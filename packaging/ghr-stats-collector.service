@@ -1,0 +1,34 @@
+# systemd USER service for the ghr-stats collector.
+#
+# Install (per the operator account that owns the runner dirs):
+#   cargo build --release
+#   install -Dm755 target/release/ghr-stats ~/.local/bin/ghr-stats
+#   install -Dm644 packaging/ghr-stats-collector.service \
+#       ~/.config/systemd/user/ghr-stats-collector.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ghr-stats-collector.service
+#
+# To keep it running after logout (a CI host has no interactive session):
+#   sudo loginctl enable-linger "$USER"
+#
+# Config is read from ~/.config/ghr-stats/config.toml (keep it mode 0600 — it
+# may hold read-only PATs). Logs: journalctl --user -u ghr-stats-collector -f
+
+[Unit]
+Description=ghr-stats collector (self-hosted GitHub Actions runner metrics)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ghr-stats collect
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+# The collector only reads /proc, /sys, the runner dirs, and the docker-free
+# local sources, and writes its own SQLite DB under ~/.local/share. It needs no
+# elevated privileges; do not run it as root.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,47 @@
+# ghr-stats configuration — copy to ~/.config/ghr-stats/config.toml
+#
+#   install -Dm600 config.example.toml ~/.config/ghr-stats/config.toml
+#
+# Every field has a default, so the tool runs with no config at all. Keep the
+# file mode 0600 if it holds GitHub tokens.
+#
+# Search order: --config FLAG, then $GHR_STATS_CONFIG, then
+# /etc/ghr-stats/config.toml, then $XDG_CONFIG_HOME/ghr-stats/config.toml.
+
+# SQLite database (the collector writes it; the TUI reads it).
+# Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).
+# db_path = "/home/you/.local/share/ghr-stats/ghr-stats.db"
+
+# Directories scanned for runner installs (each holds a `.runner` file).
+runner_roots = ["/mnt/store/ghr"]
+
+# GitHub orgs to reconcile. Empty => derived from the orgs found in `.runner`.
+# orgs = ["gh-org-a", "gh-org-b"]
+
+[intervals]
+# Local sampling cadence (runner processes / cgroup / host), seconds.
+local_secs = 5
+# GitHub API reconcile cadence, seconds (floored at 10).
+api_secs = 60
+
+# ── GitHub API (optional, read-only) ───────────────────────────────────────
+# Runner online/busy reconcile + the `github` validation command.
+#
+# Create a FINE-GRAINED personal access token PER ORG (a fine-grained PAT is
+# scoped to one resource owner):
+#   GitHub → Settings → Developer settings → Personal access tokens →
+#   Fine-grained tokens → Generate new token
+#     • Resource owner: the organization
+#     • Repository access: none / public read-only (runner data is org-scoped)
+#     • Organization permissions → "Self-hosted runners" → Read-only   (only this)
+#     • Expiration: bounded (e.g. 90 days); re-mint on expiry
+# The org may require owner approval for the token.
+#
+# [github.tokens]
+# "gh-org-a"      = "github_pat_..."
+# "gh-org-b"      = "github_pat_..."
+#
+# Single fallback for any org without a specific token above (suits a single-org
+# setup). The GHR_STATS_GITHUB_TOKEN env var overrides this fallback.
+# [github]
+# token = "github_pat_..."
