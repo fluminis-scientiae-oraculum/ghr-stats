@@ -1,0 +1,28 @@
+---
+source: src/tui/views/mod.rs
+expression: term.backend()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                ┌ Recycle runner-01 (#1) ──────────────────────┐                "
+"                │                                              │                "
+"                │stop · purge _work/_temp · trim _diag ·       │                "
+"                │start(scoped to THIS runner only — never      │                "
+"                │global /tmp or docker; idle-only)             │                "
+"                │                                              │                "
+"                │ [y] confirm    [n] cancel                    │                "
+"                └──────────────────────────────────────────────┘                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

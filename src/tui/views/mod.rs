@@ -330,4 +330,24 @@ mod tests {
         assert!(e.starts_with("self-"));
         assert!(e.ends_with("r-01"));
     }
+
+    /// Golden-frame snapshot of the confirm popup, rendered into ratatui's
+    /// in-memory `TestBackend` — the CI-able answer to "is the layout right?",
+    /// replacing eyeballed tmux captures. Deterministic (no wall-clock).
+    /// Run `cargo insta review` to accept intended changes.
+    #[test]
+    fn snapshot_confirm_popup() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let prompt = ConfirmPrompt {
+            title: "Recycle runner-01 (#1)".to_string(),
+            body: "stop · purge _work/_temp · trim _diag · start\n(scoped to THIS runner \
+                   only — never global /tmp or docker; idle-only)"
+                .to_string(),
+            danger: true,
+        };
+        term.draw(|f| draw_confirm(f, &prompt)).unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
 }
