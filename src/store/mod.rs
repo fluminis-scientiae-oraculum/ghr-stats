@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod reader;
 mod schema;
 pub mod writer;

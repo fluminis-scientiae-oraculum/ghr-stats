@@ -1,21 +1,20 @@
 //! Fleet-wide historical trends, read from SQLite: occupancy, host load,
-//! memory, and disk (/tmp + aggregate `_work`) over time.
+//! memory, and disk (/tmp + aggregate `_work`) over time. Each metric is a line
+//! chart with a relative-time X axis and a 0-based Y axis (see
+//! [`super::draw_time_chart`]); incomparable Y scales ⇒ one chart per metric.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Paragraph};
 
-use super::{fmt_bytes, fmt_opt_bytes};
+use super::{draw_time_chart, fmt_bytes, fmt_opt_bytes};
 use crate::tui::app::App;
 
-const MIB: u64 = 1024 * 1024;
-
-pub(crate) fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
+pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.trend_host.is_empty() && app.trend_busy.is_empty() {
         f.render_widget(
-            Paragraph::new("No history yet — start the collector:  ghr-stats collect")
+            Paragraph::new("No history yet — start the sampler:  ghr-stats serve")
                 .block(Block::bordered().title(" fleet trends ")),
             area,
         );
@@ -43,41 +42,62 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         .constraints([Constraint::Ratio(1, 5); 5])
         .split(outer[1]);
 
-    // Busy runners over time.
-    let busy: Vec<u64> = app.trend_busy.iter().map(|b| b.busy as u64).collect();
+    // Busy runners over time (Y capped at peak online ⇒ axis reflects capacity).
+    let busy_pts: Vec<(f64, f64)> = app
+        .trend_busy
+        .iter()
+        .map(|b| (b.ts as f64, b.busy as f64))
+        .collect();
     let (busy_now, online_now) = app
         .trend_busy
         .last()
         .map(|b| (b.busy, b.online))
         .unwrap_or((0, 0));
-    spark(
+    let busy_max = app
+        .trend_busy
+        .iter()
+        .map(|b| b.online)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    draw_time_chart(
         f,
         rows[0],
-        format!(" busy runners   now {busy_now} / {online_now} online "),
-        busy,
+        &format!(" busy runners   now {busy_now} / {online_now} online "),
+        &busy_pts,
+        [0.0, busy_max as f64],
+        vec!["0".to_string(), busy_max.to_string()],
         Color::Yellow,
     );
 
     // Host load average.
-    let load: Vec<u64> = app
+    let load_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
-        .map(|h| (h.load1 * 100.0) as u64)
+        .map(|h| (h.ts as f64, h.load1))
         .collect();
     let load_now = app.trend_host.last().map(|h| h.load1).unwrap_or(0.0);
-    spark(
+    let load_max = app
+        .trend_host
+        .iter()
+        .map(|h| h.load1)
+        .fold(0.0_f64, f64::max)
+        .max(0.1);
+    draw_time_chart(
         f,
         rows[1],
-        format!(" load1   now {load_now:.2} "),
-        load,
+        &format!(" load1   now {load_now:.2} "),
+        &load_pts,
+        [0.0, load_max],
+        vec!["0".to_string(), format!("{load_max:.1}")],
         Color::Magenta,
     );
 
-    // Memory used (percent).
-    let mem: Vec<u64> = app
+    // Memory used (percent — natural 0..100 scale).
+    let mem_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
-        .map(|h| mem_pct(h.mem_used, h.mem_total))
+        .map(|h| (h.ts as f64, mem_pct(h.mem_used, h.mem_total) as f64))
         .collect();
     let mem_title = match app.trend_host.last() {
         Some(h) if h.mem_total > 0 => format!(
@@ -88,40 +108,66 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         ),
         _ => " mem ".to_string(),
     };
-    spark(f, rows[2], mem_title, mem, Color::Blue);
+    draw_time_chart(
+        f,
+        rows[2],
+        &mem_title,
+        &mem_pts,
+        [0.0, 100.0],
+        vec!["0".to_string(), "100%".to_string()],
+        Color::Blue,
+    );
 
-    // /tmp used.
-    let tmp: Vec<u64> = app
+    // /tmp used (raw bytes; skip ticks that didn't sample it).
+    let tmp_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
-        .map(|h| h.tmp_bytes.unwrap_or(0) / MIB)
+        .filter_map(|h| h.tmp_bytes.map(|b| (h.ts as f64, b as f64)))
         .collect();
     let tmp_now = app.trend_host.last().and_then(|h| h.tmp_bytes);
-    spark(
+    let tmp_max = app
+        .trend_host
+        .iter()
+        .filter_map(|h| h.tmp_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    draw_time_chart(
         f,
         rows[3],
-        format!(" /tmp used   now {} ", fmt_opt_bytes(tmp_now)),
-        tmp,
+        &format!(" /tmp used   now {} ", fmt_opt_bytes(tmp_now)),
+        &tmp_pts,
+        [0.0, tmp_max as f64],
+        vec!["0".to_string(), fmt_bytes(tmp_max)],
         Color::Red,
     );
 
     // Aggregate _work size (sampled on the slow cadence, so sparser).
-    let work: Vec<u64> = app
+    let work_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
-        .map(|h| h.work_bytes.unwrap_or(0) / MIB)
+        .filter_map(|h| h.work_bytes.map(|b| (h.ts as f64, b as f64)))
         .collect();
     let work_now = app.trend_host.iter().rev().find_map(|h| h.work_bytes);
-    spark(
+    let work_max = app
+        .trend_host
+        .iter()
+        .filter_map(|h| h.work_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    draw_time_chart(
         f,
         rows[4],
-        format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
-        work,
+        &format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
+        &work_pts,
+        [0.0, work_max as f64],
+        vec!["0".to_string(), fmt_bytes(work_max)],
         Color::Green,
     );
 
     f.render_widget(
-        Paragraph::new(" Esc/Tab back · r refresh · q quit")
+        Paragraph::new(" Tab/1-4 switch · r refresh · q quit")
             .style(Style::new().fg(Color::DarkGray)),
         outer[2],
     );
@@ -129,16 +175,4 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
 
 fn mem_pct(used: u64, total: u64) -> u64 {
     (used * 100).checked_div(total).unwrap_or(0)
-}
-
-fn spark(f: &mut Frame, area: Rect, title: String, data: Vec<u64>, color: Color) {
-    let max = data.iter().copied().max().unwrap_or(0).max(1);
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::bordered().title(title))
-            .data(data)
-            .max(max)
-            .style(Style::new().fg(color)),
-        area,
-    );
 }

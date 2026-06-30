@@ -4,7 +4,7 @@ use crate::error::Result;
 
 /// Ordered DDL migrations. Append-only: each new entry bumps the schema by one
 /// and is tracked via SQLite's `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// Apply any migrations newer than the DB's recorded `user_version`.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -94,6 +94,18 @@ CREATE INDEX idx_api_runner_sample_ts ON api_runner_sample(ts);
 CREATE INDEX idx_api_runner_sample_agent ON api_runner_sample(agent_id);
 "#;
 
+/// v3 — per-runner current liveness with the timestamp of the last *change*
+/// (the edge). One row per runner; lets the TUI show "Idle 2h" / "Active 5m"
+/// and survives TUI/daemon restarts (the edge isn't kept only in memory).
+const V3: &str = r#"
+CREATE TABLE runner_state (
+    agent_id     INTEGER PRIMARY KEY,
+    liveness     TEXT    NOT NULL,
+    since_ts     INTEGER NOT NULL,
+    last_seen_ts INTEGER NOT NULL
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,11 +126,11 @@ mod tests {
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('runner_sample','host_sample','job_event','queue_sample','ingest_offset',\
-                  'api_runner_sample')",
+                  'api_runner_sample','runner_state')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 6);
+        assert_eq!(tables, 7);
     }
 }

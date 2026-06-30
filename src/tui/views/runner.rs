@@ -4,13 +4,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Paragraph};
 
-use super::{fmt_cpu, fmt_opt_bytes, fmt_uptime, liveness_label};
+use super::{
+    draw_time_chart, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime, liveness_label,
+};
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
-
-const MIB: u64 = 1024 * 1024;
+use crate::util::now_epoch;
 
 /// GitHub's view of a runner for the detail panel.
 fn gh_text(gh: Option<ApiState>) -> String {
@@ -22,9 +23,8 @@ fn gh_text(gh: Option<ApiState>) -> String {
     }
 }
 
-pub(crate) fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let Some(r) = app.selected_runner() else {
+pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
+    let Some(r) = app.detail_runner() else {
         f.render_widget(
             Paragraph::new("no runner selected").block(Block::bordered().title(" runner ")),
             area,
@@ -35,13 +35,17 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
+            Constraint::Length(10),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(area);
 
     let (label, color) = liveness_label(r.liveness);
+    let since = r
+        .state_seconds
+        .map(|s| format!("  for {}", fmt_dur(s.max(0) as u64)))
+        .unwrap_or_default();
     let info = vec![
         Line::from(vec![
             Span::styled(r.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
@@ -50,6 +54,8 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
         Line::from(vec![
             Span::raw("state   "),
             Span::styled(label, Style::new().fg(color)),
+            Span::raw(since),
+            Span::raw(format!("    hook {}", r.hook.glyph())),
         ]),
         Line::from(format!(
             "group   {}",
@@ -64,6 +70,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
             fmt_uptime(r.uptime_s)
         )),
         Line::from(format!("github  {}", gh_text(r.gh))),
+        Line::from(format!("job     {}", active_job_text(app))),
     ];
     f.render_widget(
         Paragraph::new(info).block(Block::bordered().title(" runner detail ")),
@@ -73,15 +80,30 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     draw_charts(f, app, chunks[1]);
 
     f.render_widget(
-        Paragraph::new(" Esc back · r refresh · q quit").style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(" Esc back · R restart · C recycle (idle) · r refresh · q quit")
+            .style(Style::new().fg(Color::DarkGray)),
         chunks[2],
     );
+}
+
+/// The runner's in-flight job (from local hook events), or "—".
+fn active_job_text(app: &App) -> String {
+    match &app.detail_active_job {
+        Some(j) => {
+            let elapsed = j
+                .started_at
+                .map(|s| fmt_dur((now_epoch() - s).max(0) as u64))
+                .unwrap_or_else(|| "?".to_string());
+            format!("{} · {}  (running {elapsed})", j.repo, j.job)
+        }
+        None => "—".to_string(),
+    }
 }
 
 fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
     if app.detail_history.is_empty() {
         f.render_widget(
-            Paragraph::new("No history yet — start the collector:  ghr-stats collect")
+            Paragraph::new("No history yet — start the sampler:  ghr-stats serve")
                 .block(Block::bordered().title(" history ")),
             area,
         );
@@ -93,45 +115,55 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // CPU%, kept at 0.1% resolution as an integer bar height.
-    let cpu: Vec<u64> = app
+    // CPU% over time (skip ticks with no cgroup reading; Y peak data-driven —
+    // a busy job can exceed 100% across cores).
+    let cpu_pts: Vec<(f64, f64)> = app
         .detail_history
         .iter()
-        .map(|p| (p.cpu_pct.unwrap_or(0.0).max(0.0) * 10.0) as u64)
+        .filter_map(|p| p.cpu_pct.map(|c| (p.ts as f64, c as f64)))
         .collect();
-    let cpu_max = cpu.iter().copied().max().unwrap_or(0).max(1);
     let cpu_now = app.detail_history.last().and_then(|p| p.cpu_pct);
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::bordered().title(format!(
-                " cpu   now {}   peak {:.1}% ",
-                fmt_cpu(cpu_now),
-                cpu_max as f64 / 10.0
-            )))
-            .data(cpu)
-            .max(cpu_max)
-            .style(Style::new().fg(Color::Cyan)),
+    let cpu_max = app
+        .detail_history
+        .iter()
+        .filter_map(|p| p.cpu_pct)
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+    draw_time_chart(
+        f,
         halves[0],
+        &format!(" cpu   now {}   peak {cpu_max:.1}% ", fmt_cpu(cpu_now)),
+        &cpu_pts,
+        [0.0, cpu_max as f64],
+        vec!["0".to_string(), format!("{cpu_max:.0}%")],
+        Color::Cyan,
     );
 
-    // Memory in MiB.
-    let mem: Vec<u64> = app
+    // Memory (raw bytes; labels in binary units).
+    let mem_pts: Vec<(f64, f64)> = app
         .detail_history
         .iter()
-        .map(|p| p.mem_bytes.unwrap_or(0) / MIB)
+        .filter_map(|p| p.mem_bytes.map(|m| (p.ts as f64, m as f64)))
         .collect();
-    let mem_max = mem.iter().copied().max().unwrap_or(0).max(1);
     let mem_now = app.detail_history.last().and_then(|p| p.mem_bytes);
-    f.render_widget(
-        Sparkline::default()
-            .block(Block::bordered().title(format!(
-                " mem   now {}   peak {} MiB ",
-                fmt_opt_bytes(mem_now),
-                mem_max
-            )))
-            .data(mem)
-            .max(mem_max)
-            .style(Style::new().fg(Color::Green)),
+    let mem_max = app
+        .detail_history
+        .iter()
+        .filter_map(|p| p.mem_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    draw_time_chart(
+        f,
         halves[1],
+        &format!(
+            " mem   now {}   peak {} ",
+            fmt_opt_bytes(mem_now),
+            fmt_bytes(mem_max)
+        ),
+        &mem_pts,
+        [0.0, mem_max as f64],
+        vec!["0".to_string(), fmt_bytes(mem_max)],
+        Color::Green,
     );
 }

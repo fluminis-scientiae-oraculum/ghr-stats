@@ -53,10 +53,10 @@ mod tests {
 
     #[test]
     fn unified_path_extracted() {
-        let c = "0::/system.slice/actions.runner.pt-immer.fso-epoch-immer-00.service\n";
+        let c = "0::/system.slice/actions.runner.example-org.runner-01.service\n";
         assert_eq!(
             parse_unified_path(c).as_deref(),
-            Some("/system.slice/actions.runner.pt-immer.fso-epoch-immer-00.service")
+            Some("/system.slice/actions.runner.example-org.runner-01.service")
         );
     }
 

@@ -1,89 +1,63 @@
 mod cli;
 mod collectors;
 mod config;
-mod daemon;
+mod config_wizard;
 mod error;
+mod github;
+mod hooks;
+mod metrics;
 mod model;
-mod setup;
+mod paths;
+mod privileged;
+mod serve;
 mod store;
+mod systemd;
 mod tui;
 mod util;
+
+// Platform boundary (subtract > abstract). Host integration is Linux-only:
+// runner liveness/cpu/mem come from procfs + cgroup v2, the host sampler reads
+// /sys + statvfs, and `serve`/`systemd` manage systemd units. Rather than ship a
+// build that compiles elsewhere yet silently can't sample anything, state the
+// boundary and fail fast. A thinner macOS build (launchd + Mac process
+// introspection, TUI as a pure DB reader) is future work — see README "Platform".
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "ghr-stats currently supports Linux only (procfs / cgroup v2 / systemd). \
+     A thinner macOS build is planned — see the README \"Platform\" section."
+);
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::{Cli, Command, DbAction};
 
+/// mimalloc: faster + lower-fragmentation allocation under the sampling loop's
+/// steady churn; MUSL-clean for the static distribution build.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     init_tracing();
     let args = Cli::parse();
-    let cfg = config::Config::load(args.config.as_deref()).context("loading config")?;
+    let config_path = args.config;
 
+    // `config` bootstraps the config file, so it must not require one to already
+    // exist; every other command loads config first. A small closure keeps that
+    // load lazy and per-arm — so there is no unreachable arm to assert away.
+    let load = || config::Config::load(config_path.as_deref()).context("loading config");
     match args.command {
-        Command::Db { action } => run_db(action, &cfg),
-        Command::Collect => daemon::run(&cfg),
-        Command::Tui => tui::run(&cfg),
-        Command::Setup => setup::run(args.config.as_deref()),
-        Command::Github => run_github(&cfg),
+        Some(Command::Config) => config_wizard::run(config_path.as_deref()),
+        // Default (no subcommand) launches the TUI.
+        None | Some(Command::Tui) => tui::run(&load()?),
+        Some(Command::Serve) => serve::run(&load()?),
+        Some(Command::Systemd { action }) => systemd::run(action, &load()?),
+        Some(Command::Db { action }) => run_db(action, &load()?),
     }
-}
-
-/// Validate each org's PAT and list its runners, cross-checked against the
-/// locally-discovered runners by `agentId`. Never prints the token.
-fn run_github(cfg: &config::Config) -> Result<()> {
-    let local = collectors::runners::discover(&cfg.runner_roots);
-    let orgs = if cfg.orgs.is_empty() {
-        let mut o: Vec<String> = local.iter().map(|r| r.org.clone()).collect();
-        o.sort();
-        o.dedup();
-        o
-    } else {
-        cfg.orgs.clone()
-    };
-
-    if orgs.is_empty() {
-        println!("No orgs to check (set [github] orgs, or run where runners are discoverable).");
-        return Ok(());
-    }
-
-    for org in &orgs {
-        let Some(token) = cfg.github_token_for(org) else {
-            println!(
-                "•  {org}: no token (set [github.tokens].\"{org}\" or GHR_STATS_GITHUB_TOKEN)"
-            );
-            continue;
-        };
-        match collectors::github::list_org_runners(&token, org) {
-            Ok(api) => {
-                let online = api.iter().filter(|r| r.status == "online").count();
-                let busy = api.iter().filter(|r| r.busy).count();
-                let local_ids: std::collections::HashSet<i64> = local
-                    .iter()
-                    .filter(|r| &r.org == org)
-                    .map(|r| r.agent_id)
-                    .collect();
-                let matched = api.iter().filter(|r| local_ids.contains(&r.id)).count();
-                println!(
-                    "✓  {org}: authenticated — {} runners ({online} online, {busy} busy); \
-                     matched {matched}/{} local by agentId",
-                    api.len(),
-                    local_ids.len()
-                );
-            }
-            Err(e) => println!("✗  {e}"),
-        }
-    }
-    Ok(())
 }
 
 fn run_db(action: DbAction, cfg: &config::Config) -> Result<()> {
     match action {
-        DbAction::Init => {
-            store::Store::open(&cfg.db_path)
-                .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;
-            println!("initialized {}", cfg.db_path.display());
-            Ok(())
-        }
         DbAction::Prune { days } => {
             let mut store = store::Store::open(&cfg.db_path)
                 .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;

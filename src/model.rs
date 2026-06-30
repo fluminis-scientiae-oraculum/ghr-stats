@@ -4,7 +4,6 @@
 //! (authoritative) plus the owning OS user of its install directory — never
 //! from parsing systemd unit names. The numeric `agent_id` is the stable join
 //! key to the GitHub API.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 
@@ -16,13 +15,13 @@ use serde::{Deserialize, Serialize};
 pub struct RunnerInfo {
     /// GitHub runner id (`agentId` in `.runner`) — the join key to the API.
     pub agent_id: i64,
-    /// Runner display name (`agentName`), e.g. "fso-epoch-immer-00".
+    /// Runner display name (`agentName`), e.g. "runner-01".
     pub name: String,
     /// Owning GitHub org, derived from `.runner`'s `gitHubUrl`.
     pub org: String,
-    /// Runner group (`poolName`), e.g. "FSO Owned".
+    /// Runner group (`poolName`), e.g. "Default Group".
     pub group: Option<String>,
-    /// Install directory, e.g. /mnt/store/ghr/ghr_immer_00.
+    /// Install directory, e.g. /srv/actions-runner/runner-01.
     pub dir: PathBuf,
     /// Work folder name (`workFolder`), e.g. "_work".
     pub work_folder: String,
@@ -30,7 +29,7 @@ pub struct RunnerInfo {
     /// the runner's processes (`/proc/<pid>` owner) and cgroup.
     pub uid: u32,
     /// Owning linux user name, resolved from `uid` for display (e.g.
-    /// "ghr_immer_00"). Falls back to the uid as a string if unresolvable.
+    /// "runner-01"). Falls back to the uid as a string if unresolvable.
     pub user: String,
 }
 
@@ -54,6 +53,16 @@ impl Liveness {
             Liveness::Offline => "offline",
         }
     }
+
+    /// Parse the stored `liveness` text; an unknown value fails safe to
+    /// `Offline` (a corrupt row never crashes a read).
+    pub fn from_db(s: &str) -> Liveness {
+        match s {
+            "busy" => Liveness::Busy,
+            "idle" => Liveness::Idle,
+            _ => Liveness::Offline,
+        }
+    }
 }
 
 /// A point-in-time sample of one runner.
@@ -68,6 +77,17 @@ pub struct RunnerSample {
     pub cpu_pct: Option<f32>,
     pub mem_bytes: Option<u64>,
     pub uptime_s: Option<u64>,
+}
+
+/// Current per-runner liveness plus the timestamp of the last liveness *change*
+/// (the "edge"). One row per runner, upserted by the writer; survives restarts,
+/// so "Idle/Active for <dur>" = `now - since_ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerState {
+    pub agent_id: i64,
+    pub liveness: Liveness,
+    pub since_ts: i64,
+    pub last_seen_ts: i64,
 }
 
 /// Per-NUMA-node memory, read from /sys/devices/system/node/node*/meminfo.
@@ -95,22 +115,6 @@ pub struct HostSample {
     pub root_free: Option<u64>,
 }
 
-/// A job lifecycle event: timing from local hooks, outcome from the API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobEvent {
-    pub run_id: i64,
-    pub run_attempt: i64,
-    pub job: String,
-    pub repo: String,
-    pub org: String,
-    pub runner_name: String,
-    pub started_at: Option<i64>,
-    pub completed_at: Option<i64>,
-    pub conclusion: Option<String>,
-    /// "hook" | "api".
-    pub source: String,
-}
-
 /// A runner's state as GitHub reports it (from the API reconcile pass).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRunnerRow {
@@ -119,13 +123,4 @@ pub struct ApiRunnerRow {
     pub name: String,
     pub online: bool,
     pub busy: bool,
-}
-
-/// Org queue-depth sample (from the API).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueSample {
-    pub ts: i64,
-    pub org: String,
-    pub queued: u32,
-    pub in_progress: u32,
 }

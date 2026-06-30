@@ -8,12 +8,13 @@
 # Search order: --config FLAG, then $GHR_STATS_CONFIG, then
 # /etc/ghr-stats/config.toml, then $XDG_CONFIG_HOME/ghr-stats/config.toml.
 
-# SQLite database (the collector writes it; the TUI reads it).
+# SQLite database (`serve` writes it; the TUI reads it).
 # Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).
 # db_path = "/home/you/.local/share/ghr-stats/ghr-stats.db"
 
 # Directories scanned for runner installs (each holds a `.runner` file).
-runner_roots = ["/mnt/store/ghr"]
+# Default: empty — `ghr-stats config` discovers and records them, or list here.
+# runner_roots = ["/opt/actions-runner", "/srv/runners"]
 
 # GitHub orgs to reconcile. Empty => derived from the orgs found in `.runner`.
 # orgs = ["gh-org-a", "gh-org-b"]
@@ -25,7 +26,7 @@ local_secs = 5
 api_secs = 60
 
 # ── GitHub API (optional, read-only) ───────────────────────────────────────
-# Runner online/busy reconcile + the `github` validation command.
+# Runner online/busy reconcile; `ghr-stats config` validates each token.
 #
 # Create a FINE-GRAINED personal access token PER ORG (a fine-grained PAT is
 # scoped to one resource owner):
@@ -45,3 +46,22 @@ api_secs = 60
 # setup). The GHR_STATS_GITHUB_TOKEN env var overrides this fallback.
 # [github]
 # token = "github_pat_..."
+
+# ── Metrics (optional) ───────────────────────────────────────────────────────
+# `serve` can also expose the fleet metrics. Both off by default.
+
+# Prometheus PULL: a tiny /metrics endpoint scrapers hit.
+# [metrics.pull]
+# enabled = true
+# SECURITY: bind loopback only (default 127.0.0.1:9477). Never bind a wider
+# interface — the metrics are unauthenticated. Use `localhost`? No: always the
+# literal 127.0.0.1 (localhost can resolve to ::1 first and hang the listener).
+# addr = "127.0.0.1:9477"
+
+# PUSH: periodically POST the metrics as JSON to an ingest endpoint (e.g.
+# OpenObserve's _json API). `auth` is sent as the Authorization header.
+# [metrics.push]
+# enabled = true
+# endpoint = "https://observe.example.com/api/default/ghr_stats/_json"
+# auth = "Basic dXNlcjpwYXNz"
+# interval_secs = 30

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
+use crate::model::{Liveness, RunnerSample, RunnerState};
 
 /// A recent job, joined from hook timing + (eventually) API conclusion.
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub struct HostPoint {
     pub mem_total: u64,
     pub tmp_bytes: Option<u64>,
     pub work_bytes: Option<u64>,
+    pub root_free: Option<u64>,
 }
 
 /// One fleet-occupancy point: how many runners were busy / online at a tick.
@@ -105,7 +107,7 @@ pub fn recent_jobs(conn: &Connection, limit: usize) -> Result<Vec<JobRow>> {
 /// Recent host samples, oldest → newest.
 pub fn host_series(conn: &Connection, limit: usize) -> Result<Vec<HostPoint>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT ts, load1, mem_used, mem_total, tmp_bytes, work_bytes FROM host_sample \
+        "SELECT ts, load1, mem_used, mem_total, tmp_bytes, work_bytes, root_free FROM host_sample \
          ORDER BY ts DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64], |r| {
@@ -116,6 +118,7 @@ pub fn host_series(conn: &Connection, limit: usize) -> Result<Vec<HostPoint>> {
             mem_total: r.get::<_, i64>(3)? as u64,
             tmp_bytes: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
             work_bytes: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+            root_free: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
         })
     })?;
     let mut out: Vec<HostPoint> = rows.collect::<std::result::Result<_, _>>()?;
@@ -163,6 +166,93 @@ pub fn busy_series(conn: &Connection, limit: usize) -> Result<Vec<BusyPoint>> {
     let mut out: Vec<BusyPoint> = rows.collect::<std::result::Result<_, _>>()?;
     out.reverse();
     Ok(out)
+}
+
+/// Every runner's most recent sample (the latest tick), for the pure-reader
+/// TUI to join with static identity from `.runner`. Empty if the daemon has
+/// never sampled — the caller shows the "start `serve`" banner.
+pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
+    let max_ts: Option<i64> =
+        conn.query_row("SELECT max(ts) FROM runner_sample", [], |r| r.get(0))?;
+    let Some(ts) = max_ts else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s \
+         FROM runner_sample WHERE ts = ?1",
+    )?;
+    let rows = stmt.query_map(params![ts], |r| {
+        Ok(RunnerSample {
+            ts: r.get(0)?,
+            agent_id: r.get(1)?,
+            name: r.get(2)?,
+            org: r.get(3)?,
+            liveness: Liveness::from_db(&r.get::<_, String>(4)?),
+            current_run_id: r.get(5)?,
+            cpu_pct: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
+            mem_bytes: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+            uptime_s: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Current liveness + since-edge timestamp per runner, keyed by `agent_id`.
+/// Drives the "Idle/Active for <dur>" display.
+pub fn runner_states(conn: &Connection) -> Result<HashMap<i64, RunnerState>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT agent_id, liveness, since_ts, last_seen_ts FROM runner_state")?;
+    let rows = stmt.query_map([], |r| {
+        let agent_id: i64 = r.get(0)?;
+        Ok((
+            agent_id,
+            RunnerState {
+                agent_id,
+                liveness: Liveness::from_db(&r.get::<_, String>(1)?),
+                since_ts: r.get(2)?,
+                last_seen_ts: r.get(3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The most recent host sample, if any (for the metrics exporter + banners).
+pub fn latest_host(conn: &Connection) -> Result<Option<HostPoint>> {
+    Ok(host_series(conn, 1)?.pop())
+}
+
+/// `(total job_event rows, in-flight rows)` — jobs whose `completed_at` is NULL.
+pub fn job_counts(conn: &Connection) -> Result<(i64, i64)> {
+    conn.query_row(
+        "SELECT count(*), COALESCE(SUM(completed_at IS NULL), 0) FROM job_event",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(Into::into)
+}
+
+/// The runner's in-flight job, if any: the most recently started `job_event`
+/// for `runner_name` that has not completed. Local hook timing — immediate.
+pub fn active_job(conn: &Connection, runner_name: &str) -> Result<Option<JobRow>> {
+    conn.query_row(
+        "SELECT runner_name, repo, job, started_at, completed_at, conclusion \
+         FROM job_event WHERE runner_name = ?1 AND completed_at IS NULL \
+         ORDER BY started_at DESC LIMIT 1",
+        params![runner_name],
+        |r| {
+            Ok(JobRow {
+                runner_name: r.get(0)?,
+                repo: r.get(1)?,
+                job: r.get(2)?,
+                started_at: r.get(3)?,
+                completed_at: r.get(4)?,
+                conclusion: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -254,5 +344,49 @@ mod tests {
         assert_eq!(s.iter().map(|p| p.ts).collect::<Vec<_>>(), vec![20, 30]);
         assert_eq!(s.last().unwrap().tmp_bytes, Some(150));
         assert_eq!(s[0].work_bytes, None);
+    }
+
+    #[test]
+    fn latest_runners_uses_newest_tick() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO runner_sample (ts,agent_id,name,org,liveness) VALUES (100,1,'r1','o','idle')",
+            [],
+        )
+        .unwrap();
+        for (id, name, live) in [(1, "r1", "busy"), (2, "r2", "idle")] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts,agent_id,name,org,liveness) VALUES (200,?1,?2,'o',?3)",
+                params![id, name, live],
+            )
+            .unwrap();
+        }
+        let rows = latest_runners(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.ts == 200));
+        let r1 = rows.iter().find(|r| r.agent_id == 1).unwrap();
+        assert_eq!(r1.liveness, Liveness::Busy);
+        assert!(latest_runners(&mem_db()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_job_is_the_incomplete_one() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO job_event (run_id,job,runner_name,started_at,completed_at) \
+             VALUES (1,'a','r',100,150)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO job_event (run_id,job,repo,runner_name,started_at) \
+             VALUES (2,'b','o/x','r',200)",
+            [],
+        )
+        .unwrap();
+        let j = active_job(&conn, "r").unwrap().unwrap();
+        assert_eq!(j.job, "b");
+        assert_eq!(j.repo, "o/x");
+        assert!(active_job(&conn, "nobody").unwrap().is_none());
     }
 }

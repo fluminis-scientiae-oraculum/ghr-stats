@@ -4,8 +4,6 @@
 
 mod cgroup;
 pub mod cpu;
-pub mod github;
-pub mod hooks;
 pub mod host;
 mod procscan;
 pub mod runners;

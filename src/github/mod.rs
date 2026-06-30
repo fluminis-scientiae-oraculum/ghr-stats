@@ -1,10 +1,8 @@
 //! GitHub API (read-only), via the blocking `ureq` client — no async runtime.
 //! We hit `/orgs/{org}/actions/runners` directly. Tokens are fine-grained,
 //! read-only, and never logged.
-//!
-//! `ApiRunner` captures the full response shape; `os`/`labels` are consumed by
-//! the daemon's reconcile pass (stored), not the `github` check command.
-#![allow(dead_code)]
+
+pub mod validate;
 
 use serde::Deserialize;
 
@@ -16,18 +14,9 @@ use crate::error::{Error, Result};
 pub struct ApiRunner {
     pub id: i64,
     pub name: String,
-    #[serde(default)]
-    pub os: Option<String>,
     /// "online" | "offline".
     pub status: String,
     pub busy: bool,
-    #[serde(default)]
-    pub labels: Vec<Label>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Label {
-    pub name: String,
 }
 
 #[derive(Deserialize)]

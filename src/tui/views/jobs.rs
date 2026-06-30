@@ -11,17 +11,17 @@ use super::{fmt_ago, fmt_dur};
 use crate::store::reader::JobRow;
 use crate::tui::app::App;
 
-pub(crate) fn draw(f: &mut Frame, app: &App) {
+pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(f.area());
+        .split(area);
 
     if app.jobs.is_empty() {
         f.render_widget(
             Paragraph::new(
-                "No job events yet.\n\nInstall the runner hooks (see packaging/hooks/) and point \
-                 the runners' ACTIONS_RUNNER_HOOK_JOB_STARTED / _COMPLETED at them.",
+                "No job events yet.\n\nInstall the runner hooks via the Config tab (or `ghr-stats \
+                 config`) so job starts/completions are recorded here.",
             )
             .block(Block::bordered().title(" jobs ")),
             chunks[0],
@@ -31,7 +31,8 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     }
 
     f.render_widget(
-        Paragraph::new(" Esc/w back · r refresh · q quit").style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(" Tab/1-4 switch · r refresh · q quit")
+            .style(Style::new().fg(Color::DarkGray)),
         chunks[1],
     );
 }

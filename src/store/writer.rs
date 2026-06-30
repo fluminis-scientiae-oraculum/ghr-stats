@@ -2,8 +2,8 @@
 
 use rusqlite::{Connection, params};
 
-use crate::collectors::hooks::HookEvent;
 use crate::error::Result;
+use crate::hooks::ingest::HookEvent;
 use crate::model::{ApiRunnerRow, HostSample, RunnerSample};
 
 /// Persist one tick: all runner rows plus the host row, atomically.
@@ -50,6 +50,26 @@ pub fn write_local(
             host.root_free.map(|v| v as i64),
         ],
     )?;
+
+    // Edge-detect liveness: reset `since_ts` only when a runner's liveness
+    // actually changes, so the TUI can show "Idle/Active for <dur>". One row
+    // per runner; `last_seen_ts` always advances. Pure-SQL edge detection —
+    // the single-writer connection makes the read-compare-write race-free.
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO runner_state (agent_id, liveness, since_ts, last_seen_ts) \
+             VALUES (?1, ?2, ?3, ?3) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+                 since_ts = CASE WHEN runner_state.liveness = excluded.liveness \
+                                 THEN runner_state.since_ts ELSE excluded.since_ts END, \
+                 liveness = excluded.liveness, \
+                 last_seen_ts = excluded.last_seen_ts",
+        )?;
+        for r in runners {
+            stmt.execute(params![r.agent_id, r.liveness.as_str(), r.ts])?;
+        }
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -155,7 +175,7 @@ mod tests {
         let started = HookEvent {
             phase: "started".into(),
             ts: 1000,
-            repo: "pt-immer/foo".into(),
+            repo: "example-org/foo".into(),
             run_id: 7,
             run_attempt: 1,
             job: "build".into(),
@@ -176,7 +196,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!((s, c), (1000, 1050)); // both timestamps present on one row
-        assert_eq!(org, "pt-immer");
+        assert_eq!(org, "example-org");
         let off: i64 = conn
             .query_row(
                 "SELECT offset FROM ingest_offset WHERE stream='hooks'",
@@ -220,5 +240,58 @@ mod tests {
             .query_row("SELECT count(*) FROM job_event", [], |r| r.get(0))
             .unwrap();
         assert_eq!(jobs, 1);
+    }
+
+    #[test]
+    fn runner_state_tracks_liveness_edges() {
+        use crate::model::Liveness;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::store::schema_for_test(&mut conn);
+        let host = HostSample {
+            ts: 0,
+            load1: 0.0,
+            load5: 0.0,
+            mem_used: 0,
+            mem_total: 0,
+            numa: vec![],
+            work_bytes: None,
+            tmp_bytes: None,
+            root_free: None,
+        };
+        let sample = |ts, live| RunnerSample {
+            ts,
+            agent_id: 1,
+            name: "r".into(),
+            org: "o".into(),
+            liveness: live,
+            current_run_id: None,
+            cpu_pct: None,
+            mem_bytes: None,
+            uptime_s: None,
+        };
+
+        // Two idle ticks: since_ts pins to the FIRST one (no edge on the second).
+        write_local(&mut conn, &[sample(100, Liveness::Idle)], &host).unwrap();
+        write_local(&mut conn, &[sample(200, Liveness::Idle)], &host).unwrap();
+        let (live, since): (String, i64) = conn
+            .query_row(
+                "SELECT liveness, since_ts FROM runner_state WHERE agent_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((live.as_str(), since), ("idle", 100));
+
+        // A liveness change moves since_ts to the change time; last_seen advances.
+        write_local(&mut conn, &[sample(300, Liveness::Busy)], &host).unwrap();
+        let (live, since, seen): (String, i64, i64) = conn
+            .query_row(
+                "SELECT liveness, since_ts, last_seen_ts FROM runner_state WHERE agent_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((live.as_str(), since, seen), ("busy", 300, 300));
     }
 }

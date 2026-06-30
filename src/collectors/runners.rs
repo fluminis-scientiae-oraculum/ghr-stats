@@ -91,6 +91,16 @@ fn read_runner(dir: &Path, dot: &Path) -> anyhow::Result<RunnerInfo> {
     })
 }
 
+/// The runner's systemd unit name, read from its own `.service` file in the
+/// install dir (authoritative — never parsed from a display string). `None` if
+/// the file is absent or empty.
+pub fn unit_name(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(".service"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Probe every discovered runner against the current process snapshot.
 pub fn probe_all(infos: Vec<RunnerInfo>, procs: &[ProcInfo], now_epoch: i64) -> Vec<RunnerProbe> {
     let boot = super::procscan::boot_time().unwrap_or(0);
@@ -146,7 +156,7 @@ fn strip_bom(s: &str) -> &str {
 }
 
 /// Org (or owner) from a runner's `gitHubUrl`.
-/// `https://github.com/pt-immer` → `pt-immer`;
+/// `https://github.com/example-org` → `example-org`;
 /// `https://github.com/owner/repo` → `owner`.
 fn org_from_github_url(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
@@ -181,16 +191,16 @@ mod tests {
     #[test]
     fn org_from_url_variants() {
         assert_eq!(
-            org_from_github_url("https://github.com/pt-immer").as_deref(),
-            Some("pt-immer")
+            org_from_github_url("https://github.com/example-org").as_deref(),
+            Some("example-org")
         );
         assert_eq!(
             org_from_github_url("https://github.com/owner/repo").as_deref(),
             Some("owner")
         );
         assert_eq!(
-            org_from_github_url("https://github.com/pt-immer/").as_deref(),
-            Some("pt-immer")
+            org_from_github_url("https://github.com/example-org/").as_deref(),
+            Some("example-org")
         );
         assert_eq!(org_from_github_url("https://github.com/"), None);
         assert_eq!(org_from_github_url("https://github.com"), None);
@@ -206,17 +216,17 @@ mod tests {
     #[test]
     fn dotrunner_parses_real_shape_with_bom() {
         let raw = "\u{feff}{\
-            \"agentId\":83,\"agentName\":\"fso-epoch-immer-00\",\"poolId\":5,\
-            \"poolName\":\"FSO Owned\",\"gitHubUrl\":\"https://github.com/pt-immer\",\
+            \"agentId\":42,\"agentName\":\"runner-01\",\"poolId\":5,\
+            \"poolName\":\"Default Group\",\"gitHubUrl\":\"https://github.com/example-org\",\
             \"workFolder\":\"_work\"}";
         let p: DotRunner = serde_json::from_str(strip_bom(raw)).unwrap();
-        assert_eq!(p.agent_id, 83);
-        assert_eq!(p.agent_name, "fso-epoch-immer-00");
+        assert_eq!(p.agent_id, 42);
+        assert_eq!(p.agent_name, "runner-01");
         assert_eq!(
             org_from_github_url(&p.github_url).as_deref(),
-            Some("pt-immer")
+            Some("example-org")
         );
-        assert_eq!(p.pool_name.as_deref(), Some("FSO Owned"));
+        assert_eq!(p.pool_name.as_deref(), Some("Default Group"));
     }
 
     #[test]

@@ -1,14 +1,14 @@
-//! The collector daemon.
+//! The `serve` daemon: sample the fleet into SQLite, and expose it as metrics.
 //!
-//! Architecture: two producer threads feed a single DB-writer (the main thread)
-//! over a bounded `crossbeam-channel`. No async — the work is blocking I/O with
-//! no request/response concurrency to model.
+//! Architecture: three producer threads feed a single DB-writer (the main
+//! thread) over a bounded `crossbeam-channel`. No async — the work is blocking
+//! I/O with no request/response concurrency to model.
 //!
 //! ```text
-//!   local-sampler ─┐  Sample messages   ┌───────────────┐
-//!                  ├───────(bounded)────►│  DB writer    │ owns Store
-//!   api-reconcile ─┘                     └───────────────┘
-//!           ▲ both poll Arc<AtomicBool> (ctrlc-driven shutdown)
+//!   local-sampler ─┐
+//!   api-reconcile ─┼──(bounded)──►│ DB writer │ owns Store ◄─reads─ metrics
+//!   hooks-tail   ──┘                                                (pull/push)
+//!           ▲ all poll Arc<AtomicBool> (ctrlc-driven shutdown)
 //! ```
 //!
 //! Why threads + a channel rather than one loop:
@@ -28,9 +28,9 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Sender, bounded};
 
 use crate::collectors::cpu::CpuRateTracker;
-use crate::collectors::hooks::HookEvent;
 use crate::collectors::{self};
 use crate::config::Config;
+use crate::hooks::ingest::HookEvent;
 use crate::model::{ApiRunnerRow, HostSample, RunnerSample};
 use crate::store::{Store, reader, writer};
 use crate::util::now_epoch;
@@ -95,6 +95,10 @@ pub fn run(cfg: &Config) -> Result<()> {
             .spawn(move || hooks_loop(&cfg, &term, &tx, start_offset))
             .context("spawning hooks-tail")?
     };
+    // Metrics exporter threads (pull/push) — opt-in; they read the DB on their
+    // own WAL connections, never the writer. Empty if [metrics] is disabled.
+    let metrics = crate::metrics::spawn(&cfg, Arc::clone(&term));
+
     // The writer holds only `rx`; once the producers exit and drop their
     // senders, `rx` disconnects and the loop below ends.
     drop(tx);
@@ -103,7 +107,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         db = %cfg.db_path.display(),
         every_s = cfg.intervals.local_secs,
         api_every_s = cfg.intervals.api_secs,
-        "collector started"
+        "serve started"
     );
 
     for msg in rx.iter() {
@@ -134,7 +138,10 @@ pub fn run(cfg: &Config) -> Result<()> {
     let _ = local.join();
     let _ = api.join();
     let _ = hooks.join();
-    tracing::info!("collector stopped");
+    for h in metrics {
+        let _ = h.join();
+    }
+    tracing::info!("serve stopped");
     Ok(())
 }
 
@@ -167,18 +174,23 @@ fn local_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
     }
 }
 
-/// Producer: reconcile GitHub's view on `api_secs`. Discovers orgs itself each
-/// cycle, so it shares no mutable state with the local sampler.
+/// Producer: reconcile GitHub's view on `api_secs`. Uses the explicit
+/// `config.orgs` list when set, else discovers orgs from the runners' `.runner`
+/// files each cycle — so it shares no mutable state with the local sampler.
 fn api_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
     let period = Duration::from_secs(cfg.intervals.api_secs.max(10));
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            let orgs: BTreeSet<String> = collectors::runners::discover(&cfg.runner_roots)
-                .into_iter()
-                .map(|r| r.org)
-                .collect();
+            let orgs: BTreeSet<String> = if cfg.orgs.is_empty() {
+                collectors::runners::discover(&cfg.runner_roots)
+                    .into_iter()
+                    .map(|r| r.org)
+                    .collect()
+            } else {
+                cfg.orgs.iter().cloned().collect()
+            };
             let now = now_epoch();
             let rows = gather_api(cfg, &orgs, term);
             if !rows.is_empty() && tx.send(Sample::Api { ts: now, rows }).is_err() {
@@ -200,7 +212,7 @@ fn hooks_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>, mut offset: 
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            let (events, new_offset) = collectors::hooks::tail_events(&path, offset);
+            let (events, new_offset) = crate::hooks::ingest::tail_events(&path, offset);
             if (!events.is_empty() || new_offset != offset)
                 && tx
                     .send(Sample::Hook {
@@ -253,7 +265,7 @@ fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<A
         let Some(token) = cfg.github_token_for(org) else {
             continue;
         };
-        match collectors::github::list_org_runners(&token, org) {
+        match crate::github::list_org_runners(&token, org) {
             Ok(runners) => out.extend(runners.into_iter().map(|r| ApiRunnerRow {
                 agent_id: r.id,
                 org: org.clone(),

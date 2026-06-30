@@ -81,12 +81,12 @@ mod tests {
     #[test]
     fn parse_started_and_completed() {
         let s = parse_event_line(
-            r#"{"phase":"started","ts":1700000000,"repo":"pt-immer/foo","run_id":123,"run_attempt":1,"job":"build","runner":"fso-epoch-immer-00"}"#,
+            r#"{"phase":"started","ts":1700000000,"repo":"example-org/foo","run_id":123,"run_attempt":1,"job":"build","runner":"runner-01"}"#,
         )
         .unwrap();
         assert_eq!(s.phase, "started");
         assert_eq!(s.run_id, 123);
-        assert_eq!(s.repo, "pt-immer/foo");
+        assert_eq!(s.repo, "example-org/foo");
         // run_attempt defaults to 1 when omitted
         let c = parse_event_line(
             r#"{"phase":"completed","ts":1700000050,"run_id":123,"job":"build","runner":"r"}"#,

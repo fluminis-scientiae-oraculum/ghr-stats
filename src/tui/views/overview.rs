@@ -1,26 +1,24 @@
-//! The fleet overview: host header + a runner table.
+//! The fleet Summary: a host header (with a data banner when the sampler is
+//! down) and a responsive, ellipsized runner table.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
-use super::{fmt_bytes, fmt_cpu, fmt_opt_bytes, fmt_uptime, liveness_label};
+use super::{ellipsize_middle, fmt_bytes, fmt_cpu, fmt_opt_bytes, fmt_uptime, liveness_label};
 use crate::model::Liveness;
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
 
-pub(crate) fn draw(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(f.area());
-
+pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
     draw_header(f, app, chunks[0]);
     draw_table(f, app, chunks[1]);
     draw_footer(f, app, chunks[2]);
@@ -73,37 +71,51 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 fmt_opt_bytes(h.root_free),
             ))
         }
-        None => Line::from(" sampling…"),
+        None => Line::from(" host: no data"),
     };
 
-    let github = if app.api_state.is_empty() {
+    // Third line: the data banner takes priority; otherwise the GitHub summary.
+    let third = if let Some(b) = app.banner() {
         Line::from(Span::styled(
-            " github: no API data (run `collect` with a PAT)",
+            format!(" ⚠ {b}"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    } else if app.api_state.is_empty() {
+        Line::from(Span::styled(
+            " github: no API data (add a PAT via `ghr-stats config`)",
             Style::new().fg(Color::DarkGray),
         ))
     } else {
         let online = app.api_state.values().filter(|s| s.online).count();
-        let busy = app.api_state.values().filter(|s| s.busy).count();
+        let gbusy = app.api_state.values().filter(|s| s.busy).count();
         Line::from(format!(
-            " github: {} known · {online} online · {busy} busy",
+            " github: {} known · {online} online · {gbusy} busy",
             app.api_state.len()
         ))
     };
 
-    let para = Paragraph::new(vec![counts, host, github])
-        .block(Block::bordered().title(" ghr-stats · fso-epoch "));
+    let para =
+        Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(" ghr-stats "));
     f.render_widget(para, area);
 }
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
+    // Responsive: the metric columns are fixed; the Runner/Org text columns
+    // share the remaining width and middle-ellipsize to fit.
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let fixed = 9 + 8 + 8 + 10 + 6 + 6; // Local,GH,CPU,Mem,Up + column spacing
+    let flex = inner_w.saturating_sub(fixed).max(20);
+    let name_w = (flex * 42 / 100).clamp(10, 28);
+    let org_w = flex.saturating_sub(name_w).clamp(8, 30);
+
     let header = Row::new(["Runner", "Org", "Local", "GH", "CPU", "Mem", "Up"])
         .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD));
 
     let rows = app.runners.iter().map(|r| {
         let (label, color) = liveness_label(r.liveness);
         Row::new(vec![
-            Cell::from(r.name.clone()),
-            Cell::from(r.org.clone()),
+            Cell::from(ellipsize_middle(&r.name, name_w)),
+            Cell::from(ellipsize_middle(&r.org, org_w)),
             Cell::from(Span::styled(label, Style::new().fg(color))),
             Cell::from(gh_span(r.gh)),
             Cell::from(fmt_cpu(r.cpu_pct)),
@@ -113,8 +125,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     });
 
     let widths = [
-        Constraint::Length(20),
-        Constraint::Length(26),
+        Constraint::Length(name_w as u16),
+        Constraint::Length(org_w as u16),
         Constraint::Length(9),
         Constraint::Length(8),
         Constraint::Length(8),
@@ -144,7 +156,7 @@ fn gh_span(gh: Option<ApiState>) -> Span<'static> {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let help = " ↑↓/jk move · Enter detail · Tab trends · w jobs · r refresh · q quit";
+    let help = " ↑↓/jk move · Enter detail · Tab/1-4 switch · r refresh · q quit";
     let text = match &app.status {
         Some(s) => format!("{help}    [{s}]"),
         None => help.to_string(),
