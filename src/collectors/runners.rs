@@ -169,10 +169,12 @@ fn org_from_github_url(url: &str) -> Option<String> {
 }
 
 fn clock_ticks() -> u64 {
-    // SAFETY: `sysconf` with a static, valid name has no preconditions; it
-    // returns -1 (without setting errno for _SC_CLK_TCK) if unsupported.
-    let v = unsafe { nix::libc::sysconf(nix::libc::_SC_CLK_TCK) };
-    if v > 0 { v as u64 } else { 100 }
+    // Safe wrapper over POSIX `sysconf` (nix) — no `unsafe`. The kernel's clock
+    // tick rate, or the conventional 100 Hz fallback if it can't be read.
+    match nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK) {
+        Ok(Some(hz)) if hz > 0 => hz as u64,
+        _ => 100,
+    }
 }
 
 #[cfg(test)]
