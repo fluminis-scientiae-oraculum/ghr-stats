@@ -1,0 +1,13 @@
+# Repo build settings. This file is read for builds invoked INSIDE this repo
+# (local dev + CI), but NOT by a downstream `cargo install ghr-stats` — cargo
+# reads config from the invoker's directory tree, never from the package being
+# installed. So pinning the microarchitecture here forces it for our own builds
+# without breaking anyone installing on an older or different CPU (which is why
+# it must NOT go in the Cargo.toml manifest).
+#
+# x86-64-v2 = the SSE4.2/POPCNT/CMPXCHG16B baseline (~2013+ CPUs).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
