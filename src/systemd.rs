@@ -33,11 +33,17 @@ fn resolve_scope(system: bool, user: bool) -> Scope {
 }
 
 fn install(scope: Scope) -> Result<()> {
-    if scope == Scope::System && !crate::privileged::is_root() {
-        bail!(
-            "system install needs root — re-run `{}`",
-            crate::privileged::sudo_hint("systemd install --system")
-        );
+    // Same contract as the hook installer: a system unit needs a root *process*
+    // (it writes /etc + /usr/local/bin), which per-op sudo cannot provide. The
+    // gate refuses a non-root process with a re-run hint. (The file/unit writes
+    // below run directly as root; routing them through the `Cleared` capability
+    // too is future work — the precedent is set in `privileged`.)
+    if scope == Scope::System
+        && let Err(hint) = crate::privileged::gate(crate::privileged::Needs::RootProcess {
+            resume: "systemd install --system",
+        })
+    {
+        bail!("system install needs root — re-run `{hint}`");
     }
 
     let bin = scope.bin_path();

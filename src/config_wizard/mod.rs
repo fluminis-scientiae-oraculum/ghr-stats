@@ -21,7 +21,7 @@ use crate::github::validate::{self, Verdict};
 use crate::hooks::install::{self, HookStatus};
 use crate::model::RunnerInfo;
 use crate::paths::Scope;
-use crate::privileged;
+use crate::privileged::{self, Cleared, Needs};
 
 pub fn run(config_override: Option<&Path>) -> Result<()> {
     let theme = ColorfulTheme::default();
@@ -193,19 +193,21 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
         return Ok(());
     }
     // Hooks are a shared *system* resource: the scripts must live where every
-    // runner user can read them, and each runner's `.env` is root-owned. That
-    // needs root (System scope). Per-op sudo (`privileged::run`) escalates a leaf
-    // command but cannot relocate the program's own euid-derived scope, so a
-    // user-scope run would point root-owned `.env` files at scripts under $HOME
-    // the runner users can't read. Gate it, like `systemd install --system`.
-    if !privileged::is_root() {
-        println!(
-            "  ⚠ runner hooks need root — the scripts must be readable by the runner \
-             users, and each runner's .env is root-owned.\n  Re-run:  {}",
-            privileged::sudo_hint("config")
-        );
-        return Ok(());
-    }
+    // runner user can read them, and each runner's `.env` is root-owned — so
+    // this needs a root *process* (System scope). The gate IS the contract: it
+    // mints a `Cleared` capability we thread through every privileged step, or
+    // refuses with a re-run hint. Per-op sudo can't relocate our own scope, so
+    // this is `RootProcess`, exactly like `systemd install --system`.
+    let cleared = match privileged::gate(Needs::RootProcess { resume: "config" }) {
+        Ok(c) => c,
+        Err(hint) => {
+            println!(
+                "  ⚠ runner hooks need root — the scripts must be readable by the \
+                 runner users, and each runner's .env is root-owned.\n  Re-run:  {hint}"
+            );
+            return Ok(());
+        }
+    };
     let our_dir = install::hooks_dir(&Scope::detect().data_dir());
     let (started, completed) = match install::install_scripts(&our_dir) {
         Ok(p) => p,
@@ -228,13 +230,13 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
             ),
             HookStatus::Unset => {
                 if confirm(theme, &format!("  install hooks for {}?", r.name), true)? {
-                    install_for(r, &started, &completed);
+                    install_for(r, &started, &completed, &cleared);
                 }
             }
             HookStatus::Foreign => {
                 println!("  ⚠ {} already has a job hook — NOT overwriting it", r.name);
                 if confirm(theme, "    chain ours after the existing hook?", false)? {
-                    chain_for(r, &our_dir, &started, &completed);
+                    chain_for(r, &our_dir, &started, &completed, &cleared);
                 } else {
                     println!("{}", install::instruct_snippet(&our_dir));
                 }
@@ -245,17 +247,23 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
 }
 
 /// Clean install: point the runner's `.env` hook vars at our scripts, restart.
-fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
+fn install_for(r: &RunnerInfo, started: &Path, completed: &Path, cleared: &Cleared) {
     let env_path = r.dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let new = install::rewrite_env(&existing, started, completed);
-    if write_env_as_root(&env_path, &new, &r.user) {
-        restart_runner(r);
+    if write_env_as_root(&env_path, &new, &r.user, cleared) {
+        restart_runner(r, cleared);
     }
 }
 
 /// Chain: wrap the existing hook (keep it) + append ours, repoint `.env`, restart.
-fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: &Path) {
+fn chain_for(
+    r: &RunnerInfo,
+    our_dir: &Path,
+    our_started: &Path,
+    our_completed: &Path,
+    cleared: &Cleared,
+) {
     let env_path = r.dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let (orig_started, orig_completed) = install::current_hook_paths(&existing);
@@ -270,8 +278,8 @@ fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: 
         let _ = write_script(&wrap_completed, &w);
     }
     let new = install::rewrite_env(&existing, &wrap_started, &wrap_completed);
-    if write_env_as_root(&env_path, &new, &r.user) {
-        restart_runner(r);
+    if write_env_as_root(&env_path, &new, &r.user, cleared) {
+        restart_runner(r, cleared);
     }
 }
 
@@ -287,7 +295,7 @@ fn write_script(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// Install `content` to `env_path` owned by `user` (the runner's `.env` is
 /// runner-user-owned, so this needs root). Returns whether it succeeded.
-fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> bool {
+fn write_env_as_root(env_path: &Path, content: &str, user: &str, cleared: &Cleared) -> bool {
     let tmp = std::env::temp_dir().join(format!("ghr-env-{}", std::process::id()));
     if std::fs::write(&tmp, content).is_err() {
         println!("    ✗ could not stage .env update");
@@ -297,7 +305,7 @@ fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> bool {
     let args = [
         "install", "-o", user, "-g", user, "-m", "0644", &tmp_s, &env_s,
     ];
-    let outcome = privileged::run(&args);
+    let outcome = cleared.run(&args);
     let _ = std::fs::remove_file(&tmp);
     if outcome.is_ok() {
         true
@@ -307,10 +315,10 @@ fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> bool {
     }
 }
 
-fn restart_runner(r: &RunnerInfo) {
+fn restart_runner(r: &RunnerInfo, cleared: &Cleared) {
     match runners::unit_name(&r.dir) {
         Some(unit) => {
-            let o = privileged::run(&["systemctl", "restart", &unit]);
+            let o = cleared.run(&["systemctl", "restart", &unit]);
             println!("    {}", o.describe(&format!("restart {unit}")));
         }
         None => println!(
