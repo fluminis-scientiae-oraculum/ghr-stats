@@ -33,8 +33,11 @@ fn resolve_scope(system: bool, user: bool) -> Scope {
 }
 
 fn install(scope: Scope) -> Result<()> {
-    if scope == Scope::System && uzers::get_effective_uid() != 0 {
-        bail!("system install needs root — re-run `sudo ghr-stats systemd install --system`");
+    if scope == Scope::System && !crate::privileged::is_root() {
+        bail!(
+            "system install needs root — re-run `{}`",
+            crate::privileged::sudo_hint("systemd install --system")
+        );
     }
 
     let bin = scope.bin_path();

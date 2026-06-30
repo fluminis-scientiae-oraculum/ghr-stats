@@ -49,6 +49,17 @@ pub(crate) fn is_root() -> bool {
     uzers::get_effective_uid() == 0
 }
 
+/// A "re-run me as root" hint carrying the binary's ABSOLUTE path — so it works
+/// even when ghr-stats was `cargo install`ed to `~/.cargo/bin`, which is not on
+/// sudo's `secure_path`. Falls back to the bare name if the path is unknown.
+pub(crate) fn sudo_hint(subcommand: &str) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "ghr-stats".to_string());
+    format!("sudo {exe} {subcommand}")
+}
+
 /// Run a privileged command, capturing its output. Prefixes `sudo` unless we are
 /// already root. Call only while the TUI is suspended (so `sudo` can prompt on
 /// the real TTY). `argv[0]` is the program.

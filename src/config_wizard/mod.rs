@@ -201,8 +201,8 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     if !privileged::is_root() {
         println!(
             "  ⚠ runner hooks need root — the scripts must be readable by the runner \
-             users, and each runner's .env is root-owned.\n  \
-             Re-run:  sudo ghr-stats config"
+             users, and each runner's .env is root-owned.\n  Re-run:  {}",
+            privileged::sudo_hint("config")
         );
         return Ok(());
     }
