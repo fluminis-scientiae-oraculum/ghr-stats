@@ -2,7 +2,7 @@
 //! the API reconcile).
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
@@ -12,11 +12,6 @@ use crate::store::reader::JobRow;
 use crate::tui::app::App;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-
     if app.jobs.is_empty() {
         f.render_widget(
             Paragraph::new(
@@ -24,17 +19,11 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
                  config`) so job starts/completions are recorded here.",
             )
             .block(Block::bordered().title(" jobs ")),
-            chunks[0],
+            area,
         );
     } else {
-        draw_table(f, app, chunks[0]);
+        draw_table(f, app, area);
     }
-
-    f.render_widget(
-        Paragraph::new(" Tab/1-4 switch · r refresh · q quit")
-            .style(Style::new().fg(Color::DarkGray)),
-        chunks[1],
-    );
 }
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {

@@ -53,8 +53,10 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         )));
     } else {
         for org in cfg.github.tokens.keys() {
+            // Natural spacing (not the fixed 16-col `key`): org logins can exceed
+            // 16 chars and would otherwise run into "present".
             lines.push(Line::from(vec![
-                key(org),
+                Span::styled(format!("  {org}  "), Style::new().fg(Color::Gray)),
                 Span::styled("present", Style::new().fg(Color::Green)),
             ]));
         }

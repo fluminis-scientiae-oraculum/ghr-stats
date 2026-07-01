@@ -8,7 +8,7 @@ mod runner;
 mod trends;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
@@ -19,21 +19,70 @@ use crate::tui::action::ConfirmPrompt;
 use crate::tui::app::{App, Hits, Tab};
 use crate::util::now_epoch;
 
+/// The one keymap footer, shown verbatim in every view (bracket every key). A
+/// single consistent surface — the same keys wherever you are; the per-view
+/// action keys ([Enter]/[R]/[C]) only fire where they apply.
+const FOOTER: &str = "[↑↓/jk] move · [Enter] detail · [Tab] switch · [R] restart · \
+                      [C] recycle · [r] refresh · [q] quit";
+
 pub(crate) fn draw(f: &mut Frame, app: &App) {
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(f.area());
+    let area = f.area();
+    // Small-terminal guard: below this the table/charts smear — say so instead.
+    if area.width < 40 || area.height < 8 {
+        f.render_widget(
+            Paragraph::new("terminal too small\n(min 40×8)")
+                .alignment(Alignment::Center)
+                .style(Style::new().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
+    // A shared bottom footer row, so every view gets the same keymap and views
+    // no longer each hand-roll one. Body = everything between the bar and it.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
     draw_tab_bar(f, app, rows[0]);
     let body = rows[1];
 
     if app.drill.is_some() {
         runner::draw(f, app, body);
-        return;
+    } else {
+        match app.tab {
+            Tab::Summary => overview::draw(f, app, body),
+            Tab::Jobs => jobs::draw(f, app, body),
+            Tab::Trends => trends::draw(f, app, body),
+            Tab::Config => config::draw(f, app, body),
+            Tab::Quit => {}
+        }
     }
-    match app.tab {
-        Tab::Summary => overview::draw(f, app, body),
-        Tab::Jobs => jobs::draw(f, app, body),
-        Tab::Trends => trends::draw(f, app, body),
-        Tab::Config => config::draw(f, app, body),
-        Tab::Quit => {}
+    draw_footer(f, app, rows[2]);
+}
+
+/// The shared footer: the keymap left-aligned, plus the last action's status
+/// right-aligned (highlighted) when there is one. The keymap always wins the
+/// left edge, so it stays readable even when a status is present.
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let keymap = Paragraph::new(FOOTER).style(Style::new().fg(Color::DarkGray));
+    match app.status.as_deref() {
+        Some(s) => {
+            let sw = (s.chars().count() as u16).saturating_add(3).min(area.width);
+            let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(sw)]).split(area);
+            f.render_widget(keymap, cols[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" {s} "),
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                ))
+                .alignment(Alignment::Right),
+                cols[1],
+            );
+        }
+        None => f.render_widget(keymap, area),
     }
 }
 

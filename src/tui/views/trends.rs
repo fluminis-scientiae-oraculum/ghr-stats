@@ -23,11 +23,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
 
     let samples = app.trend_host.len().max(app.trend_busy.len());
@@ -164,12 +160,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         [0.0, work_max as f64],
         vec!["0".to_string(), fmt_bytes(work_max)],
         Color::Green,
-    );
-
-    f.render_widget(
-        Paragraph::new(" Tab/1-4 switch · r refresh · q quit")
-            .style(Style::new().fg(Color::DarkGray)),
-        outer[2],
     );
 }
 

@@ -7,21 +7,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
-use super::{ellipsize_middle, fmt_bytes, fmt_cpu, fmt_opt_bytes, fmt_uptime, liveness_label};
+use super::{
+    ellipsize_middle, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime, liveness_label,
+};
+use crate::hooks::install::HookStatus;
 use crate::model::Liveness;
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    // The shared keymap footer is drawn by the parent; this view owns only its
+    // header + table.
+    let chunks = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
     draw_header(f, app, chunks[0]);
     draw_table(f, app, chunks[1]);
-    draw_footer(f, app, chunks[2]);
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -101,15 +100,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     // Responsive: the metric columns are fixed; the Runner/Org text columns
-    // share the remaining width and middle-ellipsize to fit.
+    // share the remaining width and middle-ellipsize to fit. `For` = time in the
+    // current liveness (#16); `Hook` = job-hook status (#27).
     let inner_w = area.width.saturating_sub(2) as usize;
-    let fixed = 9 + 8 + 8 + 10 + 6 + 6; // Local,GH,CPU,Mem,Up + column spacing
-    let flex = inner_w.saturating_sub(fixed).max(20);
-    let name_w = (flex * 42 / 100).clamp(10, 28);
+    let fixed = 9 + 7 + 6 + 8 + 8 + 10 + 6 + 8; // Local,For,Hook,GH,CPU,Mem,Up + spacing
+    let flex = inner_w.saturating_sub(fixed).max(18);
+    let name_w = (flex * 42 / 100).clamp(9, 28);
     let org_w = flex.saturating_sub(name_w).clamp(8, 30);
 
-    let header = Row::new(["Runner", "Org", "Local", "GH", "CPU", "Mem", "Up"])
-        .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD));
+    let header = Row::new([
+        "Runner", "Org", "Local", "For", "Hook", "GH", "CPU", "Mem", "Up",
+    ])
+    .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD));
 
     let rows = app.runners.iter().map(|r| {
         let (label, color) = liveness_label(r.liveness);
@@ -117,6 +119,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             Cell::from(ellipsize_middle(&r.name, name_w)),
             Cell::from(ellipsize_middle(&r.org, org_w)),
             Cell::from(Span::styled(label, Style::new().fg(color))),
+            Cell::from(state_for(r.state_seconds)),
+            Cell::from(hook_span(r.hook)),
             Cell::from(gh_span(r.gh)),
             Cell::from(fmt_cpu(r.cpu_pct)),
             Cell::from(fmt_opt_bytes(r.mem_bytes)),
@@ -128,6 +132,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(name_w as u16),
         Constraint::Length(org_w as u16),
         Constraint::Length(9),
+        Constraint::Length(7),
+        Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(10),
@@ -145,6 +151,12 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+/// Time held in the current liveness state ("2d14h", "5m"), or "—".
+fn state_for(secs: Option<i64>) -> String {
+    secs.map(|s| fmt_dur(s.max(0) as u64))
+        .unwrap_or_else(|| "—".to_string())
+}
+
 /// Compact GitHub-state glyph for the table's "GH" column.
 fn gh_span(gh: Option<ApiState>) -> Span<'static> {
     match gh {
@@ -155,14 +167,14 @@ fn gh_span(gh: Option<ApiState>) -> Span<'static> {
     }
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let help = " ↑↓/jk move · Enter detail · Tab/1-4 switch · r refresh · q quit";
-    let text = match &app.status {
-        Some(s) => format!("{help}    [{s}]"),
-        None => help.to_string(),
+/// Job-hook status glyph, colored by severity: ours (green ✓), a foreign hook
+/// (yellow ✗ — chain/instruct), none (red ✗), unreadable (gray ?).
+fn hook_span(h: HookStatus) -> Span<'static> {
+    let color = match h {
+        HookStatus::Ours => Color::Green,
+        HookStatus::Foreign => Color::Yellow,
+        HookStatus::Unset => Color::Red,
+        HookStatus::Unreadable => Color::DarkGray,
     };
-    f.render_widget(
-        Paragraph::new(text).style(Style::new().fg(Color::DarkGray)),
-        area,
-    );
+    Span::styled(h.glyph(), Style::new().fg(color))
 }

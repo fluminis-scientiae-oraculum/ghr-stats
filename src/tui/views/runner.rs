@@ -34,11 +34,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(10),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
         .split(area);
 
     let (label, color) = liveness_label(r.liveness);
@@ -78,12 +74,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     );
 
     draw_charts(f, app, chunks[1]);
-
-    f.render_widget(
-        Paragraph::new(" Esc back · R restart · C recycle (idle) · r refresh · q quit")
-            .style(Style::new().fg(Color::DarkGray)),
-        chunks[2],
-    );
 }
 
 /// The runner's in-flight job (from local hook events), or "—".
