@@ -2,10 +2,14 @@
 //!
 //! Identity is read from each runner's own `.runner` file (authoritative);
 //! liveness/resource use are derived from the runner's owning-uid processes and
-//! its cgroup. Nothing here parses systemd unit names.
+//! its cgroup. Nothing here derives identity from systemd unit names — root
+//! auto-discovery only uses the `actions.runner.*` glob to LOCATE units, then
+//! reads their `WorkingDirectory` property (still authoritative) for install
+//! dirs.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::Deserialize;
 
@@ -68,6 +72,84 @@ pub fn discover(roots: &[PathBuf]) -> Vec<RunnerInfo> {
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
+}
+
+/// Best-effort discovery of candidate runner-install ROOTS with no hint from the
+/// user, by reading the `WorkingDirectory` of every `actions.runner.*` systemd
+/// unit — the authoritative install-dir source — and returning the unique parent
+/// dirs (a root is the dir that CONTAINS install dirs; see [`discover`]).
+///
+/// This locates units by a name glob but takes IDENTITY from nothing but the
+/// unit property; the `.runner` file remains the identity source. Empty when
+/// systemctl is unavailable or there are no runner units (the caller then falls
+/// back to a manual prompt). System units only — the common `svc.sh install`
+/// case; a user-scope-only setup still uses the manual path.
+pub fn discover_roots() -> Vec<PathBuf> {
+    let units = systemd_runner_units();
+    if units.is_empty() {
+        return Vec::new();
+    }
+    let show = Command::new("systemctl")
+        .arg("show")
+        .args(&units)
+        .args(["--property", "WorkingDirectory"])
+        .output();
+    match show {
+        Ok(o) => roots_from_workdirs(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The `actions.runner.*.service` unit names known to systemd (loaded or not),
+/// via systemd's structured JSON output (`--output=json`) — the stable machine
+/// interface, so we parse a field, not a text column.
+fn systemd_runner_units() -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Unit {
+        unit: String,
+    }
+    let out = Command::new("systemctl")
+        .args([
+            "list-units",
+            "--type=service",
+            "--all",
+            "--output=json",
+            "actions.runner.*",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<Unit>>(&out.stdout)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u.unit)
+        .filter(|n| n.ends_with(".service"))
+        .collect()
+}
+
+/// Parse `systemctl show --property WorkingDirectory` output into unique install
+/// ROOTS (the parent of each `WorkingDirectory`). Pure, so it is unit-tested;
+/// [`discover_roots`] only adds the shell-out.
+fn roots_from_workdirs(show_output: &str) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for line in show_output.lines() {
+        let Some(path) = line.trim().strip_prefix("WorkingDirectory=") else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path == "/" {
+            continue;
+        }
+        if let Some(parent) = Path::new(path).parent() {
+            let parent = parent.to_path_buf();
+            if !roots.contains(&parent) {
+                roots.push(parent);
+            }
+        }
+    }
+    roots.sort();
+    roots
 }
 
 fn read_runner(dir: &Path, dot: &Path) -> anyhow::Result<RunnerInfo> {
@@ -188,6 +270,22 @@ mod tests {
             comm: comm.to_string(),
             starttime_ticks: 0,
         }
+    }
+
+    #[test]
+    fn roots_from_workdirs_dedups_parents_and_skips_junk() {
+        // Two runners share a root; a third is elsewhere; blank / root / missing
+        // WorkingDirectory lines are ignored. (Mirrors `systemctl show` output.)
+        let out = "WorkingDirectory=/srv/runners/r0\n\
+                   WorkingDirectory=/srv/runners/r1\n\
+                   WorkingDirectory=\n\
+                   WorkingDirectory=/\n\
+                   WorkingDirectory=/opt/actions/solo\n";
+        let roots = roots_from_workdirs(out);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/opt/actions"), PathBuf::from("/srv/runners"),]
+        );
     }
 
     #[test]

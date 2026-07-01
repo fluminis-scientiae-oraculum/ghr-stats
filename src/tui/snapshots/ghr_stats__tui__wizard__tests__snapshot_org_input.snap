@@ -11,7 +11,7 @@ expression: render(&mode)
 "                                                                                "
 "                ┌ Add org ─────────────────────────────────────┐                "
 "                │                                              │                "
-"                │  GitHub org login: example-org▏              │                "
+"                │  GitHub org login: example-org               │                "
 "                │                                              │                "
 "                │  [Enter] next · [Esc] cancel                 │                "
 "                │                                              │                "

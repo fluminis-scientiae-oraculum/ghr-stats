@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Padding, Paragraph, Row, Table, Wrap};
 
 use super::{fmt_ago, fmt_dur};
 use crate::store::reader::JobRow;
@@ -15,10 +15,16 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.jobs.is_empty() {
         f.render_widget(
             Paragraph::new(
-                "No job events yet.\n\nInstall the runner hooks via the Config tab (or `ghr-stats \
-                 config`) so job starts/completions are recorded here.",
+                "No job events yet.\n\nInstall the runner job hooks to record job starts and \
+                 completions here: on the Config tab press [h] (as root), or run \
+                 `sudo ghr-stats config`.",
             )
-            .block(Block::bordered().title(" jobs ")),
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::bordered()
+                    .title(" jobs ")
+                    .padding(Padding::horizontal(1)),
+            ),
             area,
         );
     } else {

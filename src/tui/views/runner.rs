@@ -4,10 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 
 use super::{
-    draw_time_chart, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime, liveness_label,
+    ChartSpec, draw_time_chart, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime,
+    liveness_label,
 };
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
@@ -69,7 +70,11 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("job     {}", active_job_text(app))),
     ];
     f.render_widget(
-        Paragraph::new(info).block(Block::bordered().title(" runner detail ")),
+        Paragraph::new(info).block(
+            Block::bordered()
+                .title(" runner detail ")
+                .padding(Padding::horizontal(1)),
+        ),
         chunks[0],
     );
 
@@ -105,6 +110,9 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // One clock read per frame for both charts' relative-time X labels.
+    let now = now_epoch();
+
     // CPU% over time (skip ticks with no cgroup reading; Y peak data-driven —
     // a busy job can exceed 100% across cores).
     let cpu_pts: Vec<(f64, f64)> = app
@@ -122,11 +130,14 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         halves[0],
-        &format!(" cpu   now {}   peak {cpu_max:.1}% ", fmt_cpu(cpu_now)),
-        &cpu_pts,
-        [0.0, cpu_max as f64],
-        vec!["0".to_string(), format!("{cpu_max:.0}%")],
-        Color::Cyan,
+        now,
+        ChartSpec {
+            title: &format!(" cpu   now {}   peak {cpu_max:.1}% ", fmt_cpu(cpu_now)),
+            points: &cpu_pts,
+            y_bounds: [0.0, cpu_max as f64],
+            y_labels: vec!["0".to_string(), format!("{cpu_max:.0}%")],
+            color: Color::Cyan,
+        },
     );
 
     // Memory (raw bytes; labels in binary units).
@@ -146,14 +157,17 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         halves[1],
-        &format!(
-            " mem   now {}   peak {} ",
-            fmt_opt_bytes(mem_now),
-            fmt_bytes(mem_max)
-        ),
-        &mem_pts,
-        [0.0, mem_max as f64],
-        vec!["0".to_string(), fmt_bytes(mem_max)],
-        Color::Green,
+        now,
+        ChartSpec {
+            title: &format!(
+                " mem   now {}   peak {} ",
+                fmt_opt_bytes(mem_now),
+                fmt_bytes(mem_max)
+            ),
+            points: &mem_pts,
+            y_bounds: [0.0, mem_max as f64],
+            y_labels: vec!["0".to_string(), fmt_bytes(mem_max)],
+            color: Color::Green,
+        },
     );
 }

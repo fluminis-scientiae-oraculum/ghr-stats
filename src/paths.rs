@@ -93,6 +93,52 @@ pub fn resolve_config(explicit: Option<&Path>) -> Option<PathBuf> {
     scoped.exists().then_some(scoped)
 }
 
+/// The user a root process is really acting for: `$SUDO_USER` when invoked via
+/// sudo, else `None`. `ghr-stats config` is run as root only to reach a
+/// privileged step (hook install); the CONFIG it writes is user-facing and must
+/// land where that user's own non-root TUI reads it.
+fn sudo_invoker() -> Option<uzers::User> {
+    let name = std::env::var_os("SUDO_USER")?;
+    if name.is_empty() {
+        return None;
+    }
+    uzers::get_user_by_name(&name)
+}
+
+/// Where `ghr-stats config` and the TUI's config edits WRITE the config file.
+///
+/// Explicit `--config` wins; else, when running under sudo, the invoking user's
+/// `~/.config/ghr-stats/config.toml` (so their non-root TUI reads it — NOT
+/// root's `/etc`, which a non-root process can't read); else the current scope's
+/// file. Pair with [`chown_to_invoker`] so a `0600` file written by root stays
+/// readable by that user. This is what lets `sudo ghr-stats config` (sudo only
+/// for hooks) coexist with a plain `ghr-stats` TUI.
+pub fn config_write_target(explicit: Option<&Path>) -> PathBuf {
+    use uzers::os::unix::UserExt;
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    if let Some(u) = sudo_invoker() {
+        return u.home_dir().join(".config/ghr-stats/config.toml");
+    }
+    Scope::detect().config_file()
+}
+
+/// Hand a just-written user-facing file (and the dir we created for it) back to
+/// the sudo invoker, so their non-root processes can read a `0600` config.
+/// No-op when not under sudo or the user is unknown; best-effort.
+pub fn chown_to_invoker(path: &Path) {
+    let Some(u) = sudo_invoker() else {
+        return;
+    };
+    let uid = Some(nix::unistd::Uid::from_raw(u.uid()));
+    let gid = Some(nix::unistd::Gid::from_raw(u.primary_group_id()));
+    if let Some(parent) = path.parent() {
+        let _ = nix::unistd::chown(parent, uid, gid);
+    }
+    let _ = nix::unistd::chown(path, uid, gid);
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

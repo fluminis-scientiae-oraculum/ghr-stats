@@ -135,13 +135,71 @@ impl Action for RecycleRunner {
     }
 }
 
-/// Closed erasure of the privileged action set for the loop's `ScreenState` —
-/// zero heap, zero vtable, exhaustive. (`Box<dyn Action>` is a drop-in if it
-/// opens.) Adding an org is NOT here: it is a native, no-teardown popup (see
-/// `tui::wizard`), not a suspend-to-TTY action.
+/// Install / repair the runner job hooks (Config `[h]`). Runs the interactive
+/// detect → install/chain/instruct flow on the real TTY while suspended, reusing
+/// the CLI wizard's logic (one implementation). Root is checked BEFORE arming —
+/// a non-root TUI gets an informational block instead of this action — and again
+/// inside the flow.
+pub(crate) struct InstallHooks {
+    pub roots: Vec<PathBuf>,
+}
+
+impl Action for InstallHooks {
+    fn prompt(&self) -> ConfirmPrompt {
+        ConfirmPrompt {
+            title: "Install runner hooks".to_string(),
+            body: "Detect each runner's job hooks and install/repair ours — chain or instruct \
+                   for a foreign hook, never clobber. Runs on this terminal and may restart \
+                   runners."
+                .to_string(),
+            danger: false,
+        }
+    }
+    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
+        match crate::config_wizard::install_hooks_for_tui(&self.roots) {
+            Ok(()) => ActionOutcome::Ok("hook install/repair finished (see terminal)".to_string()),
+            Err(e) => ActionOutcome::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Open the config file in `$EDITOR` (Config `[o]`), on the real TTY.
+pub(crate) struct OpenConfig {
+    pub path: PathBuf,
+}
+
+impl Action for OpenConfig {
+    fn prompt(&self) -> ConfirmPrompt {
+        ConfirmPrompt {
+            title: "Open config".to_string(),
+            body: format!(
+                "Open {} in $EDITOR (falls back to vi)?",
+                self.path.display()
+            ),
+            danger: false,
+        }
+    }
+    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        match std::process::Command::new(&editor).arg(&self.path).status() {
+            Ok(s) if s.success() => ActionOutcome::Ok(format!("edited {}", self.path.display())),
+            Ok(s) => {
+                ActionOutcome::Failed(format!("{editor} exited with {}", s.code().unwrap_or(-1)))
+            }
+            Err(e) => ActionOutcome::Failed(format!("could not launch {editor}: {e}")),
+        }
+    }
+}
+
+/// Closed erasure of the suspend-to-TTY action set for the loop's `ScreenState`
+/// — zero heap, zero vtable, exhaustive. (`Box<dyn Action>` is a drop-in if it
+/// opens.) Adding an org / toggling metrics are NOT here: those are native,
+/// no-teardown surfaces (see `tui::wizard` and `App::toggle_metrics`).
 pub(crate) enum ActionKind {
     Restart(RestartRunner),
     Recycle(RecycleRunner),
+    InstallHooks(InstallHooks),
+    OpenConfig(OpenConfig),
 }
 
 impl Action for ActionKind {
@@ -149,12 +207,16 @@ impl Action for ActionKind {
         match self {
             ActionKind::Restart(a) => a.prompt(),
             ActionKind::Recycle(a) => a.prompt(),
+            ActionKind::InstallHooks(a) => a.prompt(),
+            ActionKind::OpenConfig(a) => a.prompt(),
         }
     }
     fn execute(&self, tty: &mut Tty) -> ActionOutcome {
         match self {
             ActionKind::Restart(a) => a.execute(tty),
             ActionKind::Recycle(a) => a.execute(tty),
+            ActionKind::InstallHooks(a) => a.execute(tty),
+            ActionKind::OpenConfig(a) => a.execute(tty),
         }
     }
 }

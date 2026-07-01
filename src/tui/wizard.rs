@@ -4,17 +4,23 @@
 //! The compile-time contract (the whole reason this is safe): `write` exists
 //! ONLY on `Wizard<Confirmed>`, and a `Confirmed` is reachable ONLY from a
 //! successful `Wizard<PatInput>::validate`. So a rejected or un-validated PAT
-//! can never be persisted — it does not compile. The PAT buffer is rendered
-//! masked (`•`) and never logged.
+//! can never be persisted — it does not compile. The PAT is rendered masked
+//! (`•`) and never logged.
+//!
+//! Text editing is delegated to [`tui_input::Input`] (the ratatui-ecosystem
+//! input widget), so cursor movement, insert/delete, and Home/End come for free
+//! — the wizard only intercepts Enter/Esc for navigation.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::persist;
 use crate::github::validate::{self, Verdict};
@@ -30,11 +36,11 @@ pub(crate) struct WizardCtx {
 
 pub(crate) struct PickAction;
 pub(crate) struct OrgInput {
-    org: String,
+    org: Input,
 }
 pub(crate) struct PatInput {
     org: String,
-    pat: String,
+    pat: Input,
     error: Option<String>,
 }
 pub(crate) struct Confirmed {
@@ -55,30 +61,43 @@ pub(crate) struct Wizard<S> {
 impl Wizard<PickAction> {
     fn add_org(self) -> Wizard<OrgInput> {
         Wizard {
-            state: OrgInput { org: String::new() },
+            state: OrgInput {
+                org: Input::default(),
+            },
         }
     }
 }
 
+/// The two next-states from the org field — both valid branches (not an error,
+/// so not a `Result`; that also keeps the large `Wizard<PatInput>` off every
+/// `Result`'s error path).
+enum OrgNext {
+    Pat(Wizard<PatInput>),
+    Stay(Wizard<OrgInput>),
+}
+
+/// The two next-states from PAT validation: a validated `Confirmed`, or back to
+/// `PatInput` for the SAME org with the rejection reason (feedback #6).
+enum PatNext {
+    Confirm(Wizard<Confirmed>),
+    Reject(Wizard<PatInput>),
+}
+
 impl Wizard<OrgInput> {
-    fn push(&mut self, c: char) {
-        // Org logins are ASCII alnum + hyphen; ignore anything else.
-        if c.is_ascii_alphanumeric() || c == '-' {
-            self.state.org.push(c);
-        }
-    }
-    fn backspace(&mut self) {
-        self.state.org.pop();
+    /// Delegate a key to the input widget (typing, backspace, cursor, …).
+    fn edit(&mut self, key: KeyEvent) {
+        self.state.org.handle_event(&Event::Key(key));
     }
     /// Advance to PAT entry — only with a non-empty org (else stay put).
-    fn next(self) -> Result<Wizard<PatInput>, Wizard<OrgInput>> {
-        if self.state.org.trim().is_empty() {
-            return Err(self);
+    fn next(self) -> OrgNext {
+        let org = self.state.org.value().trim().to_string();
+        if org.is_empty() {
+            return OrgNext::Stay(self);
         }
-        Ok(Wizard {
+        OrgNext::Pat(Wizard {
             state: PatInput {
-                org: self.state.org.trim().to_string(),
-                pat: String::new(),
+                org,
+                pat: Input::default(),
                 error: None,
             },
         })
@@ -86,31 +105,26 @@ impl Wizard<OrgInput> {
 }
 
 impl Wizard<PatInput> {
-    fn push(&mut self, c: char) {
-        if !c.is_control() {
-            self.state.pat.push(c);
-        }
+    fn edit(&mut self, key: KeyEvent) {
+        self.state.pat.handle_event(&Event::Key(key));
     }
-    fn backspace(&mut self) {
-        self.state.pat.pop();
-    }
-    /// Validate the PAT (sync `github::validate`). Success ⇒ `Confirmed`;
-    /// rejection ⇒ back to `PatInput` for THAT org, prefilled, PAT cleared, with
-    /// the reason shown (feedback #6).
-    fn validate(self, local_ids: &HashSet<i64>) -> Result<Wizard<Confirmed>, Wizard<PatInput>> {
-        match validate::validate(&self.state.pat, &self.state.org, local_ids) {
-            Verdict::Valid { matched, local, .. } => Ok(Wizard {
+    /// Validate the PAT (sync `github::validate`). Valid ⇒ `Confirmed`; rejected
+    /// ⇒ back to `PatInput` for THAT org, prefilled, PAT cleared, reason shown.
+    fn validate(self, local_ids: &HashSet<i64>) -> PatNext {
+        let pat = self.state.pat.value().to_string();
+        match validate::validate(&pat, &self.state.org, local_ids) {
+            Verdict::Valid { matched, local, .. } => PatNext::Confirm(Wizard {
                 state: Confirmed {
                     org: self.state.org,
-                    pat: self.state.pat,
+                    pat,
                     matched,
                     local,
                 },
             }),
-            Verdict::Rejected(why) => Err(Wizard {
+            Verdict::Rejected(why) => PatNext::Reject(Wizard {
                 state: PatInput {
                     org: self.state.org,
-                    pat: String::new(),
+                    pat: Input::default(),
                     error: Some(why),
                 },
             }),
@@ -161,49 +175,39 @@ impl WizardMode {
         WizardMode::PickAction(Wizard { state: PickAction })
     }
 
-    /// Route one key press. Consumes `self` (the typestate) and returns the next
-    /// mode or a close. `validate`/`write` block briefly (a sync network call /
-    /// a file write) — acceptable for a one-shot config step.
-    pub(crate) fn on_key(self, code: KeyCode, ctx: &WizardCtx) -> Step {
+    /// Route one key. Consumes `self` (the typestate). The text states intercept
+    /// Enter/Esc for navigation and hand every other key to the input widget;
+    /// `validate`/`write` block briefly (a sync network call / a file write).
+    pub(crate) fn on_key(self, key: KeyEvent, ctx: &WizardCtx) -> Step {
         match self {
-            WizardMode::PickAction(w) => match code {
+            WizardMode::PickAction(w) => match key.code {
                 KeyCode::Char('a') => Step::Stay(WizardMode::OrgInput(w.add_org())),
                 KeyCode::Esc => Step::Close(false),
                 _ => Step::Stay(WizardMode::PickAction(w)),
             },
-            WizardMode::OrgInput(mut w) => match code {
+            WizardMode::OrgInput(mut w) => match key.code {
                 KeyCode::Esc => Step::Close(false),
-                KeyCode::Backspace => {
-                    w.backspace();
-                    Step::Stay(WizardMode::OrgInput(w))
-                }
                 KeyCode::Enter => match w.next() {
-                    Ok(next) => Step::Stay(WizardMode::PatInput(next)),
-                    Err(same) => Step::Stay(WizardMode::OrgInput(same)),
+                    OrgNext::Pat(next) => Step::Stay(WizardMode::PatInput(next)),
+                    OrgNext::Stay(same) => Step::Stay(WizardMode::OrgInput(same)),
                 },
-                KeyCode::Char(c) => {
-                    w.push(c);
+                _ => {
+                    w.edit(key);
                     Step::Stay(WizardMode::OrgInput(w))
                 }
-                _ => Step::Stay(WizardMode::OrgInput(w)),
             },
-            WizardMode::PatInput(mut w) => match code {
+            WizardMode::PatInput(mut w) => match key.code {
                 KeyCode::Esc => Step::Close(false),
-                KeyCode::Backspace => {
-                    w.backspace();
-                    Step::Stay(WizardMode::PatInput(w))
-                }
                 KeyCode::Enter => match w.validate(&ctx.local_ids) {
-                    Ok(confirmed) => Step::Stay(WizardMode::Confirmed(confirmed)),
-                    Err(retry) => Step::Stay(WizardMode::PatInput(retry)),
+                    PatNext::Confirm(confirmed) => Step::Stay(WizardMode::Confirmed(confirmed)),
+                    PatNext::Reject(retry) => Step::Stay(WizardMode::PatInput(retry)),
                 },
-                KeyCode::Char(c) => {
-                    w.push(c);
+                _ => {
+                    w.edit(key);
                     Step::Stay(WizardMode::PatInput(w))
                 }
-                _ => Step::Stay(WizardMode::PatInput(w)),
             },
-            WizardMode::Confirmed(w) => match code {
+            WizardMode::Confirmed(w) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     Step::Stay(WizardMode::Done(w.write(&ctx.target)))
                 }
@@ -227,10 +231,6 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             vec![
                 Line::from(""),
                 Line::from("  [a]  add org + read-only PAT"),
-                Line::from(Span::styled(
-                    "  (more actions from the Config tab: [h] hooks · [m] metrics · [i] intervals)",
-                    Style::new().fg(Color::DarkGray),
-                )),
                 Line::from(""),
                 footer("[a] add · [Esc] close"),
             ],
@@ -239,7 +239,7 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             " Add org ",
             vec![
                 Line::from(""),
-                field("GitHub org login", &w.state.org),
+                input_line("GitHub org login", &w.state.org, false),
                 Line::from(""),
                 footer("[Enter] next · [Esc] cancel"),
             ],
@@ -248,12 +248,12 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             let mut lines = vec![
                 Line::from(vec![
                     Span::raw("  org  "),
-                    Span::styled(&w.state.org, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        w.state.org.clone(),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
                 ]),
-                field(
-                    "Fine-grained PAT (github_pat_…)",
-                    &"•".repeat(w.state.pat.chars().count()),
-                ),
+                input_line("Fine-grained PAT (github_pat_…)", &w.state.pat, true),
             ];
             if let Some(err) = &w.state.error {
                 lines.push(Line::from(Span::styled(
@@ -304,15 +304,32 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
     f.render_widget(popup, area);
 }
 
-/// A labelled input field line with a trailing cursor block (only the currently
-/// active field is ever rendered, so the cursor is unconditional).
-fn field(label: &str, value: &str) -> Line<'static> {
+/// A labelled input field showing the value with a reverse-video cursor at the
+/// widget's cursor position. `masked` renders the value as `•` (the PAT); the
+/// cursor still tracks the real caret since the mask is 1:1 per char.
+fn input_line(label: &str, input: &Input, masked: bool) -> Line<'static> {
+    let value = input.value();
+    let shown: Vec<char> = if masked {
+        std::iter::repeat_n('•', value.chars().count()).collect()
+    } else {
+        value.chars().collect()
+    };
+    let cursor = input.visual_cursor().min(shown.len());
+    let before: String = shown[..cursor].iter().collect();
+    let (at, after): (String, String) = if cursor < shown.len() {
+        (
+            shown[cursor].to_string(),
+            shown[cursor + 1..].iter().collect(),
+        )
+    } else {
+        (" ".to_string(), String::new())
+    };
+    let bold = Style::new().add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled(format!("  {label}: "), Style::new().fg(Color::Gray)),
-        Span::styled(
-            format!("{value}▏"),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(before, bold),
+        Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+        Span::styled(after, bold),
     ])
 }
 
@@ -326,6 +343,11 @@ fn footer(s: &str) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    fn ev(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     // The typestate guarantee, exercised: PickAction → add → OrgInput → (type +
     // next) → PatInput. `write` is unreachable without a `Confirmed`, which only
@@ -338,16 +360,16 @@ mod tests {
             target: PathBuf::from("/tmp/x"),
         };
         let mut mode = WizardMode::new();
-        mode = step(mode, KeyCode::Char('a'), &ctx); // → OrgInput
+        mode = step(mode, ev(KeyCode::Char('a')), &ctx); // → OrgInput
         assert!(matches!(mode, WizardMode::OrgInput(_)));
         for c in "acme".chars() {
-            mode = step(mode, KeyCode::Char(c), &ctx);
+            mode = step(mode, ev(KeyCode::Char(c)), &ctx);
         }
-        mode = step(mode, KeyCode::Enter, &ctx); // → PatInput
+        mode = step(mode, ev(KeyCode::Enter), &ctx); // → PatInput
         assert!(matches!(mode, WizardMode::PatInput(_)));
         // Esc closes without a change.
         assert!(matches!(
-            mode.on_key(KeyCode::Esc, &ctx),
+            mode.on_key(ev(KeyCode::Esc), &ctx),
             Step::Close(false)
         ));
     }
@@ -358,22 +380,21 @@ mod tests {
             local_ids: HashSet::new(),
             target: PathBuf::from("/tmp/x"),
         };
-        let mode = step(WizardMode::new(), KeyCode::Char('a'), &ctx);
+        let mode = step(WizardMode::new(), ev(KeyCode::Char('a')), &ctx);
         // Enter with an empty org stays in OrgInput.
-        let mode = step(mode, KeyCode::Enter, &ctx);
+        let mode = step(mode, ev(KeyCode::Enter), &ctx);
         assert!(matches!(mode, WizardMode::OrgInput(_)));
     }
 
-    fn step(mode: WizardMode, code: KeyCode, ctx: &WizardCtx) -> WizardMode {
-        match mode.on_key(code, ctx) {
+    fn step(mode: WizardMode, key: KeyEvent, ctx: &WizardCtx) -> WizardMode {
+        match mode.on_key(key, ctx) {
             Step::Stay(m) => m,
             Step::Close(_) => panic!("unexpected close"),
         }
     }
 
     /// Render a wizard state into an in-memory `TestBackend` and flatten it to
-    /// text — the deterministic, CI-able answer to "does it draw right?" (the
-    /// insta approach this codebase uses instead of eyeballed tmux captures).
+    /// text — the deterministic, CI-able answer to "does it draw right?".
     fn render(mode: &WizardMode) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -389,7 +410,7 @@ mod tests {
         let mode = WizardMode::PatInput(Wizard {
             state: PatInput {
                 org: "example-org".to_string(),
-                pat: "github_pat_SUPERSECRETVALUE".to_string(),
+                pat: Input::from("github_pat_SUPERSECRETVALUE".to_string()),
                 error: None,
             },
         });
@@ -411,7 +432,7 @@ mod tests {
     fn snapshot_org_input() {
         let mode = WizardMode::OrgInput(Wizard {
             state: OrgInput {
-                org: "example-org".to_string(),
+                org: Input::from("example-org".to_string()),
             },
         });
         insta::assert_snapshot!(render(&mode));
@@ -422,7 +443,7 @@ mod tests {
         let mode = WizardMode::PatInput(Wizard {
             state: PatInput {
                 org: "example-org".to_string(),
-                pat: "github_pat_abcd".to_string(),
+                pat: Input::from("github_pat_abcd".to_string()),
                 error: Some("token lacks 'Self-hosted runners: Read' on example-org".to_string()),
             },
         });

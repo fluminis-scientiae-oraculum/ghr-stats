@@ -1,13 +1,13 @@
 //! The Config tab: resolved paths, sampler status, configured tokens, and
-//! metrics settings. Press `[a]` to add an org + read-only PAT via the native
-//! in-TUI wizard (`tui::wizard`); the full flow (hooks, metrics) stays on the
-//! CLI `ghr-stats config`.
+//! metrics settings, plus the in-TUI actions — `[a]` add org+PAT (native
+//! wizard), `[h]` install hooks, `[m]` toggle metrics, `[o]` open the file. The
+//! CLI `ghr-stats config` remains for a full guided first-run.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::tui::app::App;
 
@@ -76,14 +76,27 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         "off".to_string()
     };
     lines.push(kv("push", &push));
-    lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  [a] add org + read-only PAT   ·   `ghr-stats config` for hooks + metrics",
+        "  pull: scrape /metrics into Prometheus/Grafana · push: POST JSON to OpenObserve",
         Style::new().fg(Color::DarkGray),
     )));
+    // First-run invite (#4): if nothing is discoverable/configured, point at the
+    // actions rather than leaving a dead end. Otherwise the footer's [a]/[h]/[m]/
+    // [o] hints suffice.
+    if cfg.runner_roots.is_empty() || cfg.github.tokens.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  First run? [a] add an org + PAT · [h] install hooks · or `ghr-stats config`.",
+            Style::new().fg(Color::Yellow),
+        )));
+    }
 
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" config ")),
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" config ")
+                .padding(Padding::horizontal(1)),
+        ),
         area,
     );
 }

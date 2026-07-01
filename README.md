@@ -12,13 +12,14 @@ standard self-hosted runner, not just the box it was first built for.
 ```
  Summary  │  Jobs  │  Trends  │  Config  │  Quit
 ┌ ghr-stats ───────────────────────────────────────────────────────────────┐
-│ 20 runners    ● 0 busy    ○ 20 idle    × 0 offline                        │
-│ load 1.63    mem 250.7/376.5 GiB (67%)    /tmp 63.9 GiB    free 43.1 TiB  │
-│ github: 24 known · 24 online · 0 busy                                     │
+│ 8 runners    ● 1 busy    ○ 7 idle    × 0 offline                          │
+│ load 0.42    mem 9.7/31.3 GiB (31%)    /tmp 2.1 GiB    free 612.4 GiB     │
+│ github: 8 known · 8 online · 1 busy                                       │
 └───────────────────────────────────────────────────────────────────────────┘
-┌ runners (20) ─────────────────────────────────────────────────────────────┐
-│ Runner             Org            Local    GH      CPU    Mem        Up    │
-│▌runner-01   example-org   ○ idle   ○ idle  0.0%   171.2 MiB  2d6h  │
+┌ runners (8) ──────────────────────────────────────────────────────────────┐
+│ Runner        Org           Local    For    Hook   GH      CPU    Mem      │
+│▌runner-01     example-org   ● busy   4m2s   ✓      ● busy  38.4%  1.2 GiB  │
+│ runner-02     example-org   ○ idle   1h3m   ✓      ○ idle  0.0%   172 MiB  │
 │ ...                                                                        │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
@@ -36,8 +37,10 @@ standard self-hosted runner, not just the box it was first built for.
   `_work`, each a line chart with a relative-time X axis and a value Y axis.
 
 Keys: `↑↓`/`jk` move · `Enter` detail · `Tab`/`1`–`4` switch tab · `r` refresh ·
-`q` quit. Mouse: click a tab or row, scroll the list. From Detail: `R` restart ·
-`C` recycle (see [Actions](#actions)).
+`?` help · `q` quit. From Detail: `Esc` back · `R` restart · `C` recycle. From
+Config: `a` add org+PAT · `h` install hooks · `m` toggle metrics · `o` open
+config. Mouse: click a tab or row, scroll the list. (See [Actions](#actions).)
+The footer shows the keys that apply to the current view; `?` opens full help.
 
 ## Install
 

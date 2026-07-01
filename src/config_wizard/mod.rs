@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, Password};
+use dialoguer::{Confirm, Input, Password, Select};
 use serde::Serialize;
 
 use crate::collectors::runners;
@@ -40,17 +40,21 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
         return Ok(());
     }
 
-    // 1) Discover runners.
-    let root: String = Input::with_theme(&theme)
-        .with_prompt("Runner install root (the dir holding your runner install dirs)")
-        .interact_text()?;
-    let roots = vec![PathBuf::from(root.trim())];
+    // 1) Discover runners — auto-detect the root(s) from systemd; ask only when
+    // that finds nothing, so most users just press Enter.
+    println!("── Step 1 of 4 · Discover runners ──");
+    let roots = choose_roots(&theme)?;
     let discovered = runners::discover(&roots);
     let mut orgs: Vec<String> = discovered.iter().map(|r| r.org.clone()).collect();
     orgs.sort();
     orgs.dedup();
     if discovered.is_empty() {
-        println!("⚠ no runners found under {root} (no .runner files).");
+        let where_ = roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("⚠ no runners found under {where_} (no .runner files).");
     } else {
         println!(
             "found {} runners across {} orgs: {}",
@@ -61,12 +65,15 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     }
 
     // 2) Per-org read-only PAT (bounded validation).
+    println!("\n── Step 2 of 4 · Read-only GitHub PATs (optional) ──");
     let tokens = collect_tokens(&theme, &orgs, &discovered)?;
 
     // 3) Metrics (opt-in).
+    println!("\n── Step 3 of 4 · Prometheus metrics (optional) ──");
     let metrics = prompt_metrics(&theme)?;
 
     // 4) Write the config (with consent), tokens redacted in the preview.
+    println!("\n── Step 4 of 4 · Write config ──");
     let target = config_target(config_override);
     let write_ok = !target.exists()
         || confirm(
@@ -102,6 +109,45 @@ fn confirm(theme: &ColorfulTheme, prompt: &str, default: bool) -> Result<bool> {
         .with_prompt(prompt)
         .default(default)
         .interact()?)
+}
+
+/// Pick the runner install root(s). Auto-detected from systemd (the common case
+/// — just press Enter), or entered manually when detection finds nothing.
+/// Always returns at least one root (the manual fallback yields one).
+fn choose_roots(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
+    let found = runners::discover_roots();
+    if !found.is_empty() {
+        println!("Auto-detected runner install dir(s) under:");
+        for r in &found {
+            println!("  • {}", r.display());
+        }
+        if confirm(theme, "Use these?", true)? {
+            return Ok(found);
+        }
+    } else {
+        println!(
+            "Couldn't auto-detect from systemd (no actions.runner.* services, or systemctl is \
+             unavailable) — enter the path manually."
+        );
+    }
+    let root: String = Input::with_theme(theme)
+        .with_prompt(
+            "Runner install root — the directory that holds your runner install dirs (each has a \
+             .runner file), e.g. /opt/actions-runner or ~/actions-runner",
+        )
+        .interact_text()?;
+    Ok(vec![PathBuf::from(expand_tilde(root.trim()))])
+}
+
+/// Expand a leading `~/` using `$HOME` (dialoguer returns the raw string).
+fn expand_tilde(s: &str) -> String {
+    match s.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => format!("{}/{}", home.to_string_lossy(), rest),
+            None => s.to_string(),
+        },
+        None => s.to_string(),
+    }
 }
 
 /// Collect a validated read-only PAT per org. Bounded validation: fine-grained
@@ -192,6 +238,39 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     if !confirm(theme, "Install / repair runner hooks now?", false)? {
         return Ok(());
     }
+    apply_hooks(theme, discovered)
+}
+
+/// Discover runners under `roots` and run the hook install/repair flow. The
+/// entry point the TUI's `[h]` action uses (while suspended, on the real TTY),
+/// so the per-runner detect → install/chain/instruct decisions are the same
+/// ones the CLI wizard makes — one implementation, two front-ends.
+pub(crate) fn install_hooks_for_tui(roots: &[PathBuf]) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let discovered = runners::discover(roots);
+    if discovered.is_empty() {
+        println!(
+            "No runners found under {} — set the runner root with `ghr-stats config` first.",
+            roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(());
+    }
+    println!(
+        "Installing / repairing job hooks for {} runners (detect-first, never clobbering).\n",
+        discovered.len()
+    );
+    apply_hooks(&theme, &discovered)
+}
+
+/// The shared hook install/repair core: gate on a root *process*, write our
+/// scripts, then per runner detect → install (unset) / chain-or-instruct
+/// (foreign) / no-op (ours). No initial confirm — the caller already consented
+/// (the CLI wizard's prompt or the TUI's confirm popup).
+fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     // Hooks are a shared *system* resource: the scripts must live where every
     // runner user can read them, and each runner's `.env` is root-owned — so
     // this needs a root *process* (System scope). `require_root` gates once here
@@ -199,7 +278,7 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     // via `privileged::run`. Same requirement as `systemd install --system`.
     if let Err(hint) = privileged::require_root("config") {
         println!(
-            "  ⚠ runner hooks need root — the scripts must be readable by the \
+            "  runner hooks need root — the scripts must be readable by the \
              runner users, and each runner's .env is root-owned.\n  Re-run:  {hint}"
         );
         return Ok(());
@@ -230,11 +309,26 @@ fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
                 }
             }
             HookStatus::Foreign => {
-                println!("  ⚠ {} already has a job hook — NOT overwriting it", r.name);
-                if confirm(theme, "    chain ours after the existing hook?", false)? {
-                    chain_for(r, &our_dir, &started, &completed);
-                } else {
-                    println!("{}", install::instruct_snippet(&our_dir));
+                println!(
+                    "  ⚠ {} already has a job hook — ghr-stats will NOT overwrite it.",
+                    r.name
+                );
+                let choice = Select::with_theme(theme)
+                    .with_prompt(format!(
+                        "    {}: how should ghr-stats add its hook?",
+                        r.name
+                    ))
+                    .items([
+                        "Chain — run your existing hook, then ghr-stats (keeps both)",
+                        "Instruct — print a snippet to add to your hook yourself",
+                        "Skip this runner",
+                    ])
+                    .default(0)
+                    .interact()?;
+                match choice {
+                    0 => chain_for(r, &our_dir, &started, &completed),
+                    1 => println!("{}", install::instruct_snippet(&our_dir)),
+                    _ => println!("    skipped {}", r.name),
                 }
             }
         }
@@ -391,13 +485,14 @@ fn write_config(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     f.write_all(contents.as_bytes())?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // If we're root only for the hooks step, the config is still the invoking
+    // user's — hand it (and the dir we made) back so their non-root TUI reads it.
+    crate::paths::chown_to_invoker(path);
     Ok(())
 }
 
 fn config_target(config_override: Option<&Path>) -> PathBuf {
-    config_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| Scope::detect().config_file())
+    crate::paths::config_write_target(config_override)
 }
 
 #[cfg(test)]

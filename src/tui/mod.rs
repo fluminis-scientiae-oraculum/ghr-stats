@@ -7,6 +7,7 @@
 
 mod action;
 mod app;
+mod help;
 mod screen;
 mod views;
 mod wizard;
@@ -22,8 +23,8 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::{DefaultTerminal, Frame};
 
-use action::ActionKind;
-use app::{App, Tab};
+use action::{ActionKind, InstallHooks, OpenConfig};
+use app::{App, Overlay, Tab};
 use screen::{Confirm, Screen, ScreenState, Suspension};
 
 use crate::config::Config;
@@ -69,11 +70,11 @@ fn event_loop(
         if event::poll(timeout)? {
             // Every arm moves `mode` into `next`; `mode` is reassigned by `drive`.
             let next = match event::read()? {
-                // The native config wizard is a modal overlay: while it is open it
-                // captures every key (text input), so it is routed BEFORE the
-                // browsing/confirm state machine. It never suspends the terminal.
-                Event::Key(k) if k.kind == KeyEventKind::Press && app.wizard_open() => {
-                    app.wizard_key(k.code);
+                // A modal overlay (wizard / help / info) captures every key while
+                // open, so it is routed BEFORE the browsing/confirm state machine.
+                // Overlays never suspend the terminal.
+                Event::Key(k) if k.kind == KeyEventKind::Press && app.overlay_open() => {
+                    app.overlay_key(k);
                     Next::Mode(mode)
                 }
                 Event::Key(k) if k.kind == KeyEventKind::Press => route_key(mode, &mut app, k.code),
@@ -101,12 +102,41 @@ fn drive(next: Next, app: &mut App, terminal: &mut DefaultTerminal) -> Result<Sc
 fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
     match mode {
         ScreenState::Browsing(scr) => {
-            // Action triggers are armed here (Browsing -> Confirm).
-            // Config tab: 'a' opens the native config wizard (a no-teardown popup,
-            // handled app-side — the loop stays in Browsing).
-            if app.tab == Tab::Config && app.drill.is_none() && code == KeyCode::Char('a') {
-                app.open_wizard();
-                return Next::Mode(ScreenState::Browsing(scr));
+            // Config-tab actions. `[a]` add-org and `[m]` metrics are native (no
+            // teardown, loop stays Browsing); `[o]` open-config and `[h]` hooks
+            // are suspend-to-TTY actions (arm Confirm → suspend). `[h]` is
+            // root-gated INFORMATIONALLY: non-root shows guidance, never an error.
+            if app.tab == Tab::Config && app.drill.is_none() {
+                match code {
+                    KeyCode::Char('a') => {
+                        app.open_wizard();
+                        return Next::Mode(ScreenState::Browsing(scr));
+                    }
+                    KeyCode::Char('m') => {
+                        app.toggle_metrics();
+                        return Next::Mode(ScreenState::Browsing(scr));
+                    }
+                    KeyCode::Char('o') => {
+                        let action = ActionKind::OpenConfig(OpenConfig {
+                            path: app.config_target(),
+                        });
+                        return Next::Mode(ScreenState::Confirm(scr.confirm(action)));
+                    }
+                    KeyCode::Char('h') => {
+                        if crate::privileged::is_root() {
+                            let action = ActionKind::InstallHooks(InstallHooks {
+                                roots: app.cfg().runner_roots.clone(),
+                            });
+                            return Next::Mode(ScreenState::Confirm(scr.confirm(action)));
+                        }
+                        app.open_info(
+                            "Hook install needs root",
+                            crate::privileged::root_guidance(),
+                        );
+                        return Next::Mode(ScreenState::Browsing(scr));
+                    }
+                    _ => {}
+                }
             }
             // Detail drill-down: R = restart, C = recycle (idle-only) the runner.
             if app.drill.is_some() {
@@ -160,10 +190,13 @@ fn render(f: &mut Frame, app: &App, mode: &ScreenState) {
     if let ScreenState::Confirm(scr) = mode {
         views::draw_confirm(f, &scr.prompt());
     }
-    // The wizard overlay is drawn last so it sits atop the dashboard + any
-    // confirm popup. (In practice the two are mutually exclusive — the wizard
-    // opens only from Browsing.)
-    if let Some(w) = app.wizard() {
-        wizard::draw(f, w);
+    // The modal overlay is drawn last so it sits atop the dashboard + any confirm
+    // popup. (In practice they are mutually exclusive — overlays open only from
+    // Browsing.)
+    match app.overlay() {
+        Some(Overlay::Wizard(w)) => wizard::draw(f, w),
+        Some(Overlay::Help) => help::draw_help(f),
+        Some(Overlay::Info { title, body }) => help::draw_info(f, title, body),
+        None => {}
     }
 }

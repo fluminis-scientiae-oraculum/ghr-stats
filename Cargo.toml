@@ -3,9 +3,9 @@ name = "ghr-stats"
 version = "0.1.0"
 edition = "2024"
 description = "TUI dashboard + Prometheus exporter for self-hosted GitHub Actions runners"
-authors = ["Aditya Kresna <akresna360@gmail.com>"]
+authors = ["Aditya Kresna <https://github.com/Ujang360>"]
 license = "MIT"
-repository = "https://github.com/example-org/ghr-stats"
+repository = "https://github.com/fluminis-scientiae-oraculum/ghr-stats"
 readme = "README.md"
 keywords = ["github-actions", "self-hosted", "runner", "tui", "prometheus"]
 categories = ["command-line-utilities", "development-tools"]
@@ -17,7 +17,7 @@ crossbeam-channel = "0.5.15"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 dialoguer = "0.12.0"
 mimalloc = "0.1"
-nix = { version = "0.31.3", features = ["fs", "feature"] }
+nix = { version = "0.31.3", features = ["fs", "feature", "user"] }
 ratatui = "0.30.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -28,6 +28,7 @@ tiny_http = "0.12"
 toml = "1.1.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tui-input = { version = "0.15.3", default-features = false, features = ["ratatui-crossterm"] }
 ureq = { version = "2", features = ["json"] }
 uzers = "0.12.2"
 walkdir = "2.5.0"

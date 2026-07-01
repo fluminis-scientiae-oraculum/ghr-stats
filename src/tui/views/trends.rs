@@ -8,8 +8,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::{draw_time_chart, fmt_bytes, fmt_opt_bytes};
+use super::{ChartSpec, draw_time_chart, fmt_bytes, fmt_opt_bytes};
 use crate::tui::app::App;
+use crate::util::now_epoch;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.trend_host.is_empty() && app.trend_busy.is_empty() {
@@ -38,6 +39,9 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Ratio(1, 5); 5])
         .split(outer[1]);
 
+    // One clock read per frame, shared by every chart's relative-time X labels.
+    let now = now_epoch();
+
     // Busy runners over time (Y capped at peak online ⇒ axis reflects capacity).
     let busy_pts: Vec<(f64, f64)> = app
         .trend_busy
@@ -59,11 +63,14 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         rows[0],
-        &format!(" busy runners   now {busy_now} / {online_now} online "),
-        &busy_pts,
-        [0.0, busy_max as f64],
-        vec!["0".to_string(), busy_max.to_string()],
-        Color::Yellow,
+        now,
+        ChartSpec {
+            title: &format!(" busy runners   now {busy_now} / {online_now} online "),
+            points: &busy_pts,
+            y_bounds: [0.0, busy_max as f64],
+            y_labels: vec!["0".to_string(), busy_max.to_string()],
+            color: Color::Yellow,
+        },
     );
 
     // Host load average.
@@ -82,11 +89,14 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         rows[1],
-        &format!(" load1   now {load_now:.2} "),
-        &load_pts,
-        [0.0, load_max],
-        vec!["0".to_string(), format!("{load_max:.1}")],
-        Color::Magenta,
+        now,
+        ChartSpec {
+            title: &format!(" load1   now {load_now:.2} "),
+            points: &load_pts,
+            y_bounds: [0.0, load_max],
+            y_labels: vec!["0".to_string(), format!("{load_max:.1}")],
+            color: Color::Magenta,
+        },
     );
 
     // Memory used (percent — natural 0..100 scale).
@@ -107,11 +117,14 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         rows[2],
-        &mem_title,
-        &mem_pts,
-        [0.0, 100.0],
-        vec!["0".to_string(), "100%".to_string()],
-        Color::Blue,
+        now,
+        ChartSpec {
+            title: &mem_title,
+            points: &mem_pts,
+            y_bounds: [0.0, 100.0],
+            y_labels: vec!["0".to_string(), "100%".to_string()],
+            color: Color::Blue,
+        },
     );
 
     // /tmp used (raw bytes; skip ticks that didn't sample it).
@@ -131,11 +144,14 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         rows[3],
-        &format!(" /tmp used   now {} ", fmt_opt_bytes(tmp_now)),
-        &tmp_pts,
-        [0.0, tmp_max as f64],
-        vec!["0".to_string(), fmt_bytes(tmp_max)],
-        Color::Red,
+        now,
+        ChartSpec {
+            title: &format!(" /tmp used   now {} ", fmt_opt_bytes(tmp_now)),
+            points: &tmp_pts,
+            y_bounds: [0.0, tmp_max as f64],
+            y_labels: vec!["0".to_string(), fmt_bytes(tmp_max)],
+            color: Color::Red,
+        },
     );
 
     // Aggregate _work size (sampled on the slow cadence, so sparser).
@@ -155,11 +171,14 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_time_chart(
         f,
         rows[4],
-        &format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
-        &work_pts,
-        [0.0, work_max as f64],
-        vec!["0".to_string(), fmt_bytes(work_max)],
-        Color::Green,
+        now,
+        ChartSpec {
+            title: &format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
+            points: &work_pts,
+            y_bounds: [0.0, work_max as f64],
+            y_labels: vec!["0".to_string(), fmt_bytes(work_max)],
+            color: Color::Green,
+        },
     );
 }
 

@@ -33,10 +33,26 @@ pub enum Command {
     #[command(hide = true)]
     Tui,
 
-    /// Sample the fleet into SQLite and expose metrics. Runs as a systemd service.
+    /// Sample the fleet into SQLite and expose Prometheus metrics. Runs as a service.
+    #[command(
+        long_about = "The always-on daemon and sole DB writer: it samples the fleet into \
+        SQLite so the TUI's history and trends accrue even while the dashboard is closed, and — \
+        when enabled in the config — exposes a Prometheus /metrics endpoint on loopback (scrape \
+        it into Prometheus/Grafana) and/or pushes the metrics as JSON to an OpenObserve endpoint. \
+        Install it as a background service with `ghr-stats systemd install`."
+    )]
     Serve,
 
-    /// Consent-first interactive configuration wizard (orgs, PATs, hooks).
+    /// Interactive first-run setup: runner root, per-org PATs, metrics, and hooks.
+    #[command(
+        long_about = "Consent-first interactive configuration. Four steps — discover \
+        runners under a root you choose, add read-only fine-grained PATs per org (validated \
+        before saving), optionally enable Prometheus metrics, and write a 0600 config — then \
+        offers to install/repair each runner's job hooks, detect-first and never clobbering a \
+        foreign hook (it chains after it or prints a snippet instead). Installing hooks edits \
+        root-owned runner .env files, so re-run this with sudo to reach that step. The same \
+        settings can be changed live from the TUI's Config tab ([a]/[h]/[m]/[o])."
+    )]
     Config,
 
     /// Manage the ghr-stats systemd service.

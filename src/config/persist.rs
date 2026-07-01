@@ -40,6 +40,8 @@ fn write_table(target: &Path, doc: &Table) -> Result<()> {
         .map_err(|e| Error::Config(format!("writing {}: {e}", target.display())))?;
     // Enforce 0600 even if the file pre-existed with looser perms — it holds a PAT.
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600)).ok();
+    // If a sudo TUI wrote it, hand it back to the invoking user (matches the CLI).
+    crate::paths::chown_to_invoker(target);
     Ok(())
 }
 
@@ -57,15 +59,22 @@ fn nested_table<'a>(doc: &'a mut Table, path: &[&str]) -> Result<&'a mut Table> 
     Ok(cur)
 }
 
-/// Add/replace a per-org read-only PAT under `[github.tokens]`.
-///
-/// The only edit the TUI performs today (the native config wizard's write step).
-/// Metrics/interval setters land alongside their in-TUI editors — deferred rather
-/// than shipped unused, so the `dead_code` gate stays green (no `allow`).
+/// Add/replace a per-org read-only PAT under `[github.tokens]` (the native
+/// wizard's write step).
 pub(crate) fn set_org_token(target: &Path, org: &str, token: &str) -> Result<()> {
     let mut doc = load_table(target)?;
     nested_table(&mut doc, &["github", "tokens"])?
         .insert(org.to_string(), Value::String(token.to_string()));
+    write_table(target, &doc)
+}
+
+/// Toggle + address the Prometheus pull endpoint under `[metrics.pull]` (the
+/// Config tab's `[m]` action). Preserves the address when only toggling.
+pub(crate) fn set_metrics_pull(target: &Path, enabled: bool, addr: &str) -> Result<()> {
+    let mut doc = load_table(target)?;
+    let pull = nested_table(&mut doc, &["metrics", "pull"])?;
+    pull.insert("enabled".to_string(), Value::Boolean(enabled));
+    pull.insert("addr".to_string(), Value::String(addr.to_string()));
     write_table(target, &doc)
 }
 

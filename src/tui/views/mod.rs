@@ -19,12 +19,6 @@ use crate::tui::action::ConfirmPrompt;
 use crate::tui::app::{App, Hits, Tab};
 use crate::util::now_epoch;
 
-/// The one keymap footer, shown verbatim in every view (bracket every key). A
-/// single consistent surface — the same keys wherever you are; the per-view
-/// action keys ([Enter]/[R]/[C]) only fire where they apply.
-const FOOTER: &str = "[↑↓/jk] move · [Enter] detail · [Tab] switch · [R] restart · \
-                      [C] recycle · [r] refresh · [q] quit";
-
 pub(crate) fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     // Small-terminal guard: below this the table/charts smear — say so instead.
@@ -63,11 +57,33 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, rows[2]);
 }
 
+/// Context-aware key hints (#13's bracket format, but only the keys that act
+/// where you are — so the footer changes with the view/mode instead of
+/// advertising Detail-only actions on the list tabs). `[Tab] switch · [r]
+/// refresh · [q] quit` is the common tail everywhere except the drill-down.
+fn footer_keys(app: &App) -> String {
+    if app.drill.is_some() {
+        // Runner detail: the per-runner actions live here, not on the lists.
+        return "[Esc] back · [R] restart · [C] recycle · [r] refresh · [?] help · [q] quit"
+            .to_string();
+    }
+    match app.tab {
+        Tab::Summary => {
+            "[↑↓/jk] move · [Enter] detail · [Tab] switch · [r] refresh · [?] help · [q] quit"
+        }
+        Tab::Config => {
+            "[a] org · [h] hooks · [m] metrics · [o] open · [Tab] switch · [?] help · [q] quit"
+        }
+        _ => "[Tab] switch · [r] refresh · [?] help · [q] quit",
+    }
+    .to_string()
+}
+
 /// The shared footer: the keymap left-aligned, plus the last action's status
 /// right-aligned (highlighted) when there is one. The keymap always wins the
 /// left edge, so it stays readable even when a status is present.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let keymap = Paragraph::new(FOOTER).style(Style::new().fg(Color::DarkGray));
+    let keymap = Paragraph::new(footer_keys(app)).style(Style::new().fg(Color::DarkGray));
     match app.status.as_deref() {
         Some(s) => {
             let sw = (s.chars().count() as u16).saturating_add(3).min(area.width);
@@ -169,7 +185,7 @@ pub(crate) fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
     .split(col)[1]
 }
 
-/// Middle-ellipsize a string to at most `max` display chars ("fso-e…r-00").
+/// Middle-ellipsize a string to at most `max` display chars ("runner-…er-01").
 pub(crate) fn ellipsize_middle(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -268,27 +284,34 @@ pub(crate) fn liveness_label(l: Liveness) -> (&'static str, Color) {
 /// metric-specific (count vs percent vs bytes). At most three labels per axis —
 /// ratatui mis-positions a fourth (issue 334). Fewer than two points ⇒ a
 /// "collecting" note, since a line needs two ends.
-pub(crate) fn draw_time_chart(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    points: &[(f64, f64)],
-    y_bounds: [f64; 2],
-    y_labels: Vec<String>,
-    color: Color,
-) {
-    if points.len() < 2 {
+///
+/// `now` (the reference for the relative-time X labels) is a parameter, not read
+/// from the clock here — so the callers pass one `now_epoch()` per frame and
+/// tests can pin it for deterministic golden snapshots.
+///
+/// The chart's *content* (title, series, Y axis, color) is bundled in
+/// [`ChartSpec`] so the call stays `(where, when, what)` rather than a long
+/// positional argument list.
+pub(crate) struct ChartSpec<'a> {
+    pub title: &'a str,
+    pub points: &'a [(f64, f64)],
+    pub y_bounds: [f64; 2],
+    pub y_labels: Vec<String>,
+    pub color: Color,
+}
+
+pub(crate) fn draw_time_chart(f: &mut Frame, area: Rect, now: i64, spec: ChartSpec) {
+    if spec.points.len() < 2 {
         f.render_widget(
             Paragraph::new("  collecting…")
                 .style(Style::new().fg(Color::DarkGray))
-                .block(Block::bordered().title(title.to_string())),
+                .block(Block::bordered().title(spec.title.to_string())),
             area,
         );
         return;
     }
-    let now = now_epoch();
-    let t0 = points[0].0;
-    let tn = points[points.len() - 1].0;
+    let t0 = spec.points[0].0;
+    let tn = spec.points[spec.points.len() - 1].0;
     let x_labels = vec![
         rel_label(t0 as i64, now),
         rel_label(((t0 + tn) / 2.0) as i64, now),
@@ -298,12 +321,12 @@ pub(crate) fn draw_time_chart(
         Dataset::default()
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
-            .style(Style::new().fg(color))
-            .data(points),
+            .style(Style::new().fg(spec.color))
+            .data(spec.points),
     ];
     let axis_style = Style::new().fg(Color::DarkGray);
     let chart = Chart::new(datasets)
-        .block(Block::bordered().title(title.to_string()))
+        .block(Block::bordered().title(spec.title.to_string()))
         .x_axis(
             Axis::default()
                 .style(axis_style)
@@ -313,8 +336,8 @@ pub(crate) fn draw_time_chart(
         .y_axis(
             Axis::default()
                 .style(axis_style)
-                .bounds(y_bounds)
-                .labels(y_labels),
+                .bounds(spec.y_bounds)
+                .labels(spec.y_labels),
         );
     f.render_widget(chart, area);
 }
@@ -401,6 +424,40 @@ mod tests {
             danger: true,
         };
         term.draw(|f| draw_confirm(f, &prompt)).unwrap();
+        insta::assert_snapshot!(term.backend());
+    }
+
+    /// Golden a time-series chart. Deterministic because `now` and the points are
+    /// fixed — the whole reason `draw_time_chart` takes `now` as a parameter
+    /// instead of reading the clock. Pins the axes, the relative-time X labels
+    /// (`-2m · -1m · now`), and the braille line.
+    #[test]
+    fn snapshot_time_chart() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let now = 10_000_i64;
+        let points = vec![
+            ((now - 120) as f64, 10.0),
+            ((now - 60) as f64, 25.0),
+            (now as f64, 40.0),
+        ];
+        term.draw(|f| {
+            let area = f.area();
+            draw_time_chart(
+                f,
+                area,
+                now,
+                ChartSpec {
+                    title: " cpu   now 40% ",
+                    points: &points,
+                    y_bounds: [0.0, 40.0],
+                    y_labels: vec!["0".to_string(), "40%".to_string()],
+                    color: Color::Cyan,
+                },
+            );
+        })
+        .unwrap();
         insta::assert_snapshot!(term.backend());
     }
 }

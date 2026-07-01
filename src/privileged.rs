@@ -119,15 +119,40 @@ pub(crate) fn is_root() -> bool {
     uzers::get_effective_uid() == 0
 }
 
-/// A "re-run me as root" hint carrying the binary's ABSOLUTE path — so it works
-/// even when ghr-stats was `cargo install`ed to `~/.cargo/bin`, which is not on
-/// sudo's `secure_path`. Falls back to the bare name if the path is unknown.
-pub(crate) fn sudo_hint(subcommand: &str) -> String {
-    let exe = std::env::current_exe()
+/// This binary's ABSOLUTE path — the basis for every "re-run as root" hint, so
+/// they work even when ghr-stats was `cargo install`ed to `~/.cargo/bin` (which
+/// is NOT on sudo's `secure_path`). Falls back to the bare name if unknown.
+pub(crate) fn exe_path() -> String {
+    std::env::current_exe()
         .ok()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "ghr-stats".to_string());
-    format!("sudo {exe} {subcommand}")
+        .unwrap_or_else(|| "ghr-stats".to_string())
+}
+
+/// A "re-run me as root" hint carrying the binary's absolute path.
+pub(crate) fn sudo_hint(subcommand: &str) -> String {
+    format!("sudo {} {subcommand}", exe_path())
+        .trim_end()
+        .to_string()
+}
+
+/// Guidance for running the whole tool as root, spelling out the sudo
+/// `secure_path` gap that bites a user-wide install. Shown (as an informational
+/// block, never an error) when a root-only action is invoked from a non-root
+/// TUI, and in the help sheet. The gate informs; it does not fail.
+pub(crate) fn root_guidance() -> String {
+    format!(
+        "Installing runner hooks edits each runner's root-owned .env and writes shared \
+         scripts, so the whole process must run as root.\n\n\
+         Re-run the dashboard as root:\n\
+         \x20\x20sudo {exe}\n\n\
+         If `sudo ghr-stats` says \"command not found\", that is expected: sudo resets PATH to a \
+         secure default that excludes ~/.cargo/bin and ~/.local/bin, so a user-wide install is \
+         not on it. Use the absolute path above, or install system-wide with\n\
+         \x20\x20{exe} systemd install --system\n\
+         which copies the binary to /usr/local/bin (on sudo's path).",
+        exe = exe_path()
+    )
 }
 
 /// The first non-empty line of captured stderr, trimmed.

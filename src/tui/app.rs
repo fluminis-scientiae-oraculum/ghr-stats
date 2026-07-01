@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
@@ -92,14 +92,28 @@ pub(crate) struct Hits {
     pub table_rows: Option<Rect>,
 }
 
+/// A modal popup drawn over the dashboard; while one is open the loop routes
+/// every key to it. One concept for the three no-teardown modals (the config
+/// wizard, the help sheet, and an informational block — e.g. privilege
+/// guidance). Distinct from the suspend/resume path used for privileged
+/// shell-outs (Restart/Recycle/hook-install), which tears the terminal down.
+pub(crate) enum Overlay {
+    Wizard(WizardMode),
+    Help,
+    /// Read-only guidance (title, body lines) — e.g. "this needs root, here's how".
+    Info {
+        title: String,
+        body: String,
+    },
+}
+
 pub(crate) struct App {
     cfg: Config,
     /// The `--config` override (if any), so the native config wizard writes back
     /// to the same file this run loaded; `None` ⇒ the scope's default path.
     config_path: Option<PathBuf>,
-    /// The native config wizard, when open. `Some` makes the loop route every key
-    /// to it (modal) and render its popup. A no-teardown overlay (see `wizard`).
-    wizard: Option<WizardMode>,
+    /// The open modal popup, if any (config wizard / help / info block).
+    overlay: Option<Overlay>,
     /// Read-only handle; `None` if the DB could not be opened.
     store: Option<Store>,
     /// Derives per-runner CPU% from cgroup-usage deltas between ticks.
@@ -138,7 +152,7 @@ impl App {
         Self {
             cfg,
             config_path,
-            wizard: None,
+            overlay: None,
             store,
             cpu: CpuRateTracker::new(),
             edges: HashMap::new(),
@@ -164,37 +178,55 @@ impl App {
         &self.cfg
     }
 
-    // ---- native config wizard (see `tui::wizard`) ----
+    // ---- modal overlays (config wizard / help / info) ----
 
-    /// Whether the modal config wizard is open (⇒ the loop routes keys to it).
-    pub(crate) fn wizard_open(&self) -> bool {
-        self.wizard.is_some()
+    /// Whether a modal overlay is open (⇒ the loop routes every key to it).
+    pub(crate) fn overlay_open(&self) -> bool {
+        self.overlay.is_some()
     }
 
-    /// The wizard state to render, if open.
-    pub(crate) fn wizard(&self) -> Option<&WizardMode> {
-        self.wizard.as_ref()
+    /// The open overlay to render, if any.
+    pub(crate) fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
     }
 
-    /// Open the wizard at its action menu (from the Config tab `[a]`).
+    /// Open the config wizard at its action menu (from the Config tab `[a]`).
     pub(crate) fn open_wizard(&mut self) {
-        self.wizard = Some(WizardMode::new());
+        self.overlay = Some(Overlay::Wizard(WizardMode::new()));
     }
 
-    /// Route one key to the open wizard, advancing or closing it. A close that
+    /// Open the context-sensitive help sheet (`[?]`).
+    pub(crate) fn open_help(&mut self) {
+        self.overlay = Some(Overlay::Help);
+    }
+
+    /// Open a read-only info block (e.g. privilege guidance) — dismissed by any key.
+    pub(crate) fn open_info(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.overlay = Some(Overlay::Info {
+            title: title.into(),
+            body: body.into(),
+        });
+    }
+
+    /// Route one key to the open overlay. The wizard advances/closes via its
+    /// typestate (and delegates text editing to its input widget, hence the full
+    /// `KeyEvent`); help/info are dismissed by any key. A wizard close that
     /// changed the config reloads it so the Config tab reflects the new token.
-    pub(crate) fn wizard_key(&mut self, code: KeyCode) {
-        let Some(mode) = self.wizard.take() else {
-            return;
-        };
-        let ctx = self.wizard_ctx();
-        match mode.on_key(code, &ctx) {
-            wizard::Step::Stay(next) => self.wizard = Some(next),
-            wizard::Step::Close(changed) => {
-                if changed {
-                    self.reload_cfg();
+    pub(crate) fn overlay_key(&mut self, key: KeyEvent) {
+        match self.overlay.take() {
+            Some(Overlay::Wizard(mode)) => {
+                let ctx = self.wizard_ctx();
+                match mode.on_key(key, &ctx) {
+                    wizard::Step::Stay(next) => self.overlay = Some(Overlay::Wizard(next)),
+                    wizard::Step::Close(changed) => {
+                        if changed {
+                            self.reload_cfg();
+                        }
+                    }
                 }
             }
+            // Help / Info: any key dismisses (already removed by `take`).
+            Some(Overlay::Help | Overlay::Info { .. }) | None => {}
         }
     }
 
@@ -207,15 +239,29 @@ impl App {
         }
     }
 
-    /// The config file the wizard writes: the `--config` override, else the
-    /// privilege scope's default `config.toml` (matches `ghr-stats config`).
-    fn config_target(&self) -> PathBuf {
-        self.config_path
-            .clone()
-            .unwrap_or_else(|| Scope::detect().config_file())
+    /// The config file the TUI writes — the `--config` override, else the
+    /// invoking user's config (SUDO_USER-aware, matches `ghr-stats config`), so a
+    /// sudo TUI still writes where the plain TUI reads.
+    pub(crate) fn config_target(&self) -> PathBuf {
+        crate::paths::config_write_target(self.config_path.as_deref())
     }
 
-    /// Reload config from disk after a wizard write, then refresh the views.
+    /// Toggle the Prometheus `/metrics` pull endpoint (Config `[m]`), persisting
+    /// to the config and reloading. Takes effect on the next `serve` start.
+    pub(crate) fn toggle_metrics(&mut self) {
+        let enabled = !self.cfg.metrics.pull.enabled;
+        let addr = self.cfg.metrics.pull.addr.clone();
+        match crate::config::persist::set_metrics_pull(&self.config_target(), enabled, &addr) {
+            Ok(()) => {
+                self.reload_cfg();
+                let state = if enabled { "enabled" } else { "disabled" };
+                self.status = Some(format!("metrics pull {state} — restart `serve` to apply"));
+            }
+            Err(e) => self.status = Some(format!("✗ metrics toggle failed: {e}")),
+        }
+    }
+
+    /// Reload config from disk after a write, then refresh the views.
     fn reload_cfg(&mut self) {
         if let Ok(cfg) = Config::load(self.config_path.as_deref()) {
             self.cfg = cfg;
@@ -341,6 +387,11 @@ impl App {
     }
 
     pub(crate) fn on_key(&mut self, code: KeyCode) {
+        // Help is global — it opens over any view/mode.
+        if code == KeyCode::Char('?') {
+            self.open_help();
+            return;
+        }
         // While drilled into Detail, keys are back-nav / refresh only.
         if self.drill.is_some() {
             match code {
