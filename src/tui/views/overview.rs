@@ -149,6 +149,15 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     // Render needs &mut state; TableState is Copy, so copy to keep `app` shared.
     let mut state = app.table;
     f.render_stateful_widget(table, area, &mut state);
+
+    // Cache the data-row region (inside the border, below the header) so a click
+    // there selects the runner under the cursor.
+    app.hits.borrow_mut().table_rows = Some(Rect {
+        x: area.x + 1,
+        y: area.y + 2,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(3),
+    });
 }
 
 /// Time held in the current liveness state ("2d14h", "5m"), or "—".

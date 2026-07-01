@@ -113,9 +113,12 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(label, style));
         x += w;
     }
+    // Reset the hit cache each frame; the Summary view re-populates `table_rows`
+    // when it draws (this runs first, so it must not clobber a later write).
     *app.hits.borrow_mut() = Hits {
         tabs,
         tab_row: area.y,
+        table_rows: None,
     };
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

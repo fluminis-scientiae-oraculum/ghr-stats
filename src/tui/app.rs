@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
 use crate::collectors::cpu::CpuRateTracker;
@@ -86,6 +87,9 @@ pub(crate) struct Hits {
     /// `(tab, x_start, x_end_exclusive)` on the tab-bar row.
     pub tabs: Vec<(Tab, u16, u16)>,
     pub tab_row: u16,
+    /// The Summary table's data-row region (below the header), for click-to-
+    /// select. `None` on non-Summary views / when nothing is drawn there.
+    pub table_rows: Option<Rect>,
 }
 
 pub(crate) struct App {
@@ -373,22 +377,45 @@ impl App {
             MouseEventKind::ScrollDown if self.scrollable() => self.move_selection(1),
             MouseEventKind::ScrollUp if self.scrollable() => self.move_selection(-1),
             MouseEventKind::Down(MouseButton::Left) => {
-                let clicked = {
+                // A click resolves to at most one target; snapshot the hit cache,
+                // then act (so the `hits` borrow is released before `&mut self`).
+                let (tab, rows) = {
                     let hit = self.hits.borrow();
-                    if m.row == hit.tab_row {
-                        hit.tabs
-                            .iter()
-                            .find(|(_, a, b)| m.column >= *a && m.column < *b)
-                            .map(|(t, _, _)| *t)
-                    } else {
-                        None
-                    }
+                    let tab = (m.row == hit.tab_row)
+                        .then(|| {
+                            hit.tabs
+                                .iter()
+                                .find(|(_, a, b)| m.column >= *a && m.column < *b)
+                                .map(|(t, _, _)| *t)
+                        })
+                        .flatten();
+                    (tab, hit.table_rows)
                 };
-                if let Some(t) = clicked {
+                if let Some(t) = tab {
                     self.set_tab(t);
+                } else if let Some(r) = rows {
+                    self.select_at_row(r, m.column, m.row);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Select the Summary row under a click at `(col, row)`, if it lands on the
+    /// table's data region and a runner exists there (respecting the scroll
+    /// offset). Summary-only, like the scroll wheel.
+    fn select_at_row(&mut self, region: Rect, col: u16, row: u16) {
+        if !self.scrollable() {
+            return;
+        }
+        let in_x = col >= region.x && col < region.x.saturating_add(region.width);
+        let in_y = row >= region.y && row < region.y.saturating_add(region.height);
+        if !in_x || !in_y {
+            return;
+        }
+        let idx = self.table.offset() + (row - region.y) as usize;
+        if idx < self.runners.len() {
+            self.table.select(Some(idx));
         }
     }
 
