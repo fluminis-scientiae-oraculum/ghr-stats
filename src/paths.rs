@@ -78,16 +78,28 @@ impl Scope {
     }
 }
 
+/// An explicitly-pointed config target, shared by load-resolution AND the
+/// write-target so the two can never diverge on the tiers they have in common:
+/// an explicit `--config`, then `$GHR_STATS_CONFIG`. `None` ⇒ neither was given,
+/// so the caller falls back to its own policy (load: the scope file if it exists;
+/// write: the sudo-invoker's home, else the scope file). Keeping this in one
+/// place is the whole point — a config edit must land back in the file it was
+/// loaded from (previously `$GHR_STATS_CONFIG` was honored on load but ignored on
+/// write, so edits silently went to a different file).
+fn explicit_config_target(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    std::env::var_os("GHR_STATS_CONFIG").map(PathBuf::from)
+}
+
 /// Resolve which config file to load, if any.
 ///
 /// Order: explicit `--config` → `$GHR_STATS_CONFIG` → the scope's `config.toml`
 /// if it exists. `None` ⇒ run on built-in defaults.
 pub fn resolve_config(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = explicit {
-        return Some(p.to_path_buf());
-    }
-    if let Some(p) = std::env::var_os("GHR_STATS_CONFIG") {
-        return Some(PathBuf::from(p));
+    if let Some(p) = explicit_config_target(explicit) {
+        return Some(p);
     }
     let scoped = Scope::detect().config_file();
     scoped.exists().then_some(scoped)
@@ -107,16 +119,19 @@ fn sudo_invoker() -> Option<uzers::User> {
 
 /// Where `ghr-stats config` and the TUI's config edits WRITE the config file.
 ///
-/// Explicit `--config` wins; else, when running under sudo, the invoking user's
-/// `~/.config/ghr-stats/config.toml` (so their non-root TUI reads it — NOT
-/// root's `/etc`, which a non-root process can't read); else the current scope's
-/// file. Pair with [`chown_to_invoker`] so a `0600` file written by root stays
-/// readable by that user. This is what lets `sudo ghr-stats config` (sudo only
-/// for hooks) coexist with a plain `ghr-stats` TUI.
+/// Order: explicit `--config` → `$GHR_STATS_CONFIG` → (under sudo) the invoking
+/// user's `~/.config/ghr-stats/config.toml` (so their non-root TUI reads it —
+/// NOT root's `/etc`, which a non-root process can't read) → the current scope's
+/// file. The first two tiers are shared verbatim with [`resolve_config`] via
+/// [`explicit_config_target`], so a config loaded from `$GHR_STATS_CONFIG` is
+/// also WRITTEN there (edits round-trip to the same file). Pair with
+/// [`chown_to_invoker`] so a `0600` file written by root stays readable by that
+/// user. This is what lets `sudo ghr-stats config` (sudo only for hooks) coexist
+/// with a plain `ghr-stats` TUI.
 pub fn config_write_target(explicit: Option<&Path>) -> PathBuf {
     use uzers::os::unix::UserExt;
-    if let Some(p) = explicit {
-        return p.to_path_buf();
+    if let Some(p) = explicit_config_target(explicit) {
+        return p;
     }
     if let Some(u) = sudo_invoker() {
         return u.home_dir().join(".config/ghr-stats/config.toml");
@@ -179,6 +194,22 @@ mod tests {
             Scope::System.bin_path(),
             PathBuf::from("/usr/local/bin/ghr-stats")
         );
+    }
+
+    #[test]
+    fn explicit_config_target_is_shared_by_load_and_write() {
+        // Alignment guarantee: an explicitly-pointed config is BOTH loaded from
+        // and written back to the same file. `resolve_config` and
+        // `config_write_target` must agree on the shared tiers — previously
+        // `$GHR_STATS_CONFIG` was honored on load but ignored on write, so an
+        // edit silently landed in a different file. Explicit `--config` exercises
+        // the shared `explicit_config_target` path without touching process env
+        // or euid, so this stays deterministic under the parallel test runner.
+        let p = Path::new("/etc/ghr-stats/pinned.toml");
+        assert_eq!(explicit_config_target(Some(p)), Some(p.to_path_buf()));
+        assert_eq!(resolve_config(Some(p)), Some(p.to_path_buf()));
+        // Explicit wins over the sudo-invoker / scope fallback in write-target.
+        assert_eq!(config_write_target(Some(p)), p.to_path_buf());
     }
 
     #[test]
