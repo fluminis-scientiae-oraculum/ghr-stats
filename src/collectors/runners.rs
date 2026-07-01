@@ -220,6 +220,15 @@ fn probe_one(
     }
 }
 
+/// Liveness of the runner owning `uid`, from a process snapshot — the cheap
+/// idle-gate for host-mutating ops (a one-shot `procscan::scan()` feeds every
+/// runner). Same rule as [`probe_one`], so the gate can't disagree with the
+/// dashboard's own liveness.
+pub(crate) fn liveness_for(uid: u32, procs: &[ProcInfo]) -> Liveness {
+    let mine: Vec<&ProcInfo> = procs.iter().filter(|p| p.uid == uid).collect();
+    liveness_of(&mine)
+}
+
 /// Classify liveness from a runner's own processes.
 fn liveness_of(mine: &[&ProcInfo]) -> Liveness {
     if mine.iter().any(|p| p.comm == WORKER_COMM) {

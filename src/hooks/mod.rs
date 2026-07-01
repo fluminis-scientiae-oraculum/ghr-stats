@@ -5,5 +5,7 @@
 //! from `collectors` on purpose: these read and manage the runner-hook
 //! contract, they do not sample host resources.
 
+pub mod env;
 pub mod ingest;
 pub mod install;
+pub mod uninstall;

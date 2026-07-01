@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Top-level CLI. With no subcommand, launches the TUI.
 #[derive(Parser, Debug)]
@@ -66,6 +66,62 @@ pub enum Command {
         #[command(subcommand)]
         action: DbAction,
     },
+
+    /// Remove what ghr-stats installed — hooks, service, config, data, binary.
+    #[command(
+        long_about = "Reverse an install. With NO domain this prints a dry-run PLAN of \
+        everything ghr-stats put on this host and removes nothing — a safe \"what's installed\" \
+        preview. Name one or more domains (or `all`) to actually remove; you are asked to confirm \
+        first unless --yes is given.\n\n\
+        Domains: hooks · service · config · data · binary · all.\n\n\
+        Hooks are reverted the way they were installed — detect-first, NEVER stranding a foreign \
+        hook: a runner ghr-stats chained is restored to its original hook, a foreign or untouched \
+        runner is left alone. Editing runner .env files needs root (same as install).\n\n\
+        `config` deletes the file holding your GitHub PAT(s) (unlinked, not shredded — revoke the \
+        token on GitHub to be sure). `all` also removes the SQLite history + event log. The \
+        installed binary copy is removed; a `cargo install` build prints the `cargo uninstall` \
+        command instead.\n\n\
+        Examples:\n\
+        \x20 ghr-stats uninstall                 # dry-run plan, removes nothing\n\
+        \x20 ghr-stats uninstall hooks           # just revert the runner hooks\n\
+        \x20 ghr-stats uninstall config data     # remove the PAT config + history\n\
+        \x20 sudo ghr-stats uninstall all --yes  # everything, no prompt"
+    )]
+    Uninstall(UninstallArgs),
+}
+
+/// Which parts of an install to remove. No domain ⇒ dry-run plan of everything.
+#[derive(Args, Debug)]
+pub struct UninstallArgs {
+    /// Domains to remove (space-separated). Omit for a dry-run plan of everything.
+    #[arg(value_enum)]
+    pub domains: Vec<UninstallDomain>,
+    /// Execute without the interactive confirm (for scripts / headless).
+    #[arg(long)]
+    pub yes: bool,
+    /// Force system scope (/etc, /var/lib, /usr/local/bin). Default: from euid.
+    #[arg(long, conflicts_with = "user")]
+    pub system: bool,
+    /// Force user scope (XDG base dirs). Default: from euid.
+    #[arg(long, conflicts_with = "system")]
+    pub user: bool,
+}
+
+/// A removable install domain. `All` = every other domain at once.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UninstallDomain {
+    /// Runner job hooks (restore any chained foreign hook; needs root).
+    Hooks,
+    /// The systemd service unit.
+    Service,
+    /// The config file — holds your GitHub PAT(s).
+    Config,
+    /// The SQLite history database + event log.
+    Data,
+    /// The installed binary (or a `cargo uninstall` hint).
+    Binary,
+    /// Everything above.
+    All,
 }
 
 #[derive(Subcommand, Debug)]

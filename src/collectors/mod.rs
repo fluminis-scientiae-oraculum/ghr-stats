@@ -5,7 +5,7 @@
 mod cgroup;
 pub mod cpu;
 pub mod host;
-mod procscan;
+pub(crate) mod procscan;
 pub mod runners;
 
 use std::path::PathBuf;

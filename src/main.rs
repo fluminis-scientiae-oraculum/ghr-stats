@@ -13,6 +13,7 @@ mod serve;
 mod store;
 mod systemd;
 mod tui;
+mod uninstall;
 mod util;
 
 // Platform boundary (subtract > abstract). Host integration is Linux-only:
@@ -53,6 +54,9 @@ fn main() -> Result<()> {
         Some(Command::Serve) => serve::run(&load()?),
         Some(Command::Systemd { action }) => systemd::run(action, &load()?),
         Some(Command::Db { action }) => run_db(action, &load()?),
+        // Uninstall must work when the config is absent or being removed, so it
+        // resolves paths itself rather than going through the lazy `load`.
+        Some(Command::Uninstall(a)) => uninstall::run(&a, config_path.as_deref()),
     }
 }
 

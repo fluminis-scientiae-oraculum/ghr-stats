@@ -15,6 +15,12 @@ use crate::error::Result;
 const STARTED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_STARTED";
 const COMPLETED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_COMPLETED";
 
+/// Provenance marker written into every chain wrapper so `uninstall` can recover
+/// the operator's ORIGINAL hook path unambiguously (a stable comment, not a
+/// re-parse of the exec line). Reversing a chained runner must restore this exact
+/// path — never leave the runner hookless (the inverse of never-clobber).
+const WRAP_MARKER: &str = "# ghr-stats-wraps:";
+
 /// Our hook scripts, embedded so the binary is self-contained for any adopter.
 const STARTED_SCRIPT: &str = include_str!("../../packaging/hooks/job-started.sh");
 const COMPLETED_SCRIPT: &str = include_str!("../../packaging/hooks/job-completed.sh");
@@ -143,12 +149,62 @@ pub(crate) fn render_chain_wrapper(original: &Path, ours: &Path) -> String {
         "#!/usr/bin/env bash\n\
          # ghr-stats hook chain wrapper — runs the existing hook, then records\n\
          # the ghr-stats event (best-effort). Preserves the original's exit code.\n\
+         {WRAP_MARKER} {orig}\n\
          \"{orig}\" \"$@\"; rc=$?\n\
          \"{ours}\" \"$@\" >/dev/null 2>&1 || true\n\
          exit \"$rc\"\n",
         orig = original.display(),
         ours = ours.display(),
     )
+}
+
+/// Remove BOTH hook vars from `.env` content, preserving every other line — the
+/// inverse of [`rewrite_env`] for a runner we installed *fresh* (its pre-install
+/// state was [`HookStatus::Unset`]). Restoring a *chained* runner instead reuses
+/// [`rewrite_env`] with the recovered originals. Pure.
+pub(crate) fn remove_hook_vars(existing: &str) -> String {
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.starts_with(STARTED_VAR) && !t.starts_with(COMPLETED_VAR)
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    let mut s = kept.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Recover the operator's ORIGINAL hook path from a chain wrapper's text, so
+/// uninstall can restore it. Reads the [`WRAP_MARKER`] provenance line written by
+/// [`render_chain_wrapper`]; falls back to the first quoted path on the exec line
+/// for any wrapper written before the marker existed. Pure.
+pub(crate) fn original_from_wrapper(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix(WRAP_MARKER) {
+            let p = rest.trim();
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    // Pre-marker fallback: the first `"…"`-quoted token on a non-comment line
+    // (the wrapper's exec line is `"<orig>" "$@"; rc=$?`).
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Some(inner) = t.split('"').nth(1)
+            && !inner.is_empty()
+        {
+            return Some(PathBuf::from(inner));
+        }
+    }
+    None
 }
 
 /// The snippet printed for the "instruct" path (operator adds it to their hook).
@@ -212,12 +268,87 @@ mod tests {
 
     #[test]
     fn chain_wrapper_runs_both_and_preserves_rc() {
-        let w = render_chain_wrapper(
-            Path::new("/usr/local/sbin/cleanup-started.sh"),
-            Path::new("/var/lib/ghr-stats/hooks/job-started.sh"),
-        );
+        let orig = Path::new("/usr/local/sbin/cleanup-started.sh");
+        let w = render_chain_wrapper(orig, Path::new("/var/lib/ghr-stats/hooks/job-started.sh"));
         assert!(w.contains("/usr/local/sbin/cleanup-started.sh"));
         assert!(w.contains("/var/lib/ghr-stats/hooks/job-started.sh"));
         assert!(w.contains("exit \"$rc\""));
+        // The provenance marker must be present AND recover the exact original,
+        // or uninstall could strand the operator's hook. (Regression pin.)
+        assert!(w.contains(WRAP_MARKER));
+        assert_eq!(original_from_wrapper(&w).as_deref(), Some(orig));
+    }
+
+    #[test]
+    fn original_from_wrapper_reads_marker_then_falls_back() {
+        // Marker present (the wrapper we render today).
+        let w = render_chain_wrapper(
+            Path::new("/opt/hooks/foreign.sh"),
+            Path::new("/var/lib/ghr-stats/hooks/job-started.sh"),
+        );
+        assert_eq!(
+            original_from_wrapper(&w).as_deref(),
+            Some(Path::new("/opt/hooks/foreign.sh"))
+        );
+        // Pre-marker wrapper: recover from the first quoted exec token.
+        let legacy =
+            "#!/usr/bin/env bash\n# old\n\"/opt/hooks/foreign.sh\" \"$@\"; rc=$?\nexit \"$rc\"\n";
+        assert_eq!(
+            original_from_wrapper(legacy).as_deref(),
+            Some(Path::new("/opt/hooks/foreign.sh"))
+        );
+        assert_eq!(original_from_wrapper("not a wrapper\n"), None);
+    }
+
+    #[test]
+    fn remove_hook_vars_drops_both_and_preserves_others() {
+        let existing = "TMPDIR=/var/tmp/runner\n\
+                        ACTIONS_RUNNER_HOOK_JOB_STARTED=/h/job-started.sh\n\
+                        KEEP=1\n\
+                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/h/job-completed.sh\n";
+        let out = remove_hook_vars(existing);
+        assert_eq!(out, "TMPDIR=/var/tmp/runner\nKEEP=1\n");
+        // An .env that was ONLY our two vars reverts to empty (true unset).
+        let only = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/h/job-started.sh\n\
+                    ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/h/job-completed.sh\n";
+        assert_eq!(remove_hook_vars(only), "");
+    }
+
+    #[test]
+    fn fresh_install_reverses_to_unset() {
+        // unset (other lines only) → install → remove ⇒ byte-identical original.
+        let original = "TMPDIR=/var/tmp/runner\nKEEP=1\n";
+        let installed = rewrite_env(
+            original,
+            Path::new("/var/lib/ghr-stats/hooks/job-started.sh"),
+            Path::new("/var/lib/ghr-stats/hooks/job-completed.sh"),
+        );
+        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
+        assert_eq!(remove_hook_vars(&installed), original);
+    }
+
+    #[test]
+    fn chained_install_reverses_to_original_foreign() {
+        // A foreign runner (canonical STARTED-then-COMPLETED order) → chain → the
+        // uninstall reversal must restore the exact original .env, byte-for-byte.
+        let original = "TMPDIR=/var/tmp/runner\n\
+                        ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup-started.sh\n\
+                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup-completed.sh\n";
+        // Install's chain step (mirrors config_wizard::chain_for).
+        let (orig_started, orig_completed) = current_hook_paths(original);
+        let wrap_started = our().join("chain-runner-01-started.sh");
+        let wrap_completed = our().join("chain-runner-01-completed.sh");
+        let ws = render_chain_wrapper(Path::new(&orig_started.unwrap()), &wrap_started);
+        let wc = render_chain_wrapper(Path::new(&orig_completed.unwrap()), &wrap_completed);
+        let installed = rewrite_env(original, &wrap_started, &wrap_completed);
+        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
+
+        // Uninstall reversal: recover the originals from the wrappers, restore.
+        let restored = rewrite_env(
+            &installed,
+            &original_from_wrapper(&ws).unwrap(),
+            &original_from_wrapper(&wc).unwrap(),
+        );
+        assert_eq!(restored, original); // never stranded — the foreign hook is back
     }
 }

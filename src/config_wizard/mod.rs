@@ -341,8 +341,11 @@ fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
     let env_path = r.dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let new = install::rewrite_env(&existing, started, completed);
-    if write_env_as_root(&env_path, &new, &r.user) {
+    let out = crate::hooks::env::write_env_as_root(&env_path, &new, &r.user);
+    if out.is_ok() {
         restart_runner(r);
+    } else {
+        println!("    ✗ {}", out.describe("wire .env"));
     }
 }
 
@@ -362,8 +365,11 @@ fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: 
         let _ = write_script(&wrap_completed, &w);
     }
     let new = install::rewrite_env(&existing, &wrap_started, &wrap_completed);
-    if write_env_as_root(&env_path, &new, &r.user) {
+    let out = crate::hooks::env::write_env_as_root(&env_path, &new, &r.user);
+    if out.is_ok() {
         restart_runner(r);
+    } else {
+        println!("    ✗ {}", out.describe("wire .env"));
     }
 }
 
@@ -375,28 +381,6 @@ fn write_script(path: &Path, content: &str) -> std::io::Result<()> {
         .mode(0o755)
         .open(path)?;
     f.write_all(content.as_bytes())
-}
-
-/// Install `content` to `env_path` owned by `user` (the runner's `.env` is
-/// runner-user-owned, so this needs root). Returns whether it succeeded.
-fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> bool {
-    let tmp = std::env::temp_dir().join(format!("ghr-env-{}", std::process::id()));
-    if std::fs::write(&tmp, content).is_err() {
-        println!("    ✗ could not stage .env update");
-        return false;
-    }
-    let (tmp_s, env_s) = (tmp.to_string_lossy(), env_path.to_string_lossy());
-    let args = [
-        "install", "-o", user, "-g", user, "-m", "0644", &tmp_s, &env_s,
-    ];
-    let outcome = privileged::run(&args);
-    let _ = std::fs::remove_file(&tmp);
-    if outcome.is_ok() {
-        true
-    } else {
-        println!("    ✗ {}", outcome.describe("wire .env"));
-        false
-    }
 }
 
 fn restart_runner(r: &RunnerInfo) {

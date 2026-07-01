@@ -24,7 +24,8 @@ pub fn run(action: SystemdAction, _cfg: &Config) -> Result<()> {
 }
 
 /// Explicit `--system`/`--user` win; otherwise derive from the effective uid.
-fn resolve_scope(system: bool, user: bool) -> Scope {
+/// Shared with `uninstall`, which resolves scope the same way.
+pub(crate) fn resolve_scope(system: bool, user: bool) -> Scope {
     match (system, user) {
         (true, _) => Scope::System,
         (_, true) => Scope::User,
@@ -60,7 +61,9 @@ fn install(scope: Scope) -> Result<()> {
     Ok(())
 }
 
-fn uninstall(scope: Scope) -> Result<()> {
+/// Disable + remove the service unit (best-effort), leaving data in place. Shared
+/// with the top-level `uninstall` orchestrator's `--service` domain.
+pub(crate) fn uninstall(scope: Scope) -> Result<()> {
     let unit_path = scope.systemd_unit_path();
     // Best-effort: the unit may already be gone.
     let _ = systemctl(scope, &["disable", "--now", UNIT_NAME]);
