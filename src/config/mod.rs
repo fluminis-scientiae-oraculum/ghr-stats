@@ -5,6 +5,7 @@
 //! schema, its defaults, and read-only token resolution. Every field has a
 //! default, so the tool runs with no config at all.
 
+pub(crate) mod persist;
 mod secret;
 
 use std::collections::BTreeMap;

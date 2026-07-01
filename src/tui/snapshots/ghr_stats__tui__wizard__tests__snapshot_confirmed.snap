@@ -1,0 +1,28 @@
+---
+source: src/tui/wizard.rs
+expression: render(&mode)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                ┌ Confirm ─────────────────────────────────────┐                "
+"                │                                              │                "
+"                │  example-org — valid, 3/4 local runners      │                "
+"                │matched.                                      │                "
+"                │  Save this read-only token to the config     │                "
+"                │(0600)?                                       │                "
+"                │                                              │                "
+"                │  [y] save · [n] cancel                       │                "
+"                │                                              │                "
+"                └──────────────────────────────────────────────┘                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

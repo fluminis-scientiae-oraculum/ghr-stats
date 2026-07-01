@@ -98,8 +98,9 @@ pub(crate) fn draw_confirm(f: &mut Frame, prompt: &ConfirmPrompt) {
     f.render_widget(popup, area);
 }
 
-/// A rectangle `pct_x`% × `pct_y`% of `area`, centered.
-fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+/// A rectangle `pct_x`% × `pct_y`% of `area`, centered. Shared by the confirm
+/// popup and the config wizard overlay.
+pub(crate) fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
     let vy = (100 - pct_y) / 2;
     let vx = (100 - pct_x) / 2;
     let col = Layout::vertical([

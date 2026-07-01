@@ -162,7 +162,7 @@ impl Drop for Suspension<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::action::AddOrg;
+    use crate::tui::action::RestartRunner;
 
     // Test-only token minting. Production code CANNOT mint these — that is the
     // guarantee — but tests need to exercise the transitions without a TTY.
@@ -207,7 +207,10 @@ mod tests {
 
     #[test]
     fn cancel_returns_to_browsing_without_executing() {
-        let confirm = Screen::<Browsing>::new().confirm(ActionKind::AddOrg(AddOrg));
+        let confirm = Screen::<Browsing>::new().confirm(ActionKind::Restart(RestartRunner {
+            unit: "x.service".to_string(),
+            agent_id: 1,
+        }));
         let _back: Screen<Browsing> = confirm.cancel();
     }
 }

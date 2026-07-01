@@ -1,0 +1,28 @@
+---
+source: src/tui/wizard.rs
+expression: render(&mode)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                ┌ Add PAT ─────────────────────────────────────┐                "
+"                │  org  example-org                            │                "
+"                │  Fine-grained PAT (github_pat_…):            │                "
+"                │•••••••••••••••▏                              │                "
+"                │  ✗ token lacks 'Self-hosted runners: Read' on│                "
+"                │example-org                                   │                "
+"                │                                              │                "
+"                │  [Enter] validate · [Esc] cancel             │                "
+"                │                                              │                "
+"                └──────────────────────────────────────────────┘                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

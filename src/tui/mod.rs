@@ -9,8 +9,10 @@ mod action;
 mod app;
 mod screen;
 mod views;
+mod wizard;
 
 use std::io::stdout;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -20,7 +22,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::{DefaultTerminal, Frame};
 
-use action::{ActionKind, AddOrg};
+use action::ActionKind;
 use app::{App, Tab};
 use screen::{Confirm, Screen, ScreenState, Suspension};
 
@@ -31,10 +33,12 @@ const REFRESH: Duration = Duration::from_millis(2000);
 
 /// Set up the terminal, run the event loop, and always restore on exit.
 /// `ratatui::init` also installs a panic hook that restores the terminal.
-pub fn run(cfg: &Config) -> Result<()> {
+/// `config_path` is the resolved `--config` override (if any) — threaded so the
+/// native config wizard writes back to the same file the run loaded.
+pub fn run(cfg: &Config, config_path: Option<&Path>) -> Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(stdout(), EnableMouseCapture);
-    let result = event_loop(&mut terminal, cfg);
+    let result = event_loop(&mut terminal, cfg, config_path);
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -48,8 +52,12 @@ enum Next {
     Execute(Screen<Confirm<ActionKind>>),
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, cfg: &Config) -> Result<()> {
-    let mut app = App::new(cfg.clone());
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    cfg: &Config,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    let mut app = App::new(cfg.clone(), config_path.map(Path::to_path_buf));
     app.refresh();
     let mut mode = ScreenState::browsing();
     let mut last_tick = Instant::now();
@@ -61,6 +69,13 @@ fn event_loop(terminal: &mut DefaultTerminal, cfg: &Config) -> Result<()> {
         if event::poll(timeout)? {
             // Every arm moves `mode` into `next`; `mode` is reassigned by `drive`.
             let next = match event::read()? {
+                // The native config wizard is a modal overlay: while it is open it
+                // captures every key (text input), so it is routed BEFORE the
+                // browsing/confirm state machine. It never suspends the terminal.
+                Event::Key(k) if k.kind == KeyEventKind::Press && app.wizard_open() => {
+                    app.wizard_key(k.code);
+                    Next::Mode(mode)
+                }
                 Event::Key(k) if k.kind == KeyEventKind::Press => route_key(mode, &mut app, k.code),
                 Event::Mouse(m) => route_mouse(mode, &mut app, m),
                 _ => Next::Mode(mode),
@@ -87,11 +102,11 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
     match mode {
         ScreenState::Browsing(scr) => {
             // Action triggers are armed here (Browsing -> Confirm).
-            // Config tab: 'a' arms the config wizard.
+            // Config tab: 'a' opens the native config wizard (a no-teardown popup,
+            // handled app-side — the loop stays in Browsing).
             if app.tab == Tab::Config && app.drill.is_none() && code == KeyCode::Char('a') {
-                return Next::Mode(ScreenState::Confirm(
-                    scr.confirm(ActionKind::AddOrg(AddOrg)),
-                ));
+                app.open_wizard();
+                return Next::Mode(ScreenState::Browsing(scr));
             }
             // Detail drill-down: R = restart, C = recycle (idle-only) the runner.
             if app.drill.is_some() {
@@ -144,5 +159,11 @@ fn render(f: &mut Frame, app: &App, mode: &ScreenState) {
     views::draw(f, app);
     if let ScreenState::Confirm(scr) = mode {
         views::draw_confirm(f, &scr.prompt());
+    }
+    // The wizard overlay is drawn last so it sits atop the dashboard + any
+    // confirm popup. (In practice the two are mutually exclusive — the wizard
+    // opens only from Browsing.)
+    if let Some(w) = app.wizard() {
+        wizard::draw(f, w);
     }
 }

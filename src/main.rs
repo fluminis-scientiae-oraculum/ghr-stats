@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     match args.command {
         Some(Command::Config) => config_wizard::run(config_path.as_deref()),
         // Default (no subcommand) launches the TUI.
-        None | Some(Command::Tui) => tui::run(&load()?),
+        None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()),
         Some(Command::Serve) => serve::run(&load()?),
         Some(Command::Systemd { action }) => systemd::run(action, &load()?),
         Some(Command::Db { action }) => run_db(action, &load()?),

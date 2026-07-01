@@ -1,0 +1,28 @@
+---
+source: src/tui/wizard.rs
+expression: render(&mode)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                ┌ Done ────────────────────────────────────────┐                "
+"                │                                              │                "
+"                │  ✓ saved read-only token for example-org (3/4│                "
+"                │local runners matched)                        │                "
+"                │                                              │                "
+"                │  [any key] close                             │                "
+"                │                                              │                "
+"                │                                              │                "
+"                │                                              │                "
+"                └──────────────────────────────────────────────┘                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

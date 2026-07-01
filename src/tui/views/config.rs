@@ -1,6 +1,7 @@
-//! The Config tab: a read-only dashboard of resolved paths, sampler status,
-//! configured tokens, and metrics settings. Editing is via `ghr-stats config`
-//! (the wizard); in-TUI mutating actions land in a later phase.
+//! The Config tab: resolved paths, sampler status, configured tokens, and
+//! metrics settings. Press `[a]` to add an org + read-only PAT via the native
+//! in-TUI wizard (`tui::wizard`); the full flow (hooks, metrics) stays on the
+//! CLI `ghr-stats config`.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -75,7 +76,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     lines.push(kv("push", &push));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  Edit configuration with `ghr-stats config`.",
+        "  [a] add org + read-only PAT   ·   `ghr-stats config` for hooks + metrics",
         Style::new().fg(Color::DarkGray),
     )));
 

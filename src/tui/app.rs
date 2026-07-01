@@ -25,6 +25,7 @@ use crate::paths::Scope;
 use crate::store::Store;
 use crate::store::reader::{self, ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
 use crate::tui::action::{ActionKind, RecycleRunner, RestartRunner};
+use crate::tui::wizard::{self, WizardMode};
 use crate::util::now_epoch;
 
 const HISTORY_POINTS: usize = 120;
@@ -89,6 +90,12 @@ pub(crate) struct Hits {
 
 pub(crate) struct App {
     cfg: Config,
+    /// The `--config` override (if any), so the native config wizard writes back
+    /// to the same file this run loaded; `None` ⇒ the scope's default path.
+    config_path: Option<PathBuf>,
+    /// The native config wizard, when open. `Some` makes the loop route every key
+    /// to it (modal) and render its popup. A no-teardown overlay (see `wizard`).
+    wizard: Option<WizardMode>,
     /// Read-only handle; `None` if the DB could not be opened.
     store: Option<Store>,
     /// Derives per-runner CPU% from cgroup-usage deltas between ticks.
@@ -117,7 +124,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(cfg: Config) -> Self {
+    pub(crate) fn new(cfg: Config, config_path: Option<PathBuf>) -> Self {
         let (store, status) = match Store::open(&cfg.db_path) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(format!("database unavailable: {e}"))),
@@ -126,6 +133,8 @@ impl App {
         table.select(Some(0));
         Self {
             cfg,
+            config_path,
+            wizard: None,
             store,
             cpu: CpuRateTracker::new(),
             edges: HashMap::new(),
@@ -149,6 +158,65 @@ impl App {
 
     pub(crate) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    // ---- native config wizard (see `tui::wizard`) ----
+
+    /// Whether the modal config wizard is open (⇒ the loop routes keys to it).
+    pub(crate) fn wizard_open(&self) -> bool {
+        self.wizard.is_some()
+    }
+
+    /// The wizard state to render, if open.
+    pub(crate) fn wizard(&self) -> Option<&WizardMode> {
+        self.wizard.as_ref()
+    }
+
+    /// Open the wizard at its action menu (from the Config tab `[a]`).
+    pub(crate) fn open_wizard(&mut self) {
+        self.wizard = Some(WizardMode::new());
+    }
+
+    /// Route one key to the open wizard, advancing or closing it. A close that
+    /// changed the config reloads it so the Config tab reflects the new token.
+    pub(crate) fn wizard_key(&mut self, code: KeyCode) {
+        let Some(mode) = self.wizard.take() else {
+            return;
+        };
+        let ctx = self.wizard_ctx();
+        match mode.on_key(code, &ctx) {
+            wizard::Step::Stay(next) => self.wizard = Some(next),
+            wizard::Step::Close(changed) => {
+                if changed {
+                    self.reload_cfg();
+                }
+            }
+        }
+    }
+
+    /// What the wizard needs to act: the locally-discovered runner ids (for the
+    /// agentId match) and the config file to write.
+    fn wizard_ctx(&self) -> wizard::WizardCtx {
+        wizard::WizardCtx {
+            local_ids: self.runners.iter().map(|r| r.agent_id).collect(),
+            target: self.config_target(),
+        }
+    }
+
+    /// The config file the wizard writes: the `--config` override, else the
+    /// privilege scope's default `config.toml` (matches `ghr-stats config`).
+    fn config_target(&self) -> PathBuf {
+        self.config_path
+            .clone()
+            .unwrap_or_else(|| Scope::detect().config_file())
+    }
+
+    /// Reload config from disk after a wizard write, then refresh the views.
+    fn reload_cfg(&mut self) {
+        if let Ok(cfg) = Config::load(self.config_path.as_deref()) {
+            self.cfg = cfg;
+        }
+        self.refresh();
     }
 
     /// Sample the fleet LIVE (in-memory, display-only) for the now-view, and read

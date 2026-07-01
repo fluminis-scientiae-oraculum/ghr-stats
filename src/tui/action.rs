@@ -70,9 +70,6 @@ impl RecycleRunner {
     }
 }
 
-/// Launch the dialoguer config wizard on the real TTY.
-pub(crate) struct AddOrg;
-
 impl PrivilegedExecution for RestartRunner {
     // `ensure` defaults: a restart only needs sudo, not a root process.
     fn contract(&self) -> Outcome {
@@ -138,29 +135,13 @@ impl Action for RecycleRunner {
     }
 }
 
-impl Action for AddOrg {
-    fn prompt(&self) -> ConfirmPrompt {
-        ConfirmPrompt {
-            title: "Configure (org / PAT / hooks)".to_string(),
-            body: "Suspends the dashboard and runs the `ghr-stats config` wizard on this terminal."
-                .to_string(),
-            danger: false,
-        }
-    }
-    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-        match crate::config_wizard::run(None) {
-            Ok(()) => ActionOutcome::Ok("configuration updated".to_string()),
-            Err(e) => ActionOutcome::Failed(e.to_string()),
-        }
-    }
-}
-
-/// Closed erasure of the action set for the loop's `ScreenState` — zero heap,
-/// zero vtable, exhaustive. (`Box<dyn Action>` is a drop-in if it opens.)
+/// Closed erasure of the privileged action set for the loop's `ScreenState` —
+/// zero heap, zero vtable, exhaustive. (`Box<dyn Action>` is a drop-in if it
+/// opens.) Adding an org is NOT here: it is a native, no-teardown popup (see
+/// `tui::wizard`), not a suspend-to-TTY action.
 pub(crate) enum ActionKind {
     Restart(RestartRunner),
     Recycle(RecycleRunner),
-    AddOrg(AddOrg),
 }
 
 impl Action for ActionKind {
@@ -168,14 +149,12 @@ impl Action for ActionKind {
         match self {
             ActionKind::Restart(a) => a.prompt(),
             ActionKind::Recycle(a) => a.prompt(),
-            ActionKind::AddOrg(a) => a.prompt(),
         }
     }
     fn execute(&self, tty: &mut Tty) -> ActionOutcome {
         match self {
             ActionKind::Restart(a) => a.execute(tty),
             ActionKind::Recycle(a) => a.execute(tty),
-            ActionKind::AddOrg(a) => a.execute(tty),
         }
     }
 }
