@@ -5,6 +5,7 @@ mod config_wizard;
 mod error;
 mod github;
 mod hooks;
+mod ipc;
 mod metrics;
 mod model;
 mod paths;
@@ -18,7 +19,8 @@ mod util;
 
 // Platform boundary (subtract > abstract). Host integration is Linux-only:
 // runner liveness/cpu/mem come from procfs + cgroup v2, the host sampler reads
-// /sys + statvfs, and `serve`/`systemd` manage systemd units. Rather than ship a
+// /sys + statvfs, the collector's IPC uses AF_UNIX sockets, and `systemd`
+// manages the service unit. Rather than ship a
 // build that compiles elsewhere yet silently can't sample anything, state the
 // boundary and fail fast. A thinner macOS build (launchd + Mac process
 // introspection, TUI as a pure DB reader) is future work — see README "Platform".

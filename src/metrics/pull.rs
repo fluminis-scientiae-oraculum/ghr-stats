@@ -2,7 +2,6 @@
 //! default (see `PullConfig::addr`). The single-threaded recv loop uses a short
 //! timeout so it observes the shutdown flag promptly.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -13,6 +12,7 @@ use tiny_http::{Header, Response, Server};
 
 use crate::config::Config;
 use crate::metrics::encode::Snapshot;
+use crate::store::open_reader;
 use crate::util::now_epoch;
 
 pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -51,19 +51,6 @@ pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
             tracing::debug!("metrics pull stopped");
         })
         .expect("spawn metrics-pull")
-}
-
-fn open_reader(db: &Path) -> Option<Connection> {
-    match Connection::open(db) {
-        Ok(c) => {
-            let _ = c.busy_timeout(Duration::from_secs(5));
-            Some(c)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "metrics pull: open db");
-            None
-        }
-    }
 }
 
 fn body(conn: Option<&Connection>, version: &str) -> String {

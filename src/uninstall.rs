@@ -459,6 +459,9 @@ fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBu
 }
 
 /// The data-domain files (database + WAL/SHM sidecars, event log, serve lock).
+/// The IPC socket is deliberately NOT here: it lives on tmpfs under the unit's
+/// RuntimeDirectory=, torn down by `systemd::uninstall` (the `service` domain),
+/// not left in `data_dir`.
 fn data_files(scope: Scope) -> Vec<PathBuf> {
     let db = scope.db_path();
     vec![

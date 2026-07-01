@@ -214,7 +214,7 @@ struct MetricsChoice {
 fn prompt_metrics(theme: &ColorfulTheme) -> Result<MetricsChoice> {
     let pull = confirm(
         theme,
-        "Expose Prometheus /metrics on loopback? (the daemon's reason to exist)",
+        "Expose Prometheus /metrics on loopback? (served by the collector service)",
         false,
     )?;
     let addr = if pull {

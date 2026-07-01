@@ -1,9 +1,10 @@
 # ghr-stats
 
 A mouse-driven terminal dashboard **and** Prometheus exporter for a
-**self-hosted GitHub Actions runner fleet**. A `serve` daemon samples every
-runner into a local SQLite history; the TUI reads that history to show a live
-"now" view, per-runner detail, recent jobs, and time-series trends.
+**self-hosted GitHub Actions runner fleet**. The TUI runs in two modes: an
+**Ephemeral** live dashboard standalone (no service, no database), or a
+**Persistent** dashboard once the collector service is installed — adding SQLite
+history, recent jobs, the GitHub reconcile, and a Prometheus exporter.
 
 It makes **zero host assumptions** — every fact comes from each runner's own
 `.runner` file and its processes/cgroup, so it works on any host running the
@@ -27,8 +28,9 @@ standard self-hosted runner, not just the box it was first built for.
 ## What it shows
 
 - **Summary** — every runner with local liveness, GitHub's view, CPU%, memory,
-  uptime; a host header (load / mem / disk); fleet + GitHub counts. A banner
-  appears if no fresh samples exist ("start `ghr-stats serve`").
+  uptime; a host header (load / mem / disk); fleet + GitHub counts. A mode badge
+  (top-right) reads **EPHEMERAL** or **PERSISTENT**; the GitHub counts appear
+  only in Persistent mode.
 - **Detail** (`Enter` on a runner) — identity (`agentId`/user/dir/group),
   idle/active-since, hook status, the in-flight job, and CPU/mem **charts** with
   a labeled time axis.
@@ -41,6 +43,27 @@ Keys: `↑↓`/`jk` move · `Enter` detail · `Tab`/`1`–`4` switch tab · `r` 
 Config: `a` add org+PAT · `h` install hooks · `m` toggle metrics · `o` open
 config. Mouse: click a tab or row, scroll the list. (See [Actions](#actions).)
 The footer shows the keys that apply to the current view; `?` opens full help.
+
+## Modes
+
+The dashboard adapts to whether the collector service is running:
+
+- **Ephemeral** (no service) — the TUI samples the fleet itself, in memory, every
+  couple of seconds. You get the live Summary, per-runner detail, and short
+  rolling Trends/sparklines covering *since you launched it*. Nothing is written
+  to disk; there is no GitHub reconcile and no Jobs history. Zero setup.
+- **Persistent** (collector installed) — `ghr-stats systemd install` runs the
+  collector as a service: it samples into SQLite, reconciles GitHub, tails the
+  job hooks, and exposes Prometheus metrics. The TUI detects the collector over a
+  Unix socket and pulls full history, Jobs, and the GitHub view from it.
+
+The TUI never opens the database directly — it talks to the collector over a
+loopback Unix socket. That keeps the dashboard a zero-privilege client and lets a
+**non-root TUI observe a root system service**: the socket crosses the scope
+boundary, while the `/var/lib` database (which only the service may open, WAL
+needing writer access to the directory) does not. The collector (`serve`) is
+managed by systemd and **refuses to run on a terminal** — you never invoke it by
+hand (set `GHR_STATS_ALLOW_TTY=1` only for dev/CI).
 
 ## Install
 
@@ -66,22 +89,24 @@ anyone on a different CPU. Needs a musl C compiler (`musl-gcc`, e.g. Arch
 ## Quick start
 
 ```bash
+ghr-stats                              # Ephemeral dashboard — works immediately, no setup
 ghr-stats config                       # interactive: discover runners, add PAT(s), set up hooks
-ghr-stats systemd install --user       # run `serve` as a per-user service
-ghr-stats                              # launch the dashboard (default command)
+ghr-stats systemd install --user       # install the collector → Persistent mode
 ```
 
-Run `serve` as a **user** service (it runs as the operator that owns the runner
-dirs — no root needed) and keep it alive without a login session:
+Installing the collector as a **user** service runs it as the operator that owns
+the runner dirs (no root needed); keep it alive without a login session:
 
 ```bash
 sudo loginctl enable-linger "$USER"
 journalctl --user -u ghr-stats -f
 ```
 
-For a system-wide deployment (root `serve`, `sudo ghr-stats` TUI), use
-`sudo ghr-stats systemd install --system`; it copies the binary to
-`/usr/local/bin` so both resolve the same path.
+For a system-wide deployment, `sudo ghr-stats systemd install --system` runs the
+collector as root under `/var/lib`. The TUI reaches it over the socket, so you
+can run the dashboard as **either** a plain user or `sudo ghr-stats`. Install
+copies the binary to `/usr/local/bin` so the unit and a later `sudo` resolve the
+same file.
 
 ## Configure
 
@@ -113,8 +138,8 @@ pointer to the right token type. Tokens are stored under `[github.tokens]`
 
 The Jobs/Detail job data comes from the runner's
 `ACTIONS_RUNNER_HOOK_JOB_STARTED`/`_COMPLETED` hooks, which append one NDJSON
-line per job to a shared event log that `serve` tails. A runner allows **exactly
-one** script per hook variable, and many operators already use them — so
+line per job to a shared event log that the collector tails. A runner allows
+**exactly one** script per hook variable, and many operators already use them — so
 ghr-stats **never clobbers**. Per runner it:
 
 - **unset** → installs its script and sets the variable;
@@ -124,7 +149,7 @@ ghr-stats **never clobbers**. Per runner it:
 - **ours** → idempotent no-op.
 
 Scripts always `exit 0` (a non-zero `JOB_STARTED` fails the job). The shared log
-must be writable by every runner user and readable by `serve` — see
+must be writable by every runner user and readable by the collector — see
 [`packaging/hooks/README.md`](packaging/hooks/README.md).
 
 ## Uninstall
@@ -161,8 +186,8 @@ install` build prints `cargo uninstall ghr-stats` instead (Cargo owns
 
 ## Metrics
 
-`serve` can also expose the fleet metrics (both off by default; enable in
-`[metrics]`):
+The collector can also expose the fleet metrics (both off by default; enable in
+`[metrics]`). These are Persistent-mode features — they need the service:
 
 - **Pull** — a tiny `/metrics` endpoint in Prometheus text format, bound to
   **`127.0.0.1:9477`** by default. The metrics are unauthenticated, so the bind
@@ -175,18 +200,19 @@ install` build prints `cargo uninstall ghr-stats` instead (Cargo owns
 
 ```bash
 ghr-stats                       # the dashboard (default; `tui` is a hidden alias)
-ghr-stats serve                 # sample the fleet into SQLite + expose metrics
+ghr-stats serve                 # the collector — systemd-managed; refuses to run on a terminal
 ghr-stats config                # the configuration wizard (orgs / PATs / hooks)
-ghr-stats systemd install --user | --system
+ghr-stats systemd install --user | --system   # install/enable the collector service
 ghr-stats systemd uninstall
 ghr-stats db prune --days 14    # drop time-series samples older than N days
 ghr-stats uninstall             # dry-run plan of everything installed (removes nothing)
 ghr-stats uninstall all --yes   # remove it all — hooks, service, config, data, binary
 ```
 
-Opening the store migrates it, so there is no `db init`. `db prune` keeps
-`job_event` and is safe while `serve` writes (SQLite WAL); `VACUUM` separately to
-reclaim file space after a large prune.
+You don't run `serve` yourself — `systemd install` does. Opening the store
+migrates it, so there is no `db init`. `db prune` keeps `job_event` and is safe
+while the collector writes (SQLite WAL); `VACUUM` separately to reclaim file
+space after a large prune.
 
 ## Actions
 
@@ -209,19 +235,21 @@ From a runner's Detail view, two remediations run behind a confirm prompt
 ## Platform
 
 Linux only, today. Runner liveness/CPU/memory come from procfs + cgroup v2, the
-host sampler reads `/sys` + `statvfs`, and `serve`/`systemd` manage systemd
-units — so the build fails fast on other platforms rather than shipping
-something that can't sample. A thinner macOS build (launchd + Mac process
-introspection, with the TUI as a pure DB reader) is future work.
+host sampler reads `/sys` + `statvfs`, the collector's IPC uses an `AF_UNIX`
+socket, and `systemd` manages the service — so the build fails fast on other
+platforms rather than shipping something that can't sample. A thinner macOS build
+(launchd + Mac process introspection) is future work.
 
 ## Design
 
-- **Fully synchronous, no async runtime.** `serve` is a handful of producer
+- **Fully synchronous, no async runtime.** The collector is a handful of producer
   threads (local sampler, GitHub reconcile, hook-log tail) feeding a single
-  SQLite-writer thread over a `crossbeam-channel`. SQLite runs in WAL so the TUI
-  reads while `serve` writes.
-- **Single writer, pure reader.** `serve` is the sole sampler and DB writer; the
-  TUI only reads.
+  SQLite-writer thread over a `crossbeam-channel`; metrics and the TUI's IPC read
+  on their own WAL connections. The TUI↔collector link is a length-prefixed JSON
+  protocol over a Unix socket — no HTTP framework, no runtime.
+- **Single writer, DB-agnostic client.** The collector is the sole DB writer and
+  reader; the TUI never opens the database — in Ephemeral mode it samples
+  in-memory, in Persistent mode it reads through the socket.
 - **Identity from `.runner`, never from systemd unit names** — `agentId` is the
   exact join key to the GitHub API.
 - **Two truths per runner** — local processes and the GitHub API, shown side by

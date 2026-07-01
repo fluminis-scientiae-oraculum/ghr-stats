@@ -1,5 +1,5 @@
-//! The Config tab: resolved paths, sampler status, configured tokens, and
-//! metrics settings, plus the in-TUI actions — `[a]` add org+PAT (native
+//! The Config tab: resolved paths, mode + collector status, configured tokens,
+//! and metrics settings, plus the in-TUI actions — `[a]` add org+PAT (native
 //! wizard), `[h]` install hooks, `[m]` toggle metrics, `[o]` open the file. The
 //! CLI `ghr-stats config` remains for a full guided first-run.
 
@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Padding, Paragraph};
 use crate::hooks::install::HookStatus;
 use crate::paths::Scope;
 use crate::tui::app::{App, LiveRunner};
+use crate::tui::history::Mode;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     let cfg = app.cfg();
@@ -34,19 +35,48 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     lines.push(kv("runner roots", &roots));
     lines.push(Line::raw(""));
 
-    lines.push(heading("Sampler"));
-    let (status, color) = if app.serve_up {
-        ("running", Color::Green)
-    } else {
-        (
-            "stopped — run `ghr-stats serve` for history + metrics",
-            Color::Yellow,
-        )
+    lines.push(heading("Mode"));
+    let mode = app.mode();
+    let (label, color) = match mode {
+        Mode::Persistent => ("Persistent", Color::Green),
+        Mode::Ephemeral => ("Ephemeral", Color::Yellow),
     };
     lines.push(Line::from(vec![
-        key("status"),
-        Span::styled(status, Style::new().fg(color)),
+        key("mode"),
+        Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD)),
     ]));
+    match mode {
+        Mode::Persistent => {
+            let scope = app.source_scope().unwrap_or_else(Scope::detect);
+            lines.push(kv(
+                "collector",
+                &format!("connected · {}", scope.socket_path().display()),
+            ));
+            if scope != Scope::detect() {
+                lines.push(Line::from(Span::styled(
+                    format!("  history is served by the {} collector", scope_word(scope)),
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
+        }
+        Mode::Ephemeral => {
+            lines.push(Line::from(Span::styled(
+                "  live-only — install the collector for history, jobs, GitHub + metrics:",
+                Style::new().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  ghr-stats systemd install",
+                Style::new().fg(Color::Cyan),
+            )));
+            // A unit exists on disk but no socket answered ⇒ nudge to start it.
+            if installed_scope(Scope::systemd_unit_path).is_some() {
+                lines.push(Line::from(Span::styled(
+                    "  (service installed but not reachable — `systemctl [--user] start ghr-stats`)",
+                    Style::new().fg(Color::Yellow),
+                )));
+            }
+        }
+    }
     lines.push(Line::raw(""));
 
     lines.push(heading("GitHub tokens (read-only PATs)"));

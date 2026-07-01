@@ -17,6 +17,7 @@ use ratatui::widgets::{Axis, Block, Chart, Clear, Dataset, GraphType, Paragraph,
 use crate::model::Liveness;
 use crate::tui::action::ConfirmPrompt;
 use crate::tui::app::{App, Hits, Tab};
+use crate::tui::history::Mode;
 use crate::util::now_epoch;
 
 pub(crate) fn draw(f: &mut Frame, app: &App) {
@@ -137,6 +138,28 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         table_rows: None,
     };
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Mode badge, right-aligned on the tab-bar row — only when it won't collide
+    // with the tabs (`x` is the column just past the last tab).
+    let mode = app.mode();
+    let color = match mode {
+        Mode::Persistent => Color::Green,
+        Mode::Ephemeral => Color::Yellow,
+    };
+    let badge = format!(" {} ", mode.label());
+    if (x - area.x) as usize + badge.chars().count() < area.width as usize {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                badge,
+                Style::new()
+                    .fg(Color::Black)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            area,
+        );
+    }
 }
 
 /// A centered confirm popup for a pending action. Typestate-driven: there is no

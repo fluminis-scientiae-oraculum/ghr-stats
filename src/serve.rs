@@ -1,13 +1,17 @@
-//! The `serve` daemon: sample the fleet into SQLite, and expose it as metrics.
+//! The collector — the systemd-managed `serve` service. It samples the fleet
+//! into SQLite (Persistent mode's data source) and exposes it three ways: the
+//! Prometheus `/metrics` endpoint, the JSON push, and the Unix-socket IPC the
+//! TUI reads. It is NOT an interactive command — a TTY guard refuses a foreground
+//! invocation and points at `ghr-stats systemd install`.
 //!
 //! Architecture: three producer threads feed a single DB-writer (the main
 //! thread) over a bounded `crossbeam-channel`. No async — the work is blocking
 //! I/O with no request/response concurrency to model.
 //!
 //! ```text
-//!   local-sampler ─┐
-//!   api-reconcile ─┼──(bounded)──►│ DB writer │ owns Store ◄─reads─ metrics
-//!   hooks-tail   ──┘                                                (pull/push)
+//!   local-sampler ─┐                             ┌─ metrics (pull/push)
+//!   api-reconcile ─┼──(bounded)──►│ DB writer │──┤    own WAL reader conns
+//!   hooks-tail   ──┘               owns Store     └─ ipc-server (TUI reads)
 //!           ▲ all poll Arc<AtomicBool> (ctrlc-driven shutdown)
 //! ```
 //!
@@ -19,13 +23,14 @@
 //! - The bounded channel gives natural backpressure if the writer falls behind.
 
 use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Sender, bounded};
 use nix::fcntl::{Flock, FlockArg};
 
@@ -59,22 +64,9 @@ fn acquire_lock(cfg: &Config) -> Result<Flock<std::fs::File>> {
         .open(&path)
         .with_context(|| format!("opening serve lock {}", path.display()))?;
     Flock::lock(file, FlockArg::LockExclusiveNonblock)
-        .map_err(|(_, e)| anyhow!("another `ghr-stats serve` is already running ({e})"))
+        .map_err(|(_, e)| anyhow!("another ghr-stats collector is already running ({e})"))
 }
 
-/// Whether a `serve` daemon currently holds the lock — the TUI's honest
-/// sampler-liveness check (no stale-pidfile / sample-age false positives).
-pub(crate) fn is_running(cfg: &Config) -> bool {
-    let Ok(file) = std::fs::OpenOptions::new().read(true).open(lock_path(cfg)) else {
-        return false; // no lock file ⇒ serve never started here
-    };
-    // A shared lock succeeds only if no one holds it exclusive; if `serve` holds
-    // the exclusive lock, this fails (EWOULDBLOCK) ⇒ it's running.
-    match Flock::lock(file, FlockArg::LockSharedNonblock) {
-        Ok(_released_on_drop) => false,
-        Err(_) => true,
-    }
-}
 /// Granularity of the interruptible sleep between ticks.
 const SLEEP_STEP: Duration = Duration::from_millis(200);
 /// Channel depth — small; the writer keeps up, this just absorbs bursts.
@@ -97,11 +89,20 @@ enum Sample {
 }
 
 pub fn run(cfg: &Config) -> Result<()> {
-    // Single-writer + a liveness signal in one: hold an exclusive advisory lock
-    // for the daemon's lifetime. A second `serve` fails fast here; the TUI probes
-    // this lock for an honest "sampler running?" (flock releases the instant the
-    // process dies, so — unlike a pidfile or sample-age — there are no stale
-    // false positives).
+    // `serve` is the systemd-managed collector, not an interactive command:
+    // refuse to run attached to a terminal (systemd gives the service no TTY) and
+    // point at the installer. `GHR_STATS_ALLOW_TTY=1` is the dev/CI escape hatch.
+    if std::io::stdin().is_terminal() && std::env::var_os("GHR_STATS_ALLOW_TTY").is_none() {
+        bail!(
+            "`serve` is the background collector, not an interactive command — \
+             install it with `ghr-stats systemd install` \
+             (set GHR_STATS_ALLOW_TTY=1 to run it in the foreground anyway)"
+        );
+    }
+
+    // Single-writer guard: hold an exclusive advisory lock for the collector's
+    // lifetime, so a second `serve` fails fast rather than double-writing the DB.
+    // flock releases the instant the process dies — no stale lock.
     let _serve_lock = acquire_lock(cfg)?;
     let mut store = Store::open(&cfg.db_path)?;
 
@@ -142,6 +143,10 @@ pub fn run(cfg: &Config) -> Result<()> {
     // Metrics exporter threads (pull/push) — opt-in; they read the DB on their
     // own WAL connections, never the writer. Empty if [metrics] is disabled.
     let metrics = crate::metrics::spawn(&cfg, Arc::clone(&term));
+    // IPC server: serves the TUI's Persistent-mode history/jobs/GitHub over a
+    // Unix socket (its own WAL reader connection). This is what makes the
+    // collector reachable — cross-scope included — without exposing the DB file.
+    let ipc = crate::ipc::server::spawn(&cfg, Arc::clone(&term));
 
     // The writer holds only `rx`; once the producers exit and drop their
     // senders, `rx` disconnects and the loop below ends.
@@ -185,6 +190,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     for h in metrics {
         let _ = h.join();
     }
+    let _ = ipc.join();
     tracing::info!("serve stopped");
     Ok(())
 }

@@ -1,5 +1,7 @@
-//! Interactive dashboard. Fully synchronous — blocking terminal I/O + DB reads,
-//! called directly from `main`. The dashboard is a PURE reader (see `app`).
+//! Interactive dashboard. Fully synchronous — blocking terminal I/O, called
+//! directly from `main`. The dashboard never writes: it is a pure client — an
+//! in-memory live sampler always, plus (in Persistent mode) an IPC reader of the
+//! collector (see `app` + `history`).
 //!
 //! Interaction is a typestate (see `screen`): the loop owns a runtime
 //! `ScreenState`, routes each event through it, and owns terminal teardown for
@@ -8,6 +10,7 @@
 mod action;
 mod app;
 mod help;
+mod history;
 mod screen;
 mod views;
 mod wizard;

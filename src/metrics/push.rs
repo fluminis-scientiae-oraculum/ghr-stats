@@ -7,10 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
-
 use crate::config::Config;
 use crate::metrics::encode::Snapshot;
+use crate::store::open_reader;
 use crate::util::now_epoch;
 
 pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -32,15 +31,8 @@ pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
                 tracing::warn!("metrics push enabled but endpoint is empty — disabled");
                 return;
             }
-            let conn = match Connection::open(&db) {
-                Ok(c) => {
-                    let _ = c.busy_timeout(Duration::from_secs(5));
-                    c
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "metrics push: open db");
-                    return;
-                }
+            let Some(conn) = open_reader(&db) else {
+                return;
             };
             tracing::info!(endpoint = %endpoint, every_s = interval.as_secs(), "metrics push enabled");
 

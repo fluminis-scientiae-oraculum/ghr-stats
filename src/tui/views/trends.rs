@@ -1,6 +1,7 @@
-//! Fleet-wide historical trends, read from SQLite: occupancy, host load,
-//! memory, and disk (/tmp + aggregate `_work`) over time. Each metric is a line
-//! chart with a relative-time X axis and a 0-based Y axis (see
+//! Fleet-wide trends: occupancy, host load, memory, and disk (/tmp + aggregate
+//! `_work`) over time. In Persistent mode these come from the collector; in
+//! Ephemeral, from the in-memory ring (a since-launch window). Each metric is a
+//! line chart with a relative-time X axis and a 0-based Y axis (see
 //! [`super::draw_time_chart`]); incomparable Y scales ⇒ one chart per metric.
 
 use ratatui::Frame;
@@ -10,13 +11,17 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::{ChartSpec, draw_time_chart, fmt_bytes, fmt_opt_bytes};
 use crate::tui::app::App;
+use crate::tui::history::Mode;
 use crate::util::now_epoch;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.trend_host.is_empty() && app.trend_busy.is_empty() {
         f.render_widget(
-            Paragraph::new("No history yet — start the sampler:  ghr-stats serve")
-                .block(Block::bordered().title(" fleet trends ")),
+            Paragraph::new(
+                "Collecting… — trends fill as live samples arrive.\n\nInstall the collector \
+                 for history that persists across restarts:  ghr-stats systemd install",
+            )
+            .block(Block::bordered().title(" fleet trends ")),
             area,
         );
         return;
@@ -154,32 +159,43 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Aggregate _work size (sampled on the slow cadence, so sparser).
-    let work_pts: Vec<(f64, f64)> = app
-        .trend_host
-        .iter()
-        .filter_map(|h| h.work_bytes.map(|b| (h.ts as f64, b as f64)))
-        .collect();
-    let work_now = app.trend_host.iter().rev().find_map(|h| h.work_bytes);
-    let work_max = app
-        .trend_host
-        .iter()
-        .filter_map(|h| h.work_bytes)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    draw_time_chart(
-        f,
-        rows[4],
-        now,
-        ChartSpec {
-            title: &format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
-            points: &work_pts,
-            y_bounds: [0.0, work_max as f64],
-            y_labels: vec!["0".to_string(), fmt_bytes(work_max)],
-            color: Color::Green,
-        },
-    );
+    // Aggregate _work size — Persistent-only: the live sampler skips the
+    // expensive `_work` walk (`walk_work=false`), so in Ephemeral there is no
+    // data to plot. Say so rather than show a perpetually-empty chart.
+    if matches!(app.mode(), Mode::Ephemeral) {
+        f.render_widget(
+            Paragraph::new("  Persistent only — install the collector to trend _work size")
+                .style(Style::new().fg(Color::DarkGray))
+                .block(Block::bordered().title(" _work total ")),
+            rows[4],
+        );
+    } else {
+        let work_pts: Vec<(f64, f64)> = app
+            .trend_host
+            .iter()
+            .filter_map(|h| h.work_bytes.map(|b| (h.ts as f64, b as f64)))
+            .collect();
+        let work_now = app.trend_host.iter().rev().find_map(|h| h.work_bytes);
+        let work_max = app
+            .trend_host
+            .iter()
+            .filter_map(|h| h.work_bytes)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        draw_time_chart(
+            f,
+            rows[4],
+            now,
+            ChartSpec {
+                title: &format!(" _work total   now {} ", fmt_opt_bytes(work_now)),
+                points: &work_pts,
+                y_bounds: [0.0, work_max as f64],
+                y_labels: vec!["0".to_string(), fmt_bytes(work_max)],
+                color: Color::Green,
+            },
+        );
+    }
 }
 
 fn mem_pct(used: u64, total: u64) -> u64 {

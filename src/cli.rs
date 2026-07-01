@@ -1,6 +1,7 @@
 //! Command-line surface. Pure clap types — no logic lives here.
 //!
-//! Five orthogonal verbs (default → TUI, `serve`, `config`, `db`, `systemd`).
+//! Verbs: default → TUI, `serve` (the systemd-managed collector — not for
+//! interactive use), `config`, `db`, `systemd`, `uninstall`.
 
 use std::path::PathBuf;
 
@@ -11,11 +12,13 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "ghr-stats",
     version,
-    about = "TUI dashboard + Prometheus exporter for self-hosted GitHub Actions runners",
-    long_about = "ghr-stats monitors a fleet of self-hosted GitHub Actions runners: a \
-                  mouse-driven TUI over a local SQLite history, plus a `serve` daemon that \
-                  samples the fleet and exposes Prometheus metrics. Runner identity comes \
-                  from each runner's own .runner file — no host assumptions.",
+    about = "Live TUI + collector service (history, jobs, Prometheus) for self-hosted GitHub Actions runner fleets",
+    long_about = "ghr-stats monitors a fleet of self-hosted GitHub Actions runners. Run it \
+                  with no arguments for the TUI: an Ephemeral live dashboard standalone, or — \
+                  once the collector service is installed (`ghr-stats systemd install`) — a \
+                  Persistent dashboard adding history, jobs, GitHub reconcile, and a Prometheus \
+                  exporter. Runner identity comes from each runner's own .runner file — no host \
+                  assumptions.",
     styles = help_styles(),
 )]
 pub struct Cli {
@@ -33,13 +36,15 @@ pub enum Command {
     #[command(hide = true)]
     Tui,
 
-    /// Sample the fleet into SQLite and expose Prometheus metrics. Runs as a service.
+    /// The background collector (systemd-managed). Not an interactive command.
     #[command(
-        long_about = "The always-on daemon and sole DB writer: it samples the fleet into \
-        SQLite so the TUI's history and trends accrue even while the dashboard is closed, and — \
-        when enabled in the config — exposes a Prometheus /metrics endpoint on loopback (scrape \
-        it into Prometheus/Grafana) and/or pushes the metrics as JSON to an OpenObserve endpoint. \
-        Install it as a background service with `ghr-stats systemd install`."
+        long_about = "The background collector and sole DB writer — installed and run by \
+        systemd, NOT by hand: it refuses to start on a terminal (set GHR_STATS_ALLOW_TTY=1 to \
+        override for dev/CI). It samples the fleet into SQLite so the TUI's Persistent mode has \
+        history, jobs, and the GitHub reconcile, serves those to the TUI over a Unix socket, and \
+        — when enabled in the config — exposes a Prometheus /metrics endpoint on loopback \
+        (scrape into Prometheus/Grafana) and/or pushes metrics as JSON to an OpenObserve \
+        endpoint. Install it with `ghr-stats systemd install`."
     )]
     Serve,
 

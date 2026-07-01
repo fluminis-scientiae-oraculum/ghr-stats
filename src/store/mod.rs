@@ -3,6 +3,7 @@ mod schema;
 pub mod writer;
 
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -38,6 +39,24 @@ impl Store {
 
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+}
+
+/// Open a second, non-writer WAL connection for a background reader (the metrics
+/// exporter and the IPC server). NB: a WAL "reader" still writes the `-shm`/
+/// `-wal` sidecars, so it needs write access to the DB *directory* — this is a
+/// concurrent reader, never `OPEN_READ_ONLY`. `None` (logged) if the DB can't be
+/// opened, so the caller degrades instead of aborting the collector.
+pub fn open_reader(path: &Path) -> Option<Connection> {
+    match Connection::open(path) {
+        Ok(c) => {
+            let _ = c.busy_timeout(Duration::from_secs(5));
+            Some(c)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(), "open reader db");
+            None
+        }
     }
 }
 

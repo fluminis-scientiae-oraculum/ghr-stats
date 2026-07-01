@@ -8,19 +8,15 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Cell, Padding, Paragraph, Row, Table, Wrap};
 
 use super::{fmt_ago, fmt_dur};
+use crate::hooks::install::HookStatus;
 use crate::store::reader::JobRow;
 use crate::tui::app::App;
+use crate::tui::history::Mode;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     if app.jobs.is_empty() {
         f.render_widget(
-            Paragraph::new(
-                "No job events yet.\n\nInstall the runner job hooks to record job starts and \
-                 completions here: on the Config tab press [h] (as root), or run \
-                 `sudo ghr-stats config`.",
-            )
-            .wrap(Wrap { trim: false })
-            .block(
+            Paragraph::new(empty_state(app)).wrap(Wrap { trim: false }).block(
                 Block::bordered()
                     .title(" jobs ")
                     .padding(Padding::horizontal(1)),
@@ -29,6 +25,33 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         );
     } else {
         draw_table(f, app, area);
+    }
+}
+
+/// The Jobs empty-state copy — hook-aware, so "no jobs yet" is never mistaken for
+/// "hooks not installed". Ephemeral needs the collector; in Persistent mode the
+/// message depends on whether the ghr-stats hook is actually installed on any
+/// runner (if it is, we're simply waiting for a job to run).
+fn empty_state(app: &App) -> String {
+    if app.mode() == Mode::Ephemeral {
+        return "Jobs are a Persistent-mode feature.\n\nInstall the collector to record job \
+                starts and completions:  ghr-stats systemd install"
+            .to_string();
+    }
+    let ours = app
+        .runners
+        .iter()
+        .filter(|r| matches!(r.hook, HookStatus::Ours))
+        .count();
+    if ours > 0 {
+        format!(
+            "No jobs recorded yet.\n\nThe ghr-stats job hook is installed on {ours} runner(s) — \
+             starts and completions will appear here as runners pick up work."
+        )
+    } else {
+        "No jobs recorded yet.\n\nThe ghr-stats job hook isn't feeding any runner yet. Install \
+         or chain it on the Config tab with [h] (as root), or run `sudo ghr-stats config`."
+            .to_string()
     }
 }
 

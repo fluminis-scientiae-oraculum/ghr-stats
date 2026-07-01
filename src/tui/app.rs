@@ -2,11 +2,17 @@
 //!
 //! The now-view (Summary + Detail live stats) is sampled LIVE in-memory each
 //! tick (`collectors::collect_local`, display-only, never written) — so the
-//! dashboard shows the fleet standalone, with no daemon and no DB. History
-//! (Trends, Detail sparklines, Jobs) is read from SQLite, which `serve` (the
-//! sole writer) populates; without `serve` the now-view is still fully live and
-//! history is simply sparse. The single-writer invariant holds because the TUI's
-//! live sampling never writes.
+//! dashboard shows the fleet standalone in either mode. History (Trends, Detail
+//! sparklines, Jobs, GitHub) comes from the [`history::DataSource`]:
+//!
+//! - **Ephemeral** (no collector): from a bounded in-memory ring the live sample
+//!   fills each tick. Trends + sparklines show a since-launch window; Jobs +
+//!   GitHub are empty (collector-only features).
+//! - **Persistent** (collector reachable): from the collector over the IPC
+//!   socket; the rings still fill as a warm fallback.
+//!
+//! The TUI never opens the database — the collector is the sole reader/writer of
+//! it, and cross-scope access goes through the socket, not the file.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,9 +29,9 @@ use crate::config::Config;
 use crate::hooks::install::{self, HookStatus};
 use crate::model::Liveness;
 use crate::paths::Scope;
-use crate::store::Store;
-use crate::store::reader::{self, ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::store::reader::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
 use crate::tui::action::{ActionKind, RecycleRunner, RestartRunner};
+use crate::tui::history::{DataSource, Mode, Rings};
 use crate::tui::wizard::{self, WizardMode};
 use crate::util::now_epoch;
 
@@ -114,8 +120,12 @@ pub(crate) struct App {
     config_path: Option<PathBuf>,
     /// The open modal popup, if any (config wizard / help / info block).
     overlay: Option<Overlay>,
-    /// Read-only handle; `None` if the DB could not be opened.
-    store: Option<Store>,
+    /// The history source: in-memory rings (Ephemeral) or the collector's IPC
+    /// socket (Persistent). Re-probed each refresh.
+    source: DataSource,
+    /// Bounded in-memory history, filled from the live sample every tick — the
+    /// Ephemeral-mode trends/sparklines, and the warm fallback in Persistent mode.
+    rings: Rings,
     /// Derives per-runner CPU% from cgroup-usage deltas between ticks.
     cpu: CpuRateTracker,
     /// Per-runner liveness edge `(current, since_ts)`, tracked in-memory so
@@ -133,9 +143,6 @@ pub(crate) struct App {
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
     pub(crate) api_state: HashMap<i64, ApiState>,
-    /// Whether the `serve` daemon is actually running (real flock probe) —
-    /// drives the sampler-status indicator + "history needs serve" hints.
-    pub(crate) serve_up: bool,
     pub(crate) status: Option<String>,
     pub(crate) should_quit: bool,
     pub(crate) hits: RefCell<Hits>,
@@ -143,17 +150,14 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(cfg: Config, config_path: Option<PathBuf>) -> Self {
-        let (store, status) = match Store::open(&cfg.db_path) {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(format!("database unavailable: {e}"))),
-        };
         let mut table = TableState::default();
         table.select(Some(0));
         Self {
             cfg,
             config_path,
             overlay: None,
-            store,
+            source: DataSource::detect(),
+            rings: Rings::new(TREND_POINTS, HISTORY_POINTS),
             cpu: CpuRateTracker::new(),
             edges: HashMap::new(),
             runners: Vec::new(),
@@ -167,8 +171,7 @@ impl App {
             trend_busy: Vec::new(),
             jobs: Vec::new(),
             api_state: HashMap::new(),
-            serve_up: false,
-            status,
+            status: None,
             should_quit: false,
             hits: RefCell::new(Hits::default()),
         }
@@ -176,6 +179,18 @@ impl App {
 
     pub(crate) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The current data plane (Ephemeral / Persistent) — for the header badge
+    /// and the Config tab.
+    pub(crate) fn mode(&self) -> Mode {
+        self.source.mode()
+    }
+
+    /// The scope of the connected collector, if any — the Config tab notes it
+    /// when it differs from where this TUI would otherwise look.
+    pub(crate) fn source_scope(&self) -> Option<Scope> {
+        self.source.scope()
     }
 
     // ---- modal overlays (config wizard / help / info) ----
@@ -255,7 +270,9 @@ impl App {
             Ok(()) => {
                 self.reload_cfg();
                 let state = if enabled { "enabled" } else { "disabled" };
-                self.status = Some(format!("metrics pull {state} — restart `serve` to apply"));
+                self.status = Some(format!(
+                    "metrics pull {state} — restart the service to apply"
+                ));
             }
             Err(e) => self.status = Some(format!("✗ metrics toggle failed: {e}")),
         }
@@ -280,7 +297,7 @@ impl App {
         let snap = collectors::collect_local(&self.cfg.runner_roots, now, false);
         let sampled_at = Instant::now();
         let h = snap.host;
-        self.host = Some(HostPoint {
+        let host = HostPoint {
             ts: h.ts,
             load1: h.load1,
             mem_used: h.mem_used,
@@ -288,10 +305,15 @@ impl App {
             tmp_bytes: h.tmp_bytes,
             work_bytes: h.work_bytes,
             root_free: h.root_free,
-        });
+        };
+        self.rings.push_host(host.clone());
+        self.host = Some(host);
 
-        // GitHub's view (populated by `serve`'s reconcile) is history-side.
-        let api = self.read(reader::latest_api_runners).unwrap_or_default();
+        // Attach to a collector that started while we're open (no-op if already
+        // Persistent; a later failed request reverts us to Ephemeral).
+        self.source.reconnect_if_ephemeral();
+        // GitHub's view is Persistent-only (from the collector's reconcile).
+        let api = self.source.latest_api_runners();
         // A hook counts as "ours" if it points under ANY scope's hooks dir —
         // hooks always install System-scope (they need root), but this dashboard
         // is normally run non-root, so keying off `Scope::detect()` alone
@@ -303,9 +325,27 @@ impl App {
 
         let mut edges = HashMap::with_capacity(snap.runners.len());
         let mut runners = Vec::with_capacity(snap.runners.len());
+        let (mut busy, mut online) = (0u32, 0u32);
         for p in snap.runners {
             let id = p.info.agent_id;
             let cpu_pct = self.cpu.rate(id, p.cpu_usage_usec, sampled_at);
+            // Feed the Ephemeral-mode sparkline ring from the same live sample.
+            self.rings.push_runner(
+                id,
+                HistPoint {
+                    ts: now,
+                    cpu_pct,
+                    mem_bytes: p.mem_bytes,
+                },
+            );
+            match p.liveness {
+                Liveness::Busy => {
+                    busy += 1;
+                    online += 1;
+                }
+                Liveness::Idle => online += 1,
+                Liveness::Offline => {}
+            }
             // In-memory liveness edge: keep `since` while the state is unchanged,
             // else start it now — standalone "idle/active for <dur>".
             let since = match self.edges.get(&id) {
@@ -330,10 +370,15 @@ impl App {
                 user: p.info.user,
             });
         }
+        // Fleet occupancy for the Ephemeral busy-trend (reproduces busy_series).
+        self.rings.push_busy(BusyPoint {
+            ts: now,
+            busy,
+            online,
+        });
         self.edges = edges;
         self.runners = runners;
         self.api_state = api;
-        self.serve_up = crate::serve::is_running(&self.cfg);
         self.clamp_selection();
 
         match self.tab {
@@ -344,22 +389,6 @@ impl App {
         if self.drill.is_some() {
             self.load_detail();
         }
-    }
-
-    /// Run a reader query against the store, if open.
-    fn read<T, F>(&self, f: F) -> Option<T>
-    where
-        F: FnOnce(&rusqlite::Connection) -> crate::error::Result<T>,
-    {
-        self.store.as_ref().and_then(|s| f(s.conn()).ok())
-    }
-
-    /// A banner for a hard problem (DB unavailable), else `None`. The now-view is
-    /// always live, so there is no "stale data" banner; a stopped `serve` is
-    /// surfaced contextually (the Config sampler status + empty Trends/Jobs
-    /// states), not as an alarm over a live fleet.
-    pub(crate) fn banner(&self) -> Option<String> {
-        self.store.is_none().then(|| self.status.clone()).flatten()
     }
 
     pub(crate) fn detail_runner(&self) -> Option<&LiveRunner> {
@@ -539,24 +568,16 @@ impl App {
             self.detail_active_job = None;
             return;
         };
-        if let Some(h) = self.read(|c| reader::runner_history(c, id, HISTORY_POINTS)) {
-            self.detail_history = h;
-        }
-        self.detail_active_job = self.read(|c| reader::active_job(c, &name)).flatten();
+        self.detail_history = self.source.runner_history(&self.rings, id, HISTORY_POINTS);
+        self.detail_active_job = self.source.active_job(&name);
     }
 
     fn load_trends(&mut self) {
-        if let Some(h) = self.read(|c| reader::host_series(c, TREND_POINTS)) {
-            self.trend_host = h;
-        }
-        if let Some(b) = self.read(|c| reader::busy_series(c, TREND_POINTS)) {
-            self.trend_busy = b;
-        }
+        self.trend_host = self.source.host_series(&self.rings, TREND_POINTS);
+        self.trend_busy = self.source.busy_series(&self.rings, TREND_POINTS);
     }
 
     fn load_jobs(&mut self) {
-        if let Some(j) = self.read(|c| reader::recent_jobs(c, JOB_ROWS)) {
-            self.jobs = j;
-        }
+        self.jobs = self.source.recent_jobs(JOB_ROWS);
     }
 }

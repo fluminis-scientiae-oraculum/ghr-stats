@@ -1,4 +1,4 @@
-//! Prometheus exposition — `serve`'s reason to exist: sample → SQLite → expose.
+//! Prometheus exposition — one of the collector's outputs: sample → SQLite → expose.
 //! Two independent, opt-in paths (config `[metrics]`): a pull `/metrics`
 //! endpoint (loopback by default) and a JSON push to an ingestion sink. Both
 //! read the DB on their own connections (WAL) — never the writer thread.

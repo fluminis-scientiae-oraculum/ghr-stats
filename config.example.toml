@@ -8,7 +8,7 @@
 # Search order: --config FLAG, then $GHR_STATS_CONFIG, then
 # /etc/ghr-stats/config.toml, then $XDG_CONFIG_HOME/ghr-stats/config.toml.
 
-# SQLite database (`serve` writes it; the TUI reads it).
+# SQLite database (the collector service writes it; the TUI reads it over the IPC socket).
 # Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).
 # db_path = "/home/you/.local/share/ghr-stats/ghr-stats.db"
 
@@ -48,7 +48,7 @@ api_secs = 60
 # token = "github_pat_..."
 
 # ── Metrics (optional) ───────────────────────────────────────────────────────
-# `serve` can also expose the fleet metrics. Both off by default.
+# The collector service can also expose the fleet metrics. Both off by default.
 
 # Prometheus PULL: a tiny /metrics endpoint scrapers hit.
 # [metrics.pull]

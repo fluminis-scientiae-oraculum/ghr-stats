@@ -58,6 +58,7 @@ fn install(scope: Scope) -> Result<()> {
     println!("  binary: {}", bin.display());
     println!("  config: {}", scope.config_file().display());
     println!("  data:   {}", scope.data_dir().display());
+    println!("  socket: {}", scope.socket_path().display());
     Ok(())
 }
 
@@ -72,6 +73,11 @@ pub(crate) fn uninstall(scope: Scope) -> Result<()> {
             .with_context(|| format!("removing {}", unit_path.display()))?;
     }
     let _ = systemctl(scope, &["daemon-reload"]);
+    // The IPC socket lives under the unit's RuntimeDirectory=, which `disable
+    // --now` already tears down; remove it defensively for a foreground/dev
+    // collector or an already-stopped unit (tmpfs, so usually a no-op).
+    let _ = std::fs::remove_file(scope.socket_path());
+    let _ = std::fs::remove_dir(scope.runtime_dir());
     println!(
         "✓ removed {} (data left in {})",
         unit_path.display(),
@@ -86,9 +92,13 @@ fn render_unit(bin: &Path, scope: Scope) -> String {
         Scope::System => "multi-user.target",
         Scope::User => "default.target",
     };
+    // RuntimeDirectory= makes systemd create + own /run/ghr-stats (and remove it
+    // on stop), so the IPC socket lives on tmpfs with no stale-file cleanup to do.
+    // Mode 0755 keeps the dir world-traversable so a non-root TUI can reach a
+    // root service's socket (the socket itself is widened to 0666 by the server).
     format!(
         "[Unit]\n\
-         Description=ghr-stats — sample self-hosted runners + expose metrics\n\
+         Description=ghr-stats collector — sample self-hosted runners, serve metrics + TUI IPC\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
          \n\
@@ -97,6 +107,8 @@ fn render_unit(bin: &Path, scope: Scope) -> String {
          ExecStart={bin} serve\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         RuntimeDirectory=ghr-stats\n\
+         RuntimeDirectoryMode=0755\n\
          NoNewPrivileges=true\n\
          \n\
          [Install]\n\
@@ -112,14 +124,30 @@ fn copy_bin(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(src, dst)
-        .with_context(|| format!("copying {} → {}", src.display(), dst.display()))?;
+    // Write to a sibling temp file, then atomically rename over `dst`. A plain
+    // copy overwrites `dst` IN PLACE and fails with ETXTBSY ("text file busy")
+    // when `dst` is the currently-running collector — i.e. every upgrade of a
+    // live service. rename swaps the inode instead: the running process keeps
+    // executing the old (now-unlinked) file, and new starts pick up the new one.
+    // Same directory ⇒ same filesystem ⇒ the rename is atomic.
+    let tmp = dst.with_extension("new");
+    std::fs::copy(src, &tmp)
+        .with_context(|| format!("staging {} → {}", src.display(), tmp.display()))?;
+    std::fs::rename(&tmp, dst)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp); // don't leave a stray .new on failure
+        })
+        .with_context(|| format!("installing {} → {}", src.display(), dst.display()))?;
     Ok(())
 }
 
 fn enable(scope: Scope) -> Result<()> {
     systemctl(scope, &["daemon-reload"])?;
-    systemctl(scope, &["enable", "--now", UNIT_NAME])?;
+    systemctl(scope, &["enable", UNIT_NAME])?;
+    // `restart` (not `start`/`--now`): on a fresh install it just starts, but on
+    // a re-install over an already-active service it swaps in the new binary +
+    // unit — `start` alone would no-op and leave the old process running.
+    systemctl(scope, &["restart", UNIT_NAME])?;
     Ok(())
 }
 
@@ -154,6 +182,9 @@ mod tests {
         assert!(u.contains("ExecStart=/usr/local/bin/ghr-stats serve"));
         assert!(u.contains("WantedBy=multi-user.target"));
         assert!(u.contains("Type=simple"));
+        // The IPC socket lives under the systemd-managed RuntimeDirectory.
+        assert!(u.contains("RuntimeDirectory=ghr-stats"));
+        assert!(u.contains("RuntimeDirectoryMode=0755"));
     }
 
     #[test]
@@ -161,5 +192,28 @@ mod tests {
         let u = render_unit(Path::new("/home/x/.local/bin/ghr-stats"), Scope::User);
         assert!(u.contains("ExecStart=/home/x/.local/bin/ghr-stats serve"));
         assert!(u.contains("WantedBy=default.target"));
+        assert!(u.contains("RuntimeDirectory=ghr-stats"));
+    }
+
+    #[test]
+    fn copy_bin_creates_parent_and_replaces_via_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-bin");
+        let dst = dir.path().join("sub/dst-bin"); // parent must be created
+        std::fs::write(&src, b"v1").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        copy_bin(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"v1");
+        // Executable bit survives the copy.
+        assert_ne!(std::fs::metadata(&dst).unwrap().permissions().mode() & 0o111, 0);
+
+        // Re-install (the upgrade case ETXTBSY breaks with a plain in-place copy):
+        // a second call replaces the target via rename and leaves no stray `.new`.
+        std::fs::write(&src, b"v2-longer").unwrap();
+        copy_bin(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"v2-longer");
+        assert!(!dst.with_extension("new").exists());
     }
 }

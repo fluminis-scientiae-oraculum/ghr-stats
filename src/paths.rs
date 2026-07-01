@@ -6,7 +6,11 @@
 //! hand-rolling `/etc` vs XDG; that separation is the whole reason this module
 //! exists. A system deployment (root `serve` service + `sudo ghr-stats` TUI)
 //! keeps everything under `/etc` + `/var/lib`; a personal/dev deployment is
-//! all-user under the XDG base dirs. The two are not mixed (plan §2/S9).
+//! all-user under the XDG base dirs. Config + data dirs are never mixed across
+//! scopes (plan §2/S9) — the one deliberate exception is the TUI's IPC client,
+//! which may `connect` to another scope's collector socket to read (only)
+//! derived fleet stats, so a non-root dashboard can observe a root system
+//! service without ever touching its `/var/lib` database.
 
 use std::path::{Path, PathBuf};
 
@@ -75,6 +79,24 @@ impl Scope {
             Scope::System => PathBuf::from("/etc/systemd/system/ghr-stats.service"),
             Scope::User => xdg_config_dir().join("systemd/user/ghr-stats.service"),
         }
+    }
+
+    /// The runtime directory holding the collector's IPC socket. System uses
+    /// `/run/ghr-stats` (created by the unit's `RuntimeDirectory=`, world-
+    /// traversable so a non-root TUI can reach a root service's socket); User
+    /// uses `$XDG_RUNTIME_DIR/ghr-stats` (falling back to `/run/user/<uid>`).
+    /// On tmpfs, so a stale socket never outlives a reboot.
+    pub fn runtime_dir(self) -> PathBuf {
+        match self {
+            Scope::System => PathBuf::from("/run/ghr-stats"),
+            Scope::User => xdg_runtime_dir().join("ghr-stats"),
+        }
+    }
+
+    /// The collector's IPC socket — the TUI's Persistent-mode data channel and
+    /// its liveness probe (a successful `connect` ⇒ Persistent).
+    pub fn socket_path(self) -> PathBuf {
+        self.runtime_dir().join("serve.sock")
     }
 }
 
@@ -172,6 +194,14 @@ fn xdg_data_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/share"))
 }
 
+/// `$XDG_RUNTIME_DIR`, falling back to the systemd-conventional `/run/user/<uid>`
+/// when it is unset (e.g. a bare login shell without a user session bus).
+fn xdg_runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", uzers::get_effective_uid())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +223,17 @@ mod tests {
         assert_eq!(
             Scope::System.bin_path(),
             PathBuf::from("/usr/local/bin/ghr-stats")
+        );
+    }
+
+    #[test]
+    fn system_ipc_socket_lives_on_run_tmpfs() {
+        // Deterministic (no env): the system collector's socket is under /run,
+        // matching the unit's `RuntimeDirectory=ghr-stats`.
+        assert_eq!(Scope::System.runtime_dir(), PathBuf::from("/run/ghr-stats"));
+        assert_eq!(
+            Scope::System.socket_path(),
+            PathBuf::from("/run/ghr-stats/serve.sock")
         );
     }
 

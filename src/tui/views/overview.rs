@@ -1,5 +1,6 @@
-//! The fleet Summary: a host header (with a data banner when the sampler is
-//! down) and a responsive, ellipsized runner table.
+//! The fleet Summary: a host header (with a GitHub-view line in Persistent mode,
+//! or an "install the collector" hint in Ephemeral) and a responsive,
+//! ellipsized runner table.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -14,6 +15,7 @@ use crate::hooks::install::HookStatus;
 use crate::model::Liveness;
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
+use crate::tui::history::Mode;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     // The shared keymap footer is drawn by the parent; this view owns only its
@@ -73,24 +75,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         None => Line::from(" host: no data"),
     };
 
-    // Third line: the data banner takes priority; otherwise the GitHub summary.
-    let third = if let Some(b) = app.banner() {
-        Line::from(Span::styled(
-            format!(" ⚠ {b}"),
-            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))
-    } else if app.api_state.is_empty() {
-        Line::from(Span::styled(
-            " github: no API data (add a PAT via `ghr-stats config`)",
+    // Third line: the GitHub summary in Persistent mode; in Ephemeral, GitHub is
+    // a collector-only feature, so point at the installer instead.
+    let third = match app.mode() {
+        Mode::Ephemeral => Line::from(Span::styled(
+            " github: Persistent only — install the collector (`ghr-stats systemd install`)",
             Style::new().fg(Color::DarkGray),
-        ))
-    } else {
-        let online = app.api_state.values().filter(|s| s.online).count();
-        let gbusy = app.api_state.values().filter(|s| s.busy).count();
-        Line::from(format!(
-            " github: {} known · {online} online · {gbusy} busy",
-            app.api_state.len()
-        ))
+        )),
+        Mode::Persistent if app.api_state.is_empty() => {
+            // A PAT may well be configured — don't blame a missing one unless it is.
+            let hint = if app.cfg().github.tokens.is_empty() {
+                "add a read-only PAT on the Config tab [a]"
+            } else {
+                "reconcile pending, or the PAT lacks org access"
+            };
+            Line::from(Span::styled(
+                format!(" github: no API data — {hint}"),
+                Style::new().fg(Color::DarkGray),
+            ))
+        }
+        Mode::Persistent => {
+            let online = app.api_state.values().filter(|s| s.online).count();
+            let gbusy = app.api_state.values().filter(|s| s.busy).count();
+            Line::from(format!(
+                " github: {} known · {online} online · {gbusy} busy",
+                app.api_state.len()
+            ))
+        }
     };
 
     let para =

@@ -1,15 +1,19 @@
-//! TUI-side reads. The collector is the only writer; readers open their own
-//! connection and rely on WAL for contention-free concurrent reads.
+//! Server-side reads (the IPC server + the metrics exporter). The collector is
+//! the only writer; readers open their own connection and rely on WAL for
+//! contention-free concurrent reads. The TUI no longer opens the DB — in
+//! Persistent mode it fetches these same shapes over the IPC socket, so the
+//! query structs below double as the IPC wire payloads (hence the serde derives).
 
 use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::model::{Liveness, RunnerSample, RunnerState};
 
 /// A recent job, joined from hook timing + (eventually) API conclusion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRow {
     pub runner_name: String,
     pub repo: String,
@@ -20,14 +24,14 @@ pub struct JobRow {
 }
 
 /// GitHub's view of one runner (from the latest reconcile tick).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ApiState {
     pub online: bool,
     pub busy: bool,
 }
 
 /// One historical runner sample, for sparklines.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistPoint {
     pub ts: i64,
     pub cpu_pct: Option<f32>,
@@ -35,7 +39,7 @@ pub struct HistPoint {
 }
 
 /// One host time-series point.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostPoint {
     pub ts: i64,
     pub load1: f64,
@@ -47,7 +51,7 @@ pub struct HostPoint {
 }
 
 /// One fleet-occupancy point: how many runners were busy / online at a tick.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusyPoint {
     pub ts: i64,
     pub busy: u32,
@@ -168,9 +172,8 @@ pub fn busy_series(conn: &Connection, limit: usize) -> Result<Vec<BusyPoint>> {
     Ok(out)
 }
 
-/// Every runner's most recent sample (the latest tick), for the pure-reader
-/// TUI to join with static identity from `.runner`. Empty if the daemon has
-/// never sampled — the caller shows the "start `serve`" banner.
+/// Every runner's most recent sample (the latest tick). Consumed by the metrics
+/// exporter (`metrics::encode`); empty if the collector has never sampled.
 pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
     let max_ts: Option<i64> =
         conn.query_row("SELECT max(ts) FROM runner_sample", [], |r| r.get(0))?;

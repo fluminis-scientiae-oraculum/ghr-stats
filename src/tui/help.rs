@@ -39,6 +39,20 @@ pub(crate) fn draw_help(f: &mut Frame) {
         key("m", "toggle the Prometheus /metrics endpoint"),
         key("o", "open the config file in $EDITOR"),
         blank(),
+        section("Modes"),
+        Line::from(Span::styled(
+            "   EPHEMERAL   live dashboard only — in-memory, since launch",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "   PERSISTENT  + history · jobs · GitHub · metrics (install the collector):",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "               ghr-stats systemd install",
+            Style::new().fg(Color::Cyan),
+        )),
+        blank(),
         section("Running as root"),
     ];
     for l in crate::privileged::root_guidance().lines() {

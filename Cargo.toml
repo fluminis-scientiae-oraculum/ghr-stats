@@ -2,7 +2,7 @@
 name = "ghr-stats"
 version = "0.1.0"
 edition = "2024"
-description = "TUI dashboard + Prometheus exporter for self-hosted GitHub Actions runners"
+description = "Live TUI + collector service (history, jobs, Prometheus) for self-hosted GitHub Actions runner fleets"
 authors = ["Aditya Kresna <https://github.com/Ujang360>"]
 license = "MIT"
 repository = "https://github.com/fluminis-scientiae-oraculum/ghr-stats"

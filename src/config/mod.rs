@@ -71,7 +71,7 @@ pub struct GithubConfig {
     pub tokens: BTreeMap<String, Secret>,
 }
 
-/// Prometheus metrics export (opt-in). The daemon's reason to exist: sample →
+/// Prometheus metrics export (opt-in) — one of the collector's outputs: sample →
 /// SQLite → expose. Two independent paths, configured here and via the wizard.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

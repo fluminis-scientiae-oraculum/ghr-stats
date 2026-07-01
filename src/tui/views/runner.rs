@@ -12,16 +12,36 @@ use super::{
 };
 use crate::store::reader::ApiState;
 use crate::tui::app::App;
+use crate::tui::history::Mode;
 use crate::util::now_epoch;
 
-/// GitHub's view of a runner for the detail panel.
-fn gh_text(gh: Option<ApiState>) -> String {
+/// GitHub's view of a runner for the detail panel. When there's no data, explain
+/// the actual cause (mode / missing PAT / reconcile) rather than always blaming a
+/// missing PAT — a token may well be configured.
+fn gh_text(gh: Option<ApiState>, app: &App) -> String {
     match gh {
         Some(s) if s.busy => "online, busy".to_string(),
         Some(s) if s.online => "online, idle".to_string(),
         Some(_) => "offline".to_string(),
-        None => "(no API data — needs a PAT + collector)".to_string(),
+        None => no_gh_reason(app),
     }
+}
+
+/// Why this runner has no GitHub view, most-specific cause first.
+fn no_gh_reason(app: &App) -> String {
+    if app.mode() == Mode::Ephemeral {
+        // GitHub is a collector-only feature — no network in Ephemeral.
+        return "(Persistent only — needs the collector)".to_string();
+    }
+    if app.cfg().github.tokens.is_empty() {
+        return "(no PAT configured — add one on the Config tab [a])".to_string();
+    }
+    if app.api_state.is_empty() {
+        // A PAT exists but the reconcile returned nothing for any runner.
+        return "(reconcile pending — or the PAT lacks access to this org)".to_string();
+    }
+    // The reconcile saw other runners but not this one.
+    "(not reported by the GitHub API — org/PAT mismatch?)".to_string()
 }
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
@@ -66,7 +86,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             fmt_opt_bytes(r.mem_bytes),
             fmt_uptime(r.uptime_s)
         )),
-        Line::from(format!("github  {}", gh_text(r.gh))),
+        Line::from(format!("github  {}", gh_text(r.gh, app))),
         Line::from(format!("job     {}", active_job_text(app))),
     ];
     f.render_widget(
@@ -98,8 +118,11 @@ fn active_job_text(app: &App) -> String {
 fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
     if app.detail_history.is_empty() {
         f.render_widget(
-            Paragraph::new("No history yet — start the sampler:  ghr-stats serve")
-                .block(Block::bordered().title(" history ")),
+            Paragraph::new(
+                "Collecting… — the sparkline fills as live samples arrive.\n\nInstall the \
+                 collector for history across restarts:  ghr-stats systemd install",
+            )
+            .block(Block::bordered().title(" history ")),
             area,
         );
         return;
