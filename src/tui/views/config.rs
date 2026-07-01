@@ -8,9 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::fmt_ago;
 use crate::tui::app::App;
-use crate::util::now_epoch;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     let cfg = app.cfg();
@@ -32,20 +30,18 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::raw(""));
 
     lines.push(heading("Sampler"));
-    let (status, color) = if app.is_stale() {
-        ("down / stale — start `ghr-stats serve`", Color::Yellow)
-    } else {
+    let (status, color) = if app.serve_up {
         ("running", Color::Green)
+    } else {
+        (
+            "stopped — run `ghr-stats serve` for history + metrics",
+            Color::Yellow,
+        )
     };
     lines.push(Line::from(vec![
         key("status"),
         Span::styled(status, Style::new().fg(color)),
     ]));
-    let age = app
-        .sample_age
-        .map(|a| fmt_ago(Some(now_epoch() - a)))
-        .unwrap_or_else(|| "never".to_string());
-    lines.push(kv("last sample", &age));
     lines.push(Line::raw(""));
 
     lines.push(heading("GitHub tokens (read-only PATs)"));

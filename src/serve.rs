@@ -19,13 +19,15 @@
 //! - The bounded channel gives natural backpressure if the writer falls behind.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Sender, bounded};
+use nix::fcntl::{Flock, FlockArg};
 
 use crate::collectors::cpu::CpuRateTracker;
 use crate::collectors::{self};
@@ -37,6 +39,42 @@ use crate::util::now_epoch;
 
 /// Walk the (expensive) `_work` trees once every N local ticks.
 const WORK_WALK_EVERY: u64 = 12;
+/// The daemon's lock file, beside the database.
+fn lock_path(cfg: &Config) -> PathBuf {
+    cfg.db_path.with_file_name("serve.lock")
+}
+
+/// Acquire the exclusive serve lock, held for the daemon's lifetime (dropped
+/// when `run` returns, or when the process dies). Errors if another `serve`
+/// already holds it — preventing a second DB writer.
+fn acquire_lock(cfg: &Config) -> Result<Flock<std::fs::File>> {
+    let path = lock_path(cfg);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening serve lock {}", path.display()))?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, e)| anyhow!("another `ghr-stats serve` is already running ({e})"))
+}
+
+/// Whether a `serve` daemon currently holds the lock — the TUI's honest
+/// sampler-liveness check (no stale-pidfile / sample-age false positives).
+pub(crate) fn is_running(cfg: &Config) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(lock_path(cfg)) else {
+        return false; // no lock file ⇒ serve never started here
+    };
+    // A shared lock succeeds only if no one holds it exclusive; if `serve` holds
+    // the exclusive lock, this fails (EWOULDBLOCK) ⇒ it's running.
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(_released_on_drop) => false,
+        Err(_) => true,
+    }
+}
 /// Granularity of the interruptible sleep between ticks.
 const SLEEP_STEP: Duration = Duration::from_millis(200);
 /// Channel depth — small; the writer keeps up, this just absorbs bursts.
@@ -59,6 +97,12 @@ enum Sample {
 }
 
 pub fn run(cfg: &Config) -> Result<()> {
+    // Single-writer + a liveness signal in one: hold an exclusive advisory lock
+    // for the daemon's lifetime. A second `serve` fails fast here; the TUI probes
+    // this lock for an honest "sampler running?" (flock releases the instant the
+    // process dies, so — unlike a pidfile or sample-age — there are no stale
+    // false positives).
+    let _serve_lock = acquire_lock(cfg)?;
     let mut store = Store::open(&cfg.db_path)?;
 
     // SIGINT/SIGTERM/SIGHUP flip the flag; producers exit at the next check.

@@ -1,18 +1,23 @@
-//! TUI application state — a PURE reader.
+//! TUI application state.
 //!
-//! `serve` is the sole sampler; the dashboard never samples. It reads the
-//! latest fleet metrics from SQLite and joins them with each runner's static
-//! identity from its `.runner` file (cheap, world-readable). If `serve` has not
-//! written fresh samples, the Summary shows a banner instead of stale data.
+//! The now-view (Summary + Detail live stats) is sampled LIVE in-memory each
+//! tick (`collectors::collect_local`, display-only, never written) — so the
+//! dashboard shows the fleet standalone, with no daemon and no DB. History
+//! (Trends, Detail sparklines, Jobs) is read from SQLite, which `serve` (the
+//! sole writer) populates; without `serve` the now-view is still fully live and
+//! history is simply sparse. The single-writer invariant holds because the TUI's
+//! live sampling never writes.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::widgets::TableState;
 
-use crate::collectors::runners;
+use crate::collectors::cpu::CpuRateTracker;
+use crate::collectors::{self, runners};
 use crate::config::Config;
 use crate::hooks::install::{self, HookStatus};
 use crate::model::Liveness;
@@ -25,8 +30,6 @@ use crate::util::now_epoch;
 const HISTORY_POINTS: usize = 120;
 const TREND_POINTS: usize = 240;
 const JOB_ROWS: usize = 200;
-/// Samples older than this many local intervals ⇒ "stale" (show the banner).
-const STALE_TICKS: i64 = 4;
 
 /// Top-level tabs. `Detail` is a drill-down from `Summary`, not a tab.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +91,11 @@ pub(crate) struct App {
     cfg: Config,
     /// Read-only handle; `None` if the DB could not be opened.
     store: Option<Store>,
+    /// Derives per-runner CPU% from cgroup-usage deltas between ticks.
+    cpu: CpuRateTracker,
+    /// Per-runner liveness edge `(current, since_ts)`, tracked in-memory so
+    /// "idle/active for <dur>" works standalone (no `serve`/DB needed).
+    edges: HashMap<i64, (Liveness, i64)>,
     pub(crate) runners: Vec<LiveRunner>,
     pub(crate) host: Option<HostPoint>,
     pub(crate) tab: Tab,
@@ -100,8 +108,9 @@ pub(crate) struct App {
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
     pub(crate) api_state: HashMap<i64, ApiState>,
-    /// Age (seconds) of the freshest runner sample; `None` if never sampled.
-    pub(crate) sample_age: Option<i64>,
+    /// Whether the `serve` daemon is actually running (real flock probe) —
+    /// drives the sampler-status indicator + "history needs serve" hints.
+    pub(crate) serve_up: bool,
     pub(crate) status: Option<String>,
     pub(crate) should_quit: bool,
     pub(crate) hits: RefCell<Hits>,
@@ -118,6 +127,8 @@ impl App {
         Self {
             cfg,
             store,
+            cpu: CpuRateTracker::new(),
+            edges: HashMap::new(),
             runners: Vec::new(),
             host: None,
             tab: Tab::Summary,
@@ -129,7 +140,7 @@ impl App {
             trend_busy: Vec::new(),
             jobs: Vec::new(),
             api_state: HashMap::new(),
-            sample_age: None,
+            serve_up: false,
             status,
             should_quit: false,
             hits: RefCell::new(Hits::default()),
@@ -140,49 +151,64 @@ impl App {
         &self.cfg
     }
 
-    /// Re-read the latest fleet state from the DB and re-join identity.
+    /// Sample the fleet LIVE (in-memory, display-only) for the now-view, and read
+    /// the DB for history + the GitHub view. Never writes — the single-writer
+    /// invariant is `serve`'s.
     pub(crate) fn refresh(&mut self) {
         let now = now_epoch();
-        let infos = runners::discover(&self.cfg.runner_roots);
-        let latest = self.read(reader::latest_runners).unwrap_or_default();
-        let max_ts = latest.iter().map(|r| r.ts).max();
-        let by_id: HashMap<i64, _> = latest.into_iter().map(|r| (r.agent_id, r)).collect();
-        let api = self.read(reader::latest_api_runners).unwrap_or_default();
-        let states = self.read(reader::runner_states).unwrap_or_default();
-        let our_dir = install::hooks_dir(&Scope::detect().data_dir());
-        self.host = self
-            .store
-            .as_ref()
-            .and_then(|s| reader::latest_host(s.conn()).ok().flatten());
+        // Live now-view: probe runners + host in-memory, like `serve`'s sampler
+        // but without persisting. `walk_work=false` keeps it cheap (the _work
+        // total is a slow trend metric, read from history instead).
+        let snap = collectors::collect_local(&self.cfg.runner_roots, now, false);
+        let sampled_at = Instant::now();
+        let h = snap.host;
+        self.host = Some(HostPoint {
+            ts: h.ts,
+            load1: h.load1,
+            mem_used: h.mem_used,
+            mem_total: h.mem_total,
+            tmp_bytes: h.tmp_bytes,
+            work_bytes: h.work_bytes,
+            root_free: h.root_free,
+        });
 
-        self.runners = infos
-            .into_iter()
-            .map(|info| {
-                let m = by_id.get(&info.agent_id);
-                let state_seconds = states
-                    .get(&info.agent_id)
-                    .map(|st| (now - st.since_ts).max(0));
-                let hook = install::detect(&info.dir, &our_dir);
-                LiveRunner {
-                    liveness: m.map(|s| s.liveness).unwrap_or(Liveness::Offline),
-                    cpu_pct: m.and_then(|s| s.cpu_pct),
-                    mem_bytes: m.and_then(|s| s.mem_bytes),
-                    uptime_s: m.and_then(|s| s.uptime_s),
-                    gh: api.get(&info.agent_id).copied(),
-                    state_seconds,
-                    hook,
-                    work_folder: info.work_folder,
-                    agent_id: info.agent_id,
-                    name: info.name,
-                    org: info.org,
-                    group: info.group,
-                    dir: info.dir,
-                    user: info.user,
-                }
-            })
-            .collect();
+        // GitHub's view (populated by `serve`'s reconcile) is history-side.
+        let api = self.read(reader::latest_api_runners).unwrap_or_default();
+        let our_dir = install::hooks_dir(&Scope::detect().data_dir());
+
+        let mut edges = HashMap::with_capacity(snap.runners.len());
+        let mut runners = Vec::with_capacity(snap.runners.len());
+        for p in snap.runners {
+            let id = p.info.agent_id;
+            let cpu_pct = self.cpu.rate(id, p.cpu_usage_usec, sampled_at);
+            // In-memory liveness edge: keep `since` while the state is unchanged,
+            // else start it now — standalone "idle/active for <dur>".
+            let since = match self.edges.get(&id) {
+                Some((prev, since)) if *prev == p.liveness => *since,
+                _ => now,
+            };
+            edges.insert(id, (p.liveness, since));
+            runners.push(LiveRunner {
+                liveness: p.liveness,
+                cpu_pct,
+                mem_bytes: p.mem_bytes,
+                uptime_s: p.uptime_s,
+                gh: api.get(&id).copied(),
+                state_seconds: Some((now - since).max(0)),
+                hook: install::detect(&p.info.dir, &our_dir),
+                work_folder: p.info.work_folder,
+                agent_id: id,
+                name: p.info.name,
+                org: p.info.org,
+                group: p.info.group,
+                dir: p.info.dir,
+                user: p.info.user,
+            });
+        }
+        self.edges = edges;
+        self.runners = runners;
         self.api_state = api;
-        self.sample_age = max_ts.map(|ts| (now - ts).max(0));
+        self.serve_up = crate::serve::is_running(&self.cfg);
         self.clamp_selection();
 
         match self.tab {
@@ -203,23 +229,12 @@ impl App {
         self.store.as_ref().and_then(|s| f(s.conn()).ok())
     }
 
-    /// True when there is no fresh sample (daemon down, or never run).
-    pub(crate) fn is_stale(&self) -> bool {
-        match self.sample_age {
-            None => true,
-            Some(age) => age > STALE_TICKS * self.cfg.intervals.local_secs.max(1) as i64,
-        }
-    }
-
-    /// A banner to show when there is no live data, else `None`.
+    /// A banner for a hard problem (DB unavailable), else `None`. The now-view is
+    /// always live, so there is no "stale data" banner; a stopped `serve` is
+    /// surfaced contextually (the Config sampler status + empty Trends/Jobs
+    /// states), not as an alarm over a live fleet.
     pub(crate) fn banner(&self) -> Option<String> {
-        if self.store.is_none() {
-            return self.status.clone();
-        }
-        self.is_stale().then(|| {
-            "no fresh data — start the sampler: `ghr-stats serve` (or install the service via Config)"
-                .to_string()
-        })
+        self.store.is_none().then(|| self.status.clone()).flatten()
     }
 
     pub(crate) fn detail_runner(&self) -> Option<&LiveRunner> {
