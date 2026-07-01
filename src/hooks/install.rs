@@ -57,15 +57,34 @@ pub(crate) fn hooks_dir(data_dir: &Path) -> PathBuf {
 
 /// Read + classify a runner's `.env`. `Unreadable` if it can't be read.
 pub(crate) fn detect(install_dir: &Path, our_dir: &Path) -> HookStatus {
+    detect_in(install_dir, std::slice::from_ref(&our_dir.to_path_buf()))
+}
+
+/// Like [`detect`] but classifies "ours" against SEVERAL candidate hooks dirs.
+///
+/// Detection must be independent of the euid the caller runs under: hooks are
+/// always installed by a root process (System scope, `/var/lib/ghr-stats/hooks`),
+/// but the read-only TUI is normally run non-root — so a status probe has to
+/// consider EVERY scope's hooks dir, not just `Scope::detect()`'s. Passing the
+/// current euid's single dir is what made a System-scoped hook read as `Foreign`
+/// (or a fresh install read as absent) in a plain `ghr-stats` dashboard.
+pub(crate) fn detect_in(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
     match std::fs::read_to_string(install_dir.join(".env")) {
-        Ok(text) => classify(&text, our_dir),
+        Ok(text) => classify_in(&text, our_dirs),
         Err(_) => HookStatus::Unreadable,
     }
 }
 
 /// Classify hook state from `.env` text + our hooks dir. Pure.
 pub(crate) fn classify(env: &str, our_dir: &Path) -> HookStatus {
-    let is_ours = |v: &str| Path::new(v).starts_with(our_dir);
+    classify_in(env, std::slice::from_ref(&our_dir.to_path_buf()))
+}
+
+/// Classify against MULTIPLE candidate hooks dirs — a hook is "ours" if it points
+/// under ANY of them (see [`detect_in`] for why every scope must be considered).
+/// Pure.
+pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
+    let is_ours = |v: &str| our_dirs.iter().any(|d| Path::new(v).starts_with(d));
     match (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR)) {
         (None, None) => HookStatus::Unset,
         (s, c) => {
@@ -241,6 +260,30 @@ mod tests {
         // one ours + one missing ⇒ not fully ours
         let half = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n";
         assert_eq!(classify(half, &our()), HookStatus::Foreign);
+    }
+
+    #[test]
+    fn classify_in_treats_any_scope_dir_as_ours() {
+        // The cross-scope status bug: hooks install System-scope (they need
+        // root), but the non-root TUI enumerates BOTH scope dirs. A System-scoped
+        // hook — clean OR chained — must read as Ours even with the User dir also
+        // a candidate. Checking only the euid's (User) dir mislabeled it Foreign.
+        let sys = PathBuf::from("/var/lib/ghr-stats/hooks");
+        let usr = PathBuf::from("/home/u/.local/share/ghr-stats/hooks");
+        let dirs = [usr.clone(), sys.clone()];
+        let clean = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
+                     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh\n";
+        assert_eq!(classify_in(clean, &dirs), HookStatus::Ours);
+        // Chained: `.env` points at the wrappers, which live inside our hooks dir.
+        let chained = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/chain-r1-started.sh\n\
+             ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/chain-r1-completed.sh\n";
+        assert_eq!(classify_in(chained, &dirs), HookStatus::Ours);
+        // Documents the pre-fix failure: against ONLY the User dir it reads Foreign.
+        assert_eq!(classify_in(clean, &[usr.clone()]), HookStatus::Foreign);
+        // A genuinely foreign hook is still Foreign against both dirs.
+        let foreign = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup.sh\n\
+                       ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup.sh\n";
+        assert_eq!(classify_in(foreign, &[usr, sys]), HookStatus::Foreign);
     }
 
     #[test]

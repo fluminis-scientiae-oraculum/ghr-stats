@@ -3,6 +3,8 @@
 //! wizard), `[h]` install hooks, `[m]` toggle metrics, `[o]` open the file. The
 //! CLI `ghr-stats config` remains for a full guided first-run.
 
+use std::path::PathBuf;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -87,7 +89,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     // Install & teardown (#uninstall): what's on this host + how to remove it.
     // Read-only — the removal itself is the CLI verb `ghr-stats uninstall`.
     lines.push(heading("Install & teardown"));
-    let scope = Scope::detect();
     let cfg_path = app.config_target();
     let cfg_state = if cfg_path.exists() {
         // Redacted: a COUNT, never a token value.
@@ -97,18 +98,18 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         format!("{}  (not written)", cfg_path.display())
     };
     lines.push(kv("config", &cfg_state));
-    let unit = scope.systemd_unit_path();
-    let svc = if unit.exists() {
-        format!("installed ({} scope)", scope_word(scope))
-    } else {
-        "not installed".to_string()
+    // Service + binary: report the scope whose artifact is actually on disk, not
+    // the one the current euid would use. This dashboard is normally run non-root
+    // while a system install lives under /etc + /usr/local/bin — keying off
+    // `Scope::detect()` made a present install read as "not installed".
+    let svc = match installed_scope(Scope::systemd_unit_path) {
+        Some(s) => format!("installed ({} scope)", scope_word(s)),
+        None => "not installed".to_string(),
     };
     lines.push(kv("service", &svc));
-    let bin = scope.bin_path();
-    let bin_state = if bin.exists() {
-        format!("{} (installed)", bin.display())
-    } else {
-        format!("{} (not installed)", bin.display())
+    let bin_state = match installed_scope(Scope::bin_path) {
+        Some(s) => format!("{} (installed)", s.bin_path().display()),
+        None => format!("{} (not installed)", Scope::detect().bin_path().display()),
     };
     lines.push(kv("binary", &bin_state));
     lines.push(kv("hooks", &hooks_summary(&app.runners)));
@@ -185,6 +186,22 @@ fn scope_word(scope: Scope) -> &'static str {
     }
 }
 
+/// The scope whose artifact `path_of(scope)` actually exists on disk (System
+/// first — the privileged, canonical deployment), or `None` if neither does.
+/// Lets install status be reported independent of the euid the read-only TUI
+/// runs under; the pure selection is [`pick_installed`].
+fn installed_scope(path_of: impl Fn(Scope) -> PathBuf) -> Option<Scope> {
+    pick_installed(|s| path_of(s).exists())
+}
+
+/// The first scope (System, then User) for which `exists` holds. Pure — split
+/// from the disk probe so it is unit-tested.
+fn pick_installed(exists: impl Fn(Scope) -> bool) -> Option<Scope> {
+    [Scope::System, Scope::User]
+        .into_iter()
+        .find(|s| exists(*s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +222,16 @@ mod tests {
             summarize_hooks(std::iter::empty()),
             "(no runners discovered)"
         );
+    }
+
+    #[test]
+    fn pick_installed_prefers_system_then_user() {
+        // A system install viewed from a non-root TUI must resolve to System,
+        // not "not installed" — the cross-scope status bug this guards.
+        assert_eq!(pick_installed(|s| s == Scope::System), Some(Scope::System));
+        assert_eq!(pick_installed(|s| s == Scope::User), Some(Scope::User));
+        assert_eq!(pick_installed(|_| false), None);
+        // Both present ⇒ System wins (the privileged, canonical deployment).
+        assert_eq!(pick_installed(|_| true), Some(Scope::System));
     }
 }

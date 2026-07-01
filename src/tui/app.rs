@@ -292,7 +292,14 @@ impl App {
 
         // GitHub's view (populated by `serve`'s reconcile) is history-side.
         let api = self.read(reader::latest_api_runners).unwrap_or_default();
-        let our_dir = install::hooks_dir(&Scope::detect().data_dir());
+        // A hook counts as "ours" if it points under ANY scope's hooks dir —
+        // hooks always install System-scope (they need root), but this dashboard
+        // is normally run non-root, so keying off `Scope::detect()` alone
+        // mislabeled installed/chained hooks as foreign (cross-scope status bug).
+        let our_dirs = [
+            install::hooks_dir(&Scope::System.data_dir()),
+            install::hooks_dir(&Scope::User.data_dir()),
+        ];
 
         let mut edges = HashMap::with_capacity(snap.runners.len());
         let mut runners = Vec::with_capacity(snap.runners.len());
@@ -313,7 +320,7 @@ impl App {
                 uptime_s: p.uptime_s,
                 gh: api.get(&id).copied(),
                 state_seconds: Some((now - since).max(0)),
-                hook: install::detect(&p.info.dir, &our_dir),
+                hook: install::detect_in(&p.info.dir, &our_dirs),
                 work_folder: p.info.work_folder,
                 agent_id: id,
                 name: p.info.name,
