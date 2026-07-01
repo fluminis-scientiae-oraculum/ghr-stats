@@ -10,7 +10,6 @@
 //! detect-first (see [`crate::hooks::uninstall`]) so a foreign hook is never
 //! stranded. The receipt is stdout-only — uninstall leaves nothing behind.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -194,7 +193,7 @@ impl Plan {
                 .map(|path| {
                     let token_count = std::fs::read_to_string(&path)
                         .ok()
-                        .and_then(|t| count_tokens(&t));
+                        .and_then(|t| crate::config::count_tokens(&t));
                     ConfigItem { path, token_count }
                 })
                 .collect()
@@ -500,26 +499,6 @@ fn cross_scope_probe(scope: Scope) -> Vec<String> {
     lines
 }
 
-/// Count the tokens in a config file WITHOUT exposing any value — the redaction
-/// guarantee for the plan. A lenient peek (ignores every other field); `None` if
-/// the file doesn't parse. Pure + tested.
-fn count_tokens(config_text: &str) -> Option<usize> {
-    #[derive(serde::Deserialize, Default)]
-    struct Peek {
-        #[serde(default)]
-        github: Gh,
-    }
-    #[derive(serde::Deserialize, Default)]
-    struct Gh {
-        #[serde(default)]
-        tokens: BTreeMap<String, toml::Value>,
-        #[serde(default)]
-        token: Option<toml::Value>,
-    }
-    let peek: Peek = toml::from_str(config_text).ok()?;
-    Some(peek.github.tokens.len() + usize::from(peek.github.token.is_some()))
-}
-
 fn plan_line(rp: &RunnerHookPlan) -> String {
     match &rp.action {
         RevertAction::Leave { why } => format!("  · {} — {why}", rp.name),
@@ -586,19 +565,6 @@ mod tests {
         assert!(is_cargo_bin(Path::new("/home/u/.cargo/bin/ghr-stats")));
         assert!(!is_cargo_bin(Path::new("/usr/local/bin/ghr-stats")));
         assert!(!is_cargo_bin(Path::new("/home/u/.local/bin/ghr-stats")));
-    }
-
-    #[test]
-    fn count_tokens_counts_without_exposing_values() {
-        let cfg = "runner_roots = []\n\n[github.tokens]\nacme = \"github_pat_SECRET_VALUE\"\nwidgets = \"github_pat_OTHER\"\n";
-        assert_eq!(count_tokens(cfg), Some(2));
-        // A fallback token counts too.
-        let one = "[github]\ntoken = \"github_pat_x\"\n";
-        assert_eq!(count_tokens(one), Some(1));
-        // No tokens.
-        assert_eq!(count_tokens("runner_roots = []\n"), Some(0));
-        // Malformed ⇒ None (we still remove the file, just can't count).
-        assert_eq!(count_tokens("this is not = = toml ["), None);
     }
 
     #[test]

@@ -160,6 +160,27 @@ impl Config {
     }
 }
 
+/// Count the read-only PATs in a config file's TEXT without exposing any value —
+/// a lenient peek that ignores every other field (so it survives schema drift).
+/// `None` if the text doesn't parse. Shared by the teardown plan's redacted
+/// preview and the TUI's host-inventory line. Pure.
+pub(crate) fn count_tokens(config_text: &str) -> Option<usize> {
+    #[derive(Deserialize, Default)]
+    struct Peek {
+        #[serde(default)]
+        github: Gh,
+    }
+    #[derive(Deserialize, Default)]
+    struct Gh {
+        #[serde(default)]
+        tokens: BTreeMap<String, toml::Value>,
+        #[serde(default)]
+        token: Option<toml::Value>,
+    }
+    let peek: Peek = toml::from_str(config_text).ok()?;
+    Some(peek.github.tokens.len() + usize::from(peek.github.token.is_some()))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -238,6 +259,19 @@ mod tests {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.db_path, defaults::db_path());
         assert_eq!(c.intervals.api_secs, 60);
+    }
+
+    #[test]
+    fn count_tokens_counts_without_exposing_values() {
+        let cfg = "runner_roots = []\n\n[github.tokens]\nacme = \"github_pat_SECRET_VALUE\"\nwidgets = \"github_pat_OTHER\"\n";
+        assert_eq!(count_tokens(cfg), Some(2));
+        // A fallback token counts too.
+        let one = "[github]\ntoken = \"github_pat_x\"\n";
+        assert_eq!(count_tokens(one), Some(1));
+        // No tokens.
+        assert_eq!(count_tokens("runner_roots = []\n"), Some(0));
+        // Malformed ⇒ None (the caller still shows the file, just can't count).
+        assert_eq!(count_tokens("this is not = = toml ["), None);
     }
 
     #[test]

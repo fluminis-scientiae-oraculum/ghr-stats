@@ -3,7 +3,7 @@
 //! wizard), `[h]` install hooks, `[m]` toggle metrics, `[o]` open the file. The
 //! CLI `ghr-stats config` remains for a full guided first-run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -89,13 +89,17 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     // Install & teardown (#uninstall): what's on this host + how to remove it.
     // Read-only — the removal itself is the CLI verb `ghr-stats uninstall`.
     lines.push(heading("Install & teardown"));
-    let cfg_path = app.config_target();
-    let cfg_state = if cfg_path.exists() {
-        // Redacted: a COUNT, never a token value.
-        let n = cfg.github.tokens.len() + usize::from(cfg.github.token.is_some());
-        format!("{}  ({n} token(s))", cfg_path.display())
-    } else {
-        format!("{}  (not written)", cfg_path.display())
+    // Config: show the file actually present on this host (probing both scopes),
+    // with a REDACTED count read from that same file — not the loaded cfg's — so a
+    // system config isn't reported "not written" from a non-root dashboard.
+    let cfg_path = installed_config(&app.config_target());
+    let cfg_state = match std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|t| crate::config::count_tokens(&t))
+    {
+        Some(n) => format!("{}  ({n} token(s))", cfg_path.display()),
+        None if cfg_path.exists() => format!("{}  (present, unreadable)", cfg_path.display()),
+        None => format!("{}  (not written)", cfg_path.display()),
     };
     lines.push(kv("config", &cfg_state));
     // Service + binary: report the scope whose artifact is actually on disk, not
@@ -200,6 +204,21 @@ fn pick_installed(exists: impl Fn(Scope) -> bool) -> Option<Scope> {
     [Scope::System, Scope::User]
         .into_iter()
         .find(|s| exists(*s))
+}
+
+/// The config file present on this host: the resolved read/write `target` first
+/// (an explicit `--config`, the sudo-invoker's home, or the current scope), then
+/// each scope's canonical file. Falls back to `target` (where it WOULD be
+/// written) when none exist. Keeps the host-inventory line honest across scopes.
+fn installed_config(target: &Path) -> PathBuf {
+    [
+        target.to_path_buf(),
+        Scope::System.config_file(),
+        Scope::User.config_file(),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .unwrap_or_else(|| target.to_path_buf())
 }
 
 #[cfg(test)]
