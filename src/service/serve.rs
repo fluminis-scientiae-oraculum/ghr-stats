@@ -114,7 +114,11 @@ pub fn run(cfg: &Config) -> Result<()> {
             .context("installing signal handler")?;
     }
 
-    let cfg = Arc::new(cfg.clone());
+    // With no configured roots, fall back to systemd-discovered ones (once) so
+    // the collector finds the fleet even from a bare config.
+    let mut cfg = cfg.clone();
+    cfg.runner_roots = collectors::runners::effective_roots(&cfg.runner_roots);
+    let cfg = Arc::new(cfg);
     let (tx, rx) = bounded::<Sample>(CHANNEL_BOUND);
 
     let local = {

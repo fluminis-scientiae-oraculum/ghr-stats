@@ -150,7 +150,11 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) fn new(cfg: Config, config_path: Option<PathBuf>) -> Self {
+    pub(crate) fn new(mut cfg: Config, config_path: Option<PathBuf>) -> Self {
+        // With no configured roots (e.g. a non-root TUI that can't read the
+        // root-owned /etc config), fall back to systemd-discovered roots so the
+        // live view still finds the fleet. Resolved once — it shells out.
+        cfg.runner_roots = runners::effective_roots(&cfg.runner_roots);
         let mut table = TableState::default();
         table.select(Some(0));
         Self {
@@ -304,7 +308,8 @@ impl App {
 
     /// Reload config from disk after a write, then refresh the views.
     fn reload_cfg(&mut self) {
-        if let Ok(cfg) = Config::load(self.config_path.as_deref()) {
+        if let Ok(mut cfg) = Config::load(self.config_path.as_deref()) {
+            cfg.runner_roots = runners::effective_roots(&cfg.runner_roots);
             self.cfg = cfg;
         }
         self.refresh();

@@ -84,6 +84,23 @@ pub fn discover(roots: &[PathBuf]) -> Vec<RunnerInfo> {
 /// systemctl is unavailable or there are no runner units (the caller then falls
 /// back to a manual prompt). System units only — the common `svc.sh install`
 /// case; a user-scope-only setup still uses the manual path.
+/// The runner roots to actually sample: the configured roots, or — when none are
+/// configured — those auto-discovered from systemd's `actions.runner.*` units.
+/// This is why a dashboard with no readable config still finds the fleet. Resolve
+/// once at startup (it shells out to `systemctl`), never per sampling tick.
+pub fn effective_roots(configured: &[PathBuf]) -> Vec<PathBuf> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    let discovered = discover_roots();
+    if discovered.is_empty() {
+        tracing::debug!("no runner_roots configured and no actions.runner.* units found");
+    } else {
+        tracing::info!(roots = ?discovered, "no runner_roots configured — discovered from systemd");
+    }
+    discovered
+}
+
 pub fn discover_roots() -> Vec<PathBuf> {
     let units = systemd_runner_units();
     if units.is_empty() {
