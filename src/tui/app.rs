@@ -27,8 +27,9 @@ use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::{self, runners};
 use crate::shared::config::Config;
 use crate::shared::hooks::install::{self, HookStatus};
-use crate::shared::models::Liveness;
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::models::{
+    ApiState, BusyPoint, HistPoint, HostPoint, JobRow, Liveness, RunnerState,
+};
 use crate::shared::paths::Scope;
 use crate::shared::util::now_epoch;
 use crate::tui::history::{DataSource, Mode, Rings};
@@ -336,6 +337,9 @@ impl App {
         self.source.reconnect_if_ephemeral();
         // GitHub's view is Persistent-only (from the collector's reconcile).
         let api = self.source.latest_api_runners();
+        // The collector's persisted liveness edges (Persistent only) — the true,
+        // restart-surviving `since_ts` for the "For" duration. Empty in Ephemeral.
+        let persisted = self.source.runner_states();
         // A hook counts as "ours" if it points under ANY scope's hooks dir —
         // hooks always install System-scope (they need root), but this dashboard
         // is normally run non-root, so keying off `Scope::detect()` alone
@@ -368,13 +372,16 @@ impl App {
                 Liveness::Idle => online += 1,
                 Liveness::Offline => {}
             }
-            // In-memory liveness edge: keep `since` while the state is unchanged,
-            // else start it now — standalone "idle/active for <dur>".
-            let since = match self.edges.get(&id) {
+            // In-memory liveness edge: keep `since` while unchanged, else now.
+            let edge_since = match self.edges.get(&id) {
                 Some((prev, since)) if *prev == p.liveness => *since,
                 _ => now,
             };
-            edges.insert(id, (p.liveness, since));
+            edges.insert(id, (p.liveness, edge_since));
+            // Prefer the collector's persisted edge (survives TUI restarts) when it
+            // agrees with the live-sampled liveness; else the in-memory edge
+            // (Ephemeral, or a transition the collector hasn't persisted yet).
+            let since = pick_since(persisted.get(&id), p.liveness, edge_since);
             runners.push(LiveRunner {
                 liveness: p.liveness,
                 cpu_pct,
@@ -601,5 +608,46 @@ impl App {
 
     fn load_jobs(&mut self) {
         self.jobs = self.source.recent_jobs(JOB_ROWS);
+    }
+}
+
+/// Choose the "since" timestamp for a runner's current-liveness duration (the
+/// "For" column): the collector's persisted edge when it agrees with the live
+/// liveness (true, restart-surviving), else the TUI's in-memory edge (Ephemeral,
+/// or a transition the collector hasn't persisted yet). Pure + tested.
+fn pick_since(persisted: Option<&RunnerState>, live: Liveness, edge_since: i64) -> i64 {
+    match persisted {
+        Some(st) if st.liveness == live => st.since_ts,
+        _ => edge_since,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(liveness: Liveness, since_ts: i64) -> RunnerState {
+        RunnerState {
+            agent_id: 1,
+            liveness,
+            since_ts,
+            last_seen_ts: since_ts,
+        }
+    }
+
+    #[test]
+    fn pick_since_prefers_persisted_edge_when_liveness_agrees() {
+        let persisted = state(Liveness::Busy, 100);
+        // Persisted agrees with live ⇒ use the persisted (restart-surviving) edge.
+        assert_eq!(pick_since(Some(&persisted), Liveness::Busy, 900), 100);
+    }
+
+    #[test]
+    fn pick_since_falls_back_on_disagreement_or_absence() {
+        let persisted = state(Liveness::Idle, 100);
+        // Live liveness changed since the collector's last write ⇒ in-memory edge.
+        assert_eq!(pick_since(Some(&persisted), Liveness::Busy, 900), 900);
+        // No persisted edge (Ephemeral) ⇒ in-memory edge.
+        assert_eq!(pick_since(None, Liveness::Busy, 900), 900);
     }
 }

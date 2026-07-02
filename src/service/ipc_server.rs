@@ -146,6 +146,9 @@ fn handle(req: &Request, conn: Option<&Connection>) -> Response {
                     .collect(),
             )
         }),
+        Request::RunnerStates => wrap(reader::runner_states(conn), |m| {
+            Response::RunnerStates(m.into_values().collect())
+        }),
     }
 }
 
@@ -212,6 +215,25 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 9);
                 assert!(rows[0].state.online && !rows[0].state.busy);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_states_returns_persisted_edges() {
+        let conn = seeded();
+        conn.execute(
+            "INSERT INTO runner_state (agent_id, liveness, since_ts, last_seen_ts) \
+             VALUES (7, 'busy', 500, 900)",
+            [],
+        )
+        .unwrap();
+        match handle(&Request::RunnerStates, Some(&conn)) {
+            Response::RunnerStates(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].agent_id, 7);
+                assert_eq!(rows[0].since_ts, 500);
             }
             other => panic!("unexpected {other:?}"),
         }

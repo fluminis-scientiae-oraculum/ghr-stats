@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::shared::ipc::{Request, Response};
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
 use crate::shared::paths::Scope;
 use crate::tui::ipc_client::{self, Client};
 
@@ -91,6 +91,18 @@ impl DataSource {
         match self.query(&Request::LatestApiRunners) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only
+        }
+    }
+
+    /// Persisted per-runner liveness edges (Persistent only) — the true, restart-
+    /// surviving `since_ts` for the "For" duration. Empty in Ephemeral mode, where
+    /// the App falls back to its in-memory edge.
+    pub(crate) fn runner_states(&mut self) -> HashMap<i64, RunnerState> {
+        match self.query(&Request::RunnerStates) {
+            Some(Response::RunnerStates(rows)) => {
+                rows.into_iter().map(|st| (st.agent_id, st)).collect()
+            }
+            _ => HashMap::new(),
         }
     }
 

@@ -14,12 +14,13 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
 
 /// Wire protocol version. Bump on any breaking change to `Request`/`Response`.
 /// The same binary ships both halves, so a mismatch means the installed service
 /// is older/newer than the TUI binary — restart the service after upgrading.
-pub const VERSION: u16 = 1;
+/// v2: added `RunnerStates` (persisted liveness edges for the "For" duration).
+pub const VERSION: u16 = 2;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -36,6 +37,9 @@ pub enum Request {
     RecentJobs { limit: usize },
     ActiveJob { runner_name: String },
     LatestApiRunners,
+    /// Persisted per-runner liveness edges (survive restarts) — for the "For"
+    /// duration. Falls back to the TUI's in-memory edge when absent.
+    RunnerStates,
 }
 
 /// One runner's GitHub state, paired with its id. A `Vec` of these — not a
@@ -59,6 +63,9 @@ pub enum Response {
     RecentJobs(Vec<JobRow>),
     ActiveJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
+    /// Persisted liveness edges; `RunnerState.agent_id` is self-keying, so a
+    /// `Vec` crosses the wire and the client rebuilds the map.
+    RunnerStates(Vec<RunnerState>),
     Error(String),
 }
 
