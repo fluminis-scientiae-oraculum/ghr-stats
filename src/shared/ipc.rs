@@ -23,17 +23,36 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 /// v3: added authorized config mutations (`SetMetricsPull`, `AddOrgToken`).
 /// v4: added `ConfiguredTokenOrgs` (presence-only view of the root config's
 ///     configured org logins — so a non-root TUI reflects the true PAT state).
-pub const VERSION: u16 = 4;
+/// v5: split `Request` into `Query`/`Mutate` so authz is structural (mutations
+///     are unreachable except past the gate).
+pub const VERSION: u16 = 5;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
 const MAX_FRAME: u32 = 1 << 20;
 
-/// A TUI → collector query. One variant per read query the TUI needs, plus a
-/// `Hello` handshake that proves the peer speaks our protocol version.
+/// A TUI → collector request. The three-way split is deliberate and *structural*
+/// (not cosmetic): the collector routes purely on this shape — `Query` is served
+/// with no authorization, `Mutate` is reachable ONLY past the peer-cred authz
+/// gate. So an unauthorized mutation, or a mutation that forgot the gate, is
+/// unrepresentable — a compile-time property, not something a test must guard.
+/// Adding a variant to either inner enum forces the matching handler arm
+/// (exhaustive `match`, no `unreachable!`), so "changed here, forgot there"
+/// becomes a build error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    /// Version handshake — proves the peer speaks our protocol version.
     Hello { client: u16 },
+    /// A read. Never authorized (carries only derived fleet stats + config
+    /// presence — never a secret).
+    Query(Query),
+    /// A config write. Authorized (uid 0 or the `ghr-stats` group) or refused.
+    Mutate(Mutation),
+}
+
+/// The read queries the TUI issues. Unauthenticated by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Query {
     HostSeries { limit: usize },
     BusySeries { limit: usize },
     RunnerHistory { agent_id: i64, limit: usize },
@@ -47,12 +66,29 @@ pub enum Request {
     /// the token. Lets a non-root TUI (which can't read the root-owned /etc config)
     /// show the true configured-token state via the root collector.
     ConfiguredTokenOrgs,
-    // --- mutations: authorized (uid 0 or `ghr-stats` group) writes to /etc ---
+}
+
+/// The config writes the TUI can request. Authorized (uid 0 or `ghr-stats` group)
+/// by the single gate on the `Request::Mutate` branch — every present and future
+/// variant is behind it, with no per-variant opt-in to forget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Mutation {
     /// Toggle the Prometheus pull endpoint (mirrors the TUI's `[m]`).
     SetMetricsPull { enabled: bool, addr: String },
     /// Add/replace a read-only PAT for an org (mirrors the wizard's `[a]`). The
     /// token is one-way: it is written but never returned in any response.
     AddOrgToken { org: String, token: String },
+}
+
+impl Mutation {
+    /// A stable, payload-free audit label for a mutation (never the org/token) —
+    /// the single variant→name map, shared by the collector's deny + apply logs.
+    pub fn action(&self) -> &'static str {
+        match self {
+            Mutation::SetMetricsPull { .. } => "set_metrics_pull",
+            Mutation::AddOrgToken { .. } => "add_org_token",
+        }
+    }
 }
 
 /// One runner's GitHub state, paired with its id. A `Vec` of these — not a
@@ -148,7 +184,7 @@ mod tests {
     #[test]
     fn truncated_body_errors() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &Request::HostSeries { limit: 10 }).unwrap();
+        write_frame(&mut buf, &Request::Query(Query::HostSeries { limit: 10 })).unwrap();
         buf.truncate(buf.len() - 2); // lose the tail of the body
         assert!(read_frame::<_, Request>(&mut &buf[..]).is_err());
     }
@@ -158,31 +194,33 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(
             &mut buf,
-            &Request::SetMetricsPull {
+            &Request::Mutate(Mutation::SetMetricsPull {
                 enabled: true,
                 addr: "127.0.0.1:9477".to_string(),
-            },
+            }),
         )
         .unwrap();
         let back: Request = read_frame(&mut &buf[..]).unwrap();
         assert!(matches!(
             back,
-            Request::SetMetricsPull { enabled: true, addr } if addr == "127.0.0.1:9477"
+            Request::Mutate(Mutation::SetMetricsPull { enabled: true, addr })
+                if addr == "127.0.0.1:9477"
         ));
 
         let mut buf = Vec::new();
         write_frame(
             &mut buf,
-            &Request::AddOrgToken {
+            &Request::Mutate(Mutation::AddOrgToken {
                 org: "acme".to_string(),
                 token: "github_pat_ABC".to_string(),
-            },
+            }),
         )
         .unwrap();
         let back: Request = read_frame(&mut &buf[..]).unwrap();
         assert!(matches!(
             back,
-            Request::AddOrgToken { org, token } if org == "acme" && token == "github_pat_ABC"
+            Request::Mutate(Mutation::AddOrgToken { org, token })
+                if org == "acme" && token == "github_pat_ABC"
         ));
     }
 

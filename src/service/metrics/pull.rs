@@ -1,6 +1,9 @@
 //! Prometheus pull endpoint: a tiny blocking HTTP server. Bound to loopback by
-//! default (see `PullConfig::addr`). The single-threaded recv loop uses a short
-//! timeout so it observes the shutdown flag promptly.
+//! default (see `PullConfig::addr`). The thread reconciles its listener to the
+//! live config each cycle — binding when enabled, dropping it (closing the port)
+//! when disabled, rebinding on an address change — so a `[m]` toggle in the TUI
+//! takes effect without a restart. The recv loop uses a short timeout so it
+//! observes both the shutdown flag and config changes promptly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,40 +15,64 @@ use tiny_http::{Header, Response, Server};
 
 use crate::service::metrics::encode::Snapshot;
 use crate::service::store::open_reader;
-use crate::shared::config::Config;
+use crate::shared::config::SharedConfig;
 use crate::shared::util::now_epoch;
 
-pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
-    let addr = cfg.metrics.pull.addr.clone();
-    let db = cfg.db_path.clone();
+/// How long a bound listener blocks on `recv` (also the disabled-state poll) —
+/// bounds how quickly the thread reacts to shutdown or a config change.
+const TICK: Duration = Duration::from_millis(500);
+
+pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
     let version = env!("CARGO_PKG_VERSION");
+    let db = shared.snapshot().db_path.clone(); // DB path is fixed for the run
 
     thread::Builder::new()
         .name("metrics-pull".into())
         .spawn(move || {
-            let server = match Server::http(&addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, addr = %addr, "metrics pull: bind failed");
-                    return;
-                }
-            };
-            tracing::info!(addr = %addr, "metrics pull listening");
-
             let conn = open_reader(&db);
+            let mut server: Option<Server> = None;
+            // The last-reconciled desired state; act only on a transition, so a
+            // steady state neither rebinds nor spams the log.
+            let mut applied: Option<(bool, String)> = None;
+
             while !term.load(Ordering::SeqCst) {
-                match server.recv_timeout(Duration::from_millis(500)) {
-                    Ok(Some(req)) => {
-                        let resp = if req.url().starts_with("/metrics") {
-                            Response::from_string(body(conn.as_ref(), version))
-                                .with_header(text_header())
-                        } else {
-                            Response::from_string("see /metrics\n")
-                        };
-                        let _ = req.respond(resp);
+                let cfg = shared.snapshot();
+                let desired = (cfg.metrics.pull.enabled, cfg.metrics.pull.addr.clone());
+                if applied.as_ref() != Some(&desired) {
+                    server = None; // drop any existing listener first (closes the port)
+                    if desired.0 {
+                        match Server::http(&desired.1) {
+                            Ok(s) => {
+                                tracing::info!(addr = %desired.1, "metrics pull listening");
+                                server = Some(s);
+                            }
+                            // Leave unbound; a later addr change retries. Logged once
+                            // (this is a transition), so no per-cycle spam.
+                            Err(e) => {
+                                tracing::error!(error = %e, addr = %desired.1, "metrics pull: bind failed")
+                            }
+                        }
+                    } else {
+                        tracing::info!("metrics pull disabled");
                     }
-                    Ok(None) => {} // timeout — re-check shutdown
-                    Err(e) => tracing::warn!(error = %e, "metrics pull: recv"),
+                    applied = Some(desired);
+                }
+
+                match &server {
+                    Some(s) => match s.recv_timeout(TICK) {
+                        Ok(Some(req)) => {
+                            let resp = if req.url().starts_with("/metrics") {
+                                Response::from_string(body(conn.as_ref(), version))
+                                    .with_header(text_header())
+                            } else {
+                                Response::from_string("see /metrics\n")
+                            };
+                            let _ = req.respond(resp);
+                        }
+                        Ok(None) => {} // timeout — re-check shutdown + config
+                        Err(e) => tracing::warn!(error = %e, "metrics pull: recv"),
+                    },
+                    None => thread::sleep(TICK), // disabled/unbound — poll config + term
                 }
             }
             tracing::debug!("metrics pull stopped");

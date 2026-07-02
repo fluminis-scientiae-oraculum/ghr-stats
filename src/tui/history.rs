@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::shared::ipc::{Request, Response};
+use crate::shared::ipc::{Mutation, Query, Request, Response};
 use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
 use crate::shared::paths::Scope;
 use crate::tui::ipc_client::{self, Client};
@@ -100,7 +100,7 @@ impl DataSource {
     // --- typed queries: IPC in Persistent mode, ring / empty fallback otherwise ---
 
     pub(crate) fn latest_api_runners(&mut self) -> HashMap<i64, ApiState> {
-        match self.query(&Request::LatestApiRunners) {
+        match self.query(&Request::Query(Query::LatestApiRunners)) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only
         }
@@ -110,7 +110,7 @@ impl DataSource {
     /// surviving `since_ts` for the "For" duration. Empty in Ephemeral mode, where
     /// the App falls back to its in-memory edge.
     pub(crate) fn runner_states(&mut self) -> HashMap<i64, RunnerState> {
-        match self.query(&Request::RunnerStates) {
+        match self.query(&Request::Query(Query::RunnerStates)) {
             Some(Response::RunnerStates(rows)) => {
                 rows.into_iter().map(|st| (st.agent_id, st)).collect()
             }
@@ -119,14 +119,14 @@ impl DataSource {
     }
 
     pub(crate) fn host_series(&mut self, rings: &Rings, limit: usize) -> Vec<HostPoint> {
-        match self.query(&Request::HostSeries { limit }) {
+        match self.query(&Request::Query(Query::HostSeries { limit })) {
             Some(Response::HostSeries(v)) => v,
             _ => rings.host_series(limit),
         }
     }
 
     pub(crate) fn busy_series(&mut self, rings: &Rings, limit: usize) -> Vec<BusyPoint> {
-        match self.query(&Request::BusySeries { limit }) {
+        match self.query(&Request::Query(Query::BusySeries { limit })) {
             Some(Response::BusySeries(v)) => v,
             _ => rings.busy_series(limit),
         }
@@ -138,10 +138,10 @@ impl DataSource {
         id: i64,
         limit: usize,
     ) -> Vec<HistPoint> {
-        match self.query(&Request::RunnerHistory {
+        match self.query(&Request::Query(Query::RunnerHistory {
             agent_id: id,
             limit,
-        }) {
+        })) {
             Some(Response::RunnerHistory(v)) => v,
             _ => rings.runner_history(id, limit),
         }
@@ -151,23 +151,23 @@ impl DataSource {
     /// root-owned /etc config) — presence only, no token values. `None` in
     /// Ephemeral mode or on error, so the caller falls back to its own loaded cfg.
     pub(crate) fn configured_token_orgs(&mut self) -> Option<Vec<String>> {
-        match self.query(&Request::ConfiguredTokenOrgs) {
+        match self.query(&Request::Query(Query::ConfiguredTokenOrgs)) {
             Some(Response::ConfiguredTokenOrgs(orgs)) => Some(orgs),
             _ => None,
         }
     }
 
     pub(crate) fn recent_jobs(&mut self, limit: usize) -> Vec<JobRow> {
-        match self.query(&Request::RecentJobs { limit }) {
+        match self.query(&Request::Query(Query::RecentJobs { limit })) {
             Some(Response::RecentJobs(v)) => v,
             _ => Vec::new(), // Jobs are Persistent-only
         }
     }
 
     pub(crate) fn active_job(&mut self, runner_name: &str) -> Option<JobRow> {
-        match self.query(&Request::ActiveJob {
+        match self.query(&Request::Query(Query::ActiveJob {
             runner_name: runner_name.to_string(),
-        }) {
+        })) {
             Some(Response::ActiveJob(j)) => j,
             _ => None, // Persistent-only
         }
@@ -176,17 +176,17 @@ impl DataSource {
     // --- authorized mutations (the collector writes /etc on our behalf) ---
 
     pub(crate) fn set_metrics_pull(&mut self, enabled: bool, addr: &str) -> MutateOutcome {
-        self.mutate(Request::SetMetricsPull {
+        self.mutate(Request::Mutate(Mutation::SetMetricsPull {
             enabled,
             addr: addr.to_string(),
-        })
+        }))
     }
 
     pub(crate) fn add_org_token(&mut self, org: &str, token: &str) -> MutateOutcome {
-        self.mutate(Request::AddOrgToken {
+        self.mutate(Request::Mutate(Mutation::AddOrgToken {
             org: org.to_string(),
             token: token.to_string(),
-        })
+        }))
     }
 
     /// Send a mutation request; map the reply. `Unreachable` when Ephemeral or on

@@ -10,6 +10,7 @@ mod secret;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 
@@ -168,6 +169,32 @@ impl Config {
             return Some(t);
         }
         self.github.token.as_ref().map(|s| s.expose().to_string())
+    }
+}
+
+/// A hot-swappable config snapshot shared across the collector's threads. The
+/// collector loads config once, then swaps in a fresh snapshot when a mutation
+/// (or any reload) changes it; every worker that reads its snapshot each cycle
+/// picks the change up live. Zero-dep (`RwLock<Arc<Config>>`): a read clones the
+/// inner `Arc` (not the `Config`) and releases the lock immediately, so the
+/// rare writer never blocks the read-mostly workers. Lock poisoning is recovered
+/// (a panic while holding this brief lock must not wedge the daemon).
+#[derive(Clone)]
+pub struct SharedConfig(Arc<RwLock<Arc<Config>>>);
+
+impl SharedConfig {
+    pub fn new(cfg: Config) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(cfg))))
+    }
+
+    /// A cheap snapshot of the current config (an `Arc` clone, not a deep copy).
+    pub fn snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.0.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Swap in a new config; readers observe it on their next [`Self::snapshot`].
+    pub fn store(&self, cfg: Config) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
     }
 }
 

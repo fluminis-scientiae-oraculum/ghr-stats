@@ -17,8 +17,8 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rusqlite::Connection;
 
 use crate::service::store::{self, reader};
-use crate::shared::config::{Config, persist};
-use crate::shared::ipc::{self, ApiRow, Request, Response, VERSION};
+use crate::shared::config::{Config, SharedConfig, persist};
+use crate::shared::ipc::{self, ApiRow, Mutation, Query, Request, Response, VERSION};
 use crate::shared::paths::{self, ADMIN_GROUP, Scope};
 
 /// How often the non-blocking accept loop wakes to re-check the shutdown flag.
@@ -74,18 +74,22 @@ fn uid_in_group(uid: u32, group: &str) -> bool {
 
 /// Spawn the IPC server thread. Always spawns; a bind failure is logged and the
 /// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
-pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
+/// Holds the [`SharedConfig`] so it can reload the collector's config in-process
+/// after an authorized mutation (making a newly added PAT live without restart).
+pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
     // Bind the socket for the process's own scope — the same scope `systemd
-    // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats).
+    // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats). The
+    // DB path is fixed for the run, so snapshot it once here.
     let sock = Scope::detect().socket_path();
-    let db = cfg.db_path.clone();
+    let db = shared.snapshot().db_path.clone();
+    let shared = shared.clone();
     thread::Builder::new()
         .name("ipc-server".into())
-        .spawn(move || run(&sock, &db, &term))
+        .spawn(move || run(&sock, &db, &shared, &term))
         .expect("spawn ipc-server")
 }
 
-fn run(sock: &Path, db: &Path, term: &AtomicBool) {
+fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool) {
     let listener = match bind(sock) {
         Ok(l) => l,
         Err(e) => {
@@ -108,7 +112,7 @@ fn run(sock: &Path, db: &Path, term: &AtomicBool) {
             Ok((stream, _addr)) => {
                 // One local client at a low rate — serve inline. A slow client is
                 // bounded by CONN_TIMEOUT, so it can't wedge the accept loop.
-                if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path) {
+                if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path, shared) {
                     tracing::debug!(error = %e, "ipc: connection ended");
                 }
             }
@@ -147,10 +151,13 @@ fn bind(sock: &Path) -> io::Result<UnixListener> {
 }
 
 /// Serve requests on one connection until the client hangs up (EOF) or errors.
+/// A successful mutation triggers an in-process config reload, so a change (e.g.
+/// a newly added PAT) reaches the sampler/reconcile threads without a restart.
 fn serve_conn(
     mut stream: UnixStream,
     conn: Option<&Connection>,
     config_path: &Path,
+    shared: &SharedConfig,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONN_TIMEOUT))?;
     stream.set_write_timeout(Some(CONN_TIMEOUT))?;
@@ -163,8 +170,24 @@ fn serve_conn(
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        ipc::write_frame(&mut stream, &handle(&req, conn, auth, config_path))?;
+        let resp = handle(&req, conn, auth, config_path);
+        // A persisted mutation just changed /etc — reload so the running workers
+        // pick it up live (the whole point of the shared, swappable config).
+        if matches!(resp, Response::Mutated) {
+            shared.store(reload_config(config_path));
+            tracing::info!("ipc: config reloaded after mutation");
+        }
+        ipc::write_frame(&mut stream, &resp)?;
     }
+}
+
+/// Reload the collector's config from disk, re-applying systemd root discovery
+/// (as `serve` does at startup) so an empty `runner_roots` still finds the fleet.
+/// An unreadable/invalid file falls back to defaults rather than failing.
+fn reload_config(config_path: &Path) -> Config {
+    let mut cfg = Config::load(Some(config_path)).unwrap_or_default();
+    cfg.runner_roots = crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);
+    cfg
 }
 
 /// Map one request to a response. Reads go through `store::reader`; mutations go
@@ -172,60 +195,88 @@ fn serve_conn(
 /// query error becomes `Response::Error` rather than dropping the connection.
 fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Path) -> Response {
     match req {
-        Request::Hello { .. } => return Response::Hello { server: VERSION },
-        // Presence-only view of the configured token orgs (no DB, no auth — org
-        // logins aren't secret and already appear in the fleet data served here).
-        Request::ConfiguredTokenOrgs => {
-            return Response::ConfiguredTokenOrgs(configured_token_orgs(config_path));
+        Request::Hello { .. } => Response::Hello { server: VERSION },
+        // Reads: never authorized (derived stats + config presence, no secrets).
+        Request::Query(q) => serve_query(q, conn, config_path),
+        // Writes: the ONE authz gate. `apply_mutation` is reachable only past it,
+        // so no mutation — present or future — can skip authorization.
+        Request::Mutate(m) => {
+            if !authorized(auth.uid, auth.in_admin_group) {
+                tracing::warn!(
+                    peer_uid = auth.uid,
+                    action = m.action(),
+                    "ipc: config mutation denied (need root or the ghr-stats group)"
+                );
+                return Response::Denied;
+            }
+            apply_mutation(m, auth, config_path)
         }
-        // Mutations: authorized writes to the system config (need no DB).
-        Request::SetMetricsPull { enabled, addr } => {
-            return mutate(auth, "set_metrics_pull", || {
-                persist::set_metrics_pull(config_path, *enabled, addr)
-            });
-        }
-        Request::AddOrgToken { org, token } => {
-            return mutate(auth, "add_org_token", || {
-                persist::set_org_token(config_path, org, token)
-            });
-        }
-        _ => {}
     }
-    // Reads need the DB reader connection.
-    let Some(conn) = conn else {
-        return Response::Error("db unavailable".to_string());
-    };
-    match req {
-        Request::Hello { .. }
-        | Request::ConfiguredTokenOrgs
-        | Request::SetMetricsPull { .. }
-        | Request::AddOrgToken { .. } => unreachable!("handled above"),
-        Request::HostSeries { limit } => {
-            wrap(reader::host_series(conn, *limit), Response::HostSeries)
+}
+
+/// Serve a read query. Exhaustive over [`Query`] (a new read variant is a compile
+/// error until handled here — no `unreachable!`). The DB-availability check is
+/// factored into [`with_db`], so only the arms that need the reader carry it;
+/// `ConfiguredTokenOrgs` reads the config file instead.
+fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Response {
+    match q {
+        // Presence-only view of configured token orgs (config file, not the DB).
+        Query::ConfiguredTokenOrgs => {
+            Response::ConfiguredTokenOrgs(configured_token_orgs(config_path))
         }
-        Request::BusySeries { limit } => {
-            wrap(reader::busy_series(conn, *limit), Response::BusySeries)
+        Query::HostSeries { limit } => {
+            with_db(conn, |c| wrap(reader::host_series(c, *limit), Response::HostSeries))
         }
-        Request::RunnerHistory { agent_id, limit } => wrap(
-            reader::runner_history(conn, *agent_id, *limit),
-            Response::RunnerHistory,
-        ),
-        Request::RecentJobs { limit } => {
-            wrap(reader::recent_jobs(conn, *limit), Response::RecentJobs)
+        Query::BusySeries { limit } => {
+            with_db(conn, |c| wrap(reader::busy_series(c, *limit), Response::BusySeries))
         }
-        Request::ActiveJob { runner_name } => {
-            wrap(reader::active_job(conn, runner_name), Response::ActiveJob)
-        }
-        Request::LatestApiRunners => wrap(reader::latest_api_runners(conn), |m| {
-            Response::LatestApiRunners(
-                m.into_iter()
-                    .map(|(agent_id, state)| ApiRow { agent_id, state })
-                    .collect(),
+        Query::RunnerHistory { agent_id, limit } => with_db(conn, |c| {
+            wrap(
+                reader::runner_history(c, *agent_id, *limit),
+                Response::RunnerHistory,
             )
         }),
-        Request::RunnerStates => wrap(reader::runner_states(conn), |m| {
-            Response::RunnerStates(m.into_values().collect())
+        Query::RecentJobs { limit } => {
+            with_db(conn, |c| wrap(reader::recent_jobs(c, *limit), Response::RecentJobs))
+        }
+        Query::ActiveJob { runner_name } => with_db(conn, |c| {
+            wrap(reader::active_job(c, runner_name), Response::ActiveJob)
         }),
+        Query::LatestApiRunners => with_db(conn, |c| {
+            wrap(reader::latest_api_runners(c), |m| {
+                Response::LatestApiRunners(
+                    m.into_iter()
+                        .map(|(agent_id, state)| ApiRow { agent_id, state })
+                        .collect(),
+                )
+            })
+        }),
+        Query::RunnerStates => with_db(conn, |c| {
+            wrap(reader::runner_states(c), |m| {
+                Response::RunnerStates(m.into_values().collect())
+            })
+        }),
+    }
+}
+
+/// Apply an authorized config mutation. Reachable ONLY past the authz gate in
+/// [`handle`]. Exhaustive over [`Mutation`] (a new write variant is a compile
+/// error until handled — and it is automatically gated, since this is the only
+/// caller). Success is audit-logged with the peer uid; a persist error becomes
+/// `Response::Error`.
+fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
+    let result = match m {
+        Mutation::SetMetricsPull { enabled, addr } => {
+            persist::set_metrics_pull(config_path, *enabled, addr)
+        }
+        Mutation::AddOrgToken { org, token } => persist::set_org_token(config_path, org, token),
+    };
+    match result {
+        Ok(()) => {
+            tracing::info!(peer_uid = auth.uid, action = m.action(), "ipc: config mutated");
+            Response::Mutated
+        }
+        Err(e) => Response::Error(e.to_string()),
     }
 }
 
@@ -238,23 +289,12 @@ fn configured_token_orgs(config_path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Run a config mutation behind the authz gate: `Denied` for an unauthorized peer
-/// (logged), else persist and reply `Mutated` (audit-logged with the peer uid).
-fn mutate(
-    auth: Auth,
-    action: &str,
-    f: impl FnOnce() -> crate::shared::error::Result<()>,
-) -> Response {
-    if !authorized(auth.uid, auth.in_admin_group) {
-        tracing::warn!(peer_uid = auth.uid, action, "ipc: config mutation denied (need root or the ghr-stats group)");
-        return Response::Denied;
-    }
-    match f() {
-        Ok(()) => {
-            tracing::info!(peer_uid = auth.uid, action, "ipc: config mutated");
-            Response::Mutated
-        }
-        Err(e) => Response::Error(e.to_string()),
+/// Run `f` with the DB reader connection, or reply `Error` if the DB is
+/// unavailable — the single home for that check, so every read arm shares it.
+fn with_db(conn: Option<&Connection>, f: impl FnOnce(&Connection) -> Response) -> Response {
+    match conn {
+        Some(c) => f(c),
+        None => Response::Error("db unavailable".to_string()),
     }
 }
 
@@ -310,7 +350,7 @@ mod tests {
     #[test]
     fn data_request_without_db_is_an_error_not_a_panic() {
         assert!(matches!(
-            handle(&Request::HostSeries { limit: 5 }, None, ROOT, &noconf()),
+            handle(&Request::Query(Query::HostSeries { limit: 5 }), None, ROOT, &noconf()),
             Response::Error(_)
         ));
     }
@@ -319,7 +359,12 @@ mod tests {
     fn host_series_request_returns_rows() {
         let conn = seeded();
         assert!(matches!(
-            handle(&Request::HostSeries { limit: 5 }, Some(&conn), ROOT, &noconf()),
+            handle(
+                &Request::Query(Query::HostSeries { limit: 5 }),
+                Some(&conn),
+                ROOT,
+                &noconf()
+            ),
             Response::HostSeries(v) if v.len() == 1 && v[0].ts == 100
         ));
     }
@@ -333,7 +378,7 @@ mod tests {
             [],
         )
         .unwrap();
-        match handle(&Request::LatestApiRunners, Some(&conn), ROOT, &noconf()) {
+        match handle(&Request::Query(Query::LatestApiRunners), Some(&conn), ROOT, &noconf()) {
             Response::LatestApiRunners(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 9);
@@ -352,7 +397,7 @@ mod tests {
             [],
         )
         .unwrap();
-        match handle(&Request::RunnerStates, Some(&conn), ROOT, &noconf()) {
+        match handle(&Request::Query(Query::RunnerStates), Some(&conn), ROOT, &noconf()) {
             Response::RunnerStates(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 7);
@@ -373,7 +418,7 @@ mod tests {
         .unwrap();
         // NOBODY (unauthorized for mutations) can still read presence — org logins
         // aren't secret. No DB needed.
-        match handle(&Request::ConfiguredTokenOrgs, None, NOBODY, &cfg) {
+        match handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &cfg) {
             Response::ConfiguredTokenOrgs(orgs) => {
                 assert_eq!(orgs, vec!["acme".to_string(), "widgets".to_string()]);
             }
@@ -381,7 +426,7 @@ mod tests {
         }
         // A missing/unreadable config yields an empty list, never an error.
         assert!(matches!(
-            handle(&Request::ConfiguredTokenOrgs, None, NOBODY, &noconf()),
+            handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &noconf()),
             Response::ConfiguredTokenOrgs(orgs) if orgs.is_empty()
         ));
     }
@@ -390,10 +435,10 @@ mod tests {
     fn mutation_denied_for_unauthorized_peer_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
-        let req = Request::SetMetricsPull {
+        let req = Request::Mutate(Mutation::SetMetricsPull {
             enabled: true,
             addr: "127.0.0.1:9999".to_string(),
-        };
+        });
         assert!(matches!(
             handle(&req, None, NOBODY, &cfg),
             Response::Denied
@@ -405,13 +450,18 @@ mod tests {
     fn mutation_persists_for_authorized_peer() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
-        let req = Request::SetMetricsPull {
+        let req = Request::Mutate(Mutation::SetMetricsPull {
             enabled: true,
             addr: "127.0.0.1:9999".to_string(),
-        };
+        });
         // A group member is authorized (as is root).
         assert!(matches!(handle(&req, None, MEMBER, &cfg), Response::Mutated));
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert!(text.contains("9999"), "persisted config should hold the new addr");
     }
+
+    // NB: there is deliberately NO per-mutation "is it gated?" test. The
+    // `Request::Mutate` branch is the sole path to `apply_mutation`, so the
+    // single `mutation_denied_*` case above proves the gate for EVERY present
+    // and future mutation — the structure guarantees it, not a test per variant.
 }

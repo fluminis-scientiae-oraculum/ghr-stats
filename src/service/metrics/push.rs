@@ -1,6 +1,9 @@
 //! Metrics push: periodically POST the snapshot as JSON to a configured
-//! ingestion endpoint (e.g. OpenObserve's `_json`). Blocking `ureq`; disabled
-//! unless an endpoint is set. The interval loop polls the shutdown flag.
+//! ingestion endpoint (e.g. OpenObserve's `_json`). Blocking `ureq`. The thread
+//! reads the live config each cycle: it posts on the interval when enabled with
+//! an endpoint, and idles otherwise — so enabling/disabling push (or changing
+//! the endpoint) takes effect without a restart. Enable/disable transitions are
+//! logged once, not per cycle.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,43 +12,46 @@ use std::time::{Duration, Instant};
 
 use crate::service::metrics::encode::Snapshot;
 use crate::service::store::open_reader;
-use crate::shared::config::Config;
+use crate::shared::config::SharedConfig;
 use crate::shared::util::now_epoch;
 
-pub fn spawn(cfg: &Config, term: Arc<AtomicBool>) -> JoinHandle<()> {
-    let endpoint = cfg.metrics.push.endpoint.clone();
-    let auth = cfg
-        .metrics
-        .push
-        .auth
-        .as_ref()
-        .map(|s| s.expose().to_string());
-    let interval = Duration::from_secs(cfg.metrics.push.interval_secs.max(5));
-    let db = cfg.db_path.clone();
+/// Poll granularity for shutdown + config changes while idle/between posts.
+const TICK: Duration = Duration::from_millis(200);
+
+pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
+    let db = shared.snapshot().db_path.clone(); // DB path is fixed for the run
     let version = env!("CARGO_PKG_VERSION");
 
     thread::Builder::new()
         .name("metrics-push".into())
         .spawn(move || {
-            if endpoint.is_empty() {
-                tracing::warn!("metrics push enabled but endpoint is empty — disabled");
-                return;
-            }
-            let Some(conn) = open_reader(&db) else {
-                return;
-            };
-            tracing::info!(endpoint = %endpoint, every_s = interval.as_secs(), "metrics push enabled");
-
+            let conn = open_reader(&db);
             let mut next = Instant::now();
+            let mut active = false; // whether push is currently on — for one-shot transition logs
+
             while !term.load(Ordering::SeqCst) {
-                if Instant::now() >= next {
-                    match Snapshot::gather(&conn, now_epoch(), version) {
-                        Ok(s) => post(&endpoint, auth.as_deref(), &s.to_json()),
-                        Err(e) => tracing::warn!(error = %e, "metrics push: gather"),
+                let cfg = shared.snapshot();
+                let push = &cfg.metrics.push;
+                let on = push.enabled && !push.endpoint.is_empty();
+                if on != active {
+                    if on {
+                        tracing::info!(endpoint = %push.endpoint, every_s = push.interval_secs.max(5), "metrics push enabled");
+                        next = Instant::now(); // post promptly on enable
+                    } else {
+                        tracing::info!("metrics push disabled");
                     }
-                    next = Instant::now() + interval;
+                    active = on;
                 }
-                thread::sleep(Duration::from_millis(200));
+                if on && Instant::now() >= next {
+                    if let Some(conn) = conn.as_ref() {
+                        match Snapshot::gather(conn, now_epoch(), version) {
+                            Ok(s) => post(&push.endpoint, push.auth.as_ref().map(|a| a.expose()), &s.to_json()),
+                            Err(e) => tracing::warn!(error = %e, "metrics push: gather"),
+                        }
+                    }
+                    next = Instant::now() + Duration::from_secs(push.interval_secs.max(5));
+                }
+                thread::sleep(TICK);
             }
             tracing::debug!("metrics push stopped");
         })

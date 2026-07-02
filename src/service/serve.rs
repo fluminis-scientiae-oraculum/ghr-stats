@@ -37,7 +37,7 @@ use nix::fcntl::{Flock, FlockArg};
 use crate::service::store::{Store, reader, writer};
 use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::{self};
-use crate::shared::config::Config;
+use crate::shared::config::{Config, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
 use crate::shared::models::{ApiRunnerRow, HostSample, RunnerSample};
 use crate::shared::util::now_epoch;
@@ -116,20 +116,24 @@ pub fn run(cfg: &Config) -> Result<()> {
 
     // With no configured roots, fall back to systemd-discovered ones (once) so
     // the collector finds the fleet even from a bare config.
-    let mut cfg = cfg.clone();
-    cfg.runner_roots = collectors::runners::effective_roots(&cfg.runner_roots);
-    let cfg = Arc::new(cfg);
+    let mut initial = cfg.clone();
+    initial.runner_roots = collectors::runners::effective_roots(&initial.runner_roots);
+    // Live-reloadable config shared across the workers. An IPC mutation reloads it
+    // in-process (see `ipc_server`), and each producer / metrics thread reads its
+    // snapshot every cycle, so a change — a newly added PAT, a metrics toggle —
+    // takes effect without a service restart.
+    let shared = SharedConfig::new(initial);
     let (tx, rx) = bounded::<Sample>(CHANNEL_BOUND);
 
     let local = {
-        let (cfg, term, tx) = (Arc::clone(&cfg), Arc::clone(&term), tx.clone());
+        let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("local-sampler".into())
             .spawn(move || local_loop(&cfg, &term, &tx))
             .context("spawning local-sampler")?
     };
     let api = {
-        let (cfg, term, tx) = (Arc::clone(&cfg), Arc::clone(&term), tx.clone());
+        let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("api-reconcile".into())
             .spawn(move || api_loop(&cfg, &term, &tx))
@@ -138,30 +142,35 @@ pub fn run(cfg: &Config) -> Result<()> {
     let hooks = {
         // Resume tailing from the last persisted offset.
         let start_offset = reader::ingest_offset(store.conn(), "hooks").unwrap_or(0);
-        let (cfg, term, tx) = (Arc::clone(&cfg), Arc::clone(&term), tx.clone());
+        let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("hooks-tail".into())
             .spawn(move || hooks_loop(&cfg, &term, &tx, start_offset))
             .context("spawning hooks-tail")?
     };
-    // Metrics exporter threads (pull/push) — opt-in; they read the DB on their
-    // own WAL connections, never the writer. Empty if [metrics] is disabled.
-    let metrics = crate::service::metrics::spawn(&cfg, Arc::clone(&term));
+    // Metrics exporter threads (pull/push): always spawned, each reconciles its
+    // own resource to the live config (bind/drop the /metrics listener, post-or-
+    // idle the push) — so `[metrics]` toggles take effect without a restart.
+    let metrics = crate::service::metrics::spawn(&shared, Arc::clone(&term));
     // IPC server: serves the TUI's Persistent-mode history/jobs/GitHub over a
-    // Unix socket (its own WAL reader connection). This is what makes the
-    // collector reachable — cross-scope included — without exposing the DB file.
-    let ipc = crate::service::ipc_server::spawn(&cfg, Arc::clone(&term));
+    // Unix socket (its own WAL reader connection), and reloads `shared` after an
+    // authorized config mutation. This is what makes the collector reachable —
+    // cross-scope included — without exposing the DB file.
+    let ipc = crate::service::ipc_server::spawn(&shared, Arc::clone(&term));
 
     // The writer holds only `rx`; once the producers exit and drop their
     // senders, `rx` disconnects and the loop below ends.
     drop(tx);
 
-    tracing::info!(
-        db = %cfg.db_path.display(),
-        every_s = cfg.intervals.local_secs,
-        api_every_s = cfg.intervals.api_secs,
-        "serve started"
-    );
+    {
+        let cfg = shared.snapshot();
+        tracing::info!(
+            db = %cfg.db_path.display(),
+            every_s = cfg.intervals.local_secs,
+            api_every_s = cfg.intervals.api_secs,
+            "serve started"
+        );
+    }
 
     for msg in rx.iter() {
         match msg {
@@ -200,17 +209,19 @@ pub fn run(cfg: &Config) -> Result<()> {
 }
 
 /// Producer: sample local sources on `local_secs`, deriving CPU% across ticks.
-fn local_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
+/// Reads the config snapshot each cycle, so a changed root/interval is picked up
+/// live.
+fn local_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
     let mut cpu = CpuRateTracker::new();
-    let period = Duration::from_secs(cfg.intervals.local_secs.max(1));
     let mut tick: u64 = 0;
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
+            let c = cfg.snapshot();
             let now = now_epoch();
             let walk_work = tick.is_multiple_of(WORK_WALK_EVERY);
-            let snap = collectors::collect_local(&cfg.runner_roots, now, walk_work);
+            let snap = collectors::collect_local(&c.runner_roots, now, walk_work);
             let runners = to_samples(snap.runners, now, &mut cpu);
             if tx
                 .send(Sample::Local {
@@ -222,7 +233,7 @@ fn local_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
                 break; // writer gone
             }
             tick = tick.wrapping_add(1);
-            next = Instant::now() + period;
+            next = Instant::now() + Duration::from_secs(c.intervals.local_secs.max(1));
         }
         sleep_until(next, term);
     }
@@ -231,26 +242,28 @@ fn local_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
 /// Producer: reconcile GitHub's view on `api_secs`. Uses the explicit
 /// `config.orgs` list when set, else discovers orgs from the runners' `.runner`
 /// files each cycle — so it shares no mutable state with the local sampler.
-fn api_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
-    let period = Duration::from_secs(cfg.intervals.api_secs.max(10));
+fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            let orgs: BTreeSet<String> = if cfg.orgs.is_empty() {
-                collectors::runners::discover(&cfg.runner_roots)
+            // Snapshot per cycle: a PAT added via the TUI (AddOrgToken) is picked
+            // up here on the next reconcile — no restart.
+            let c = cfg.snapshot();
+            let orgs: BTreeSet<String> = if c.orgs.is_empty() {
+                collectors::runners::discover(&c.runner_roots)
                     .into_iter()
                     .map(|r| r.org)
                     .collect()
             } else {
-                cfg.orgs.iter().cloned().collect()
+                c.orgs.iter().cloned().collect()
             };
             let now = now_epoch();
-            let rows = gather_api(cfg, &orgs, term);
+            let rows = gather_api(&c, &orgs, term);
             if !rows.is_empty() && tx.send(Sample::Api { ts: now, rows }).is_err() {
                 break; // writer gone
             }
-            next = Instant::now() + period;
+            next = Instant::now() + Duration::from_secs(c.intervals.api_secs.max(10));
         }
         sleep_until(next, term);
     }
@@ -259,13 +272,13 @@ fn api_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>) {
 /// Producer: tail the NDJSON job-event log and forward batches + the advanced
 /// offset. Tracks the offset in memory (seeded from the DB) so it shares no
 /// state with the writer.
-fn hooks_loop(cfg: &Config, term: &AtomicBool, tx: &Sender<Sample>, mut offset: u64) {
+fn hooks_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>, mut offset: u64) {
     const TAIL_PERIOD: Duration = Duration::from_secs(2);
-    let path = cfg.event_log.clone();
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
+            let path = cfg.snapshot().event_log.clone();
             let (events, new_offset) = crate::shared::hooks::ingest::tail_events(&path, offset);
             if (!events.is_empty() || new_offset != offset)
                 && tx
