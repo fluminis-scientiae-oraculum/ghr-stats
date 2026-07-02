@@ -33,9 +33,9 @@ use crate::cli::{Cli, Command, DbAction};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
-    init_tracing();
     let args = Cli::parse();
     let config_path = args.config;
+    init_tracing(&args.command);
 
     // `config` bootstraps the config file, so it must not require one to already
     // exist; every other command loads config first. A small closure keeps that
@@ -68,8 +68,18 @@ fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
     }
 }
 
-fn init_tracing() {
+/// Install the tracing subscriber, with the sink chosen by command. The
+/// interactive TUI owns the terminal (alternate screen), so ANY log line written
+/// to stdout/stderr is visible noise that bleeds onto the dashboard — it gets NO
+/// writer at all (events are dropped; `RUST_LOG` has no effect there — a
+/// file/journal sink for TUI diagnostics is future work). Every other verb
+/// (`serve`, `config`, `systemd`, `db`, `uninstall`) logs at `info`, honoring
+/// `RUST_LOG`; `serve` runs under systemd, so its output lands in the journal.
+fn init_tracing(command: &Option<Command>) {
     use tracing_subscriber::{EnvFilter, fmt};
+    if matches!(command, None | Some(Command::Tui)) {
+        return;
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).with_target(false).init();
 }
