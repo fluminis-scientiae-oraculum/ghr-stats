@@ -123,6 +123,25 @@ local config). An explicit `--config FLAG` or `$GHR_STATS_CONFIG` overrides the
 location. Every field has a default, so the tool runs with no config at all. See
 [`config.example.toml`](config.example.toml) for every field.
 
+### Editing config from a non-root TUI (the `ghr-stats` group)
+
+Because the config is root-owned, a plain dashboard normally can't apply the
+Config-tab edits — you'd run `sudo ghr-stats`. To avoid per-edit sudo, a system
+install provisions a **`ghr-stats` group** and adds the installing operator to
+it. When the collector is running, the TUI's `[a]` (add org + PAT) and `[m]`
+(toggle metrics) route the change over the socket to the root collector, which
+applies it only for an **authorized peer** — one whose kernel-reported uid is
+root or a member of `ghr-stats`. This is the standard privileged-daemon pattern:
+the unprivileged client asks the privileged service to perform a narrow,
+validated write on its behalf. Reads stay open to any local user (the socket
+carries only derived fleet stats, never tokens); only these two writes are gated,
+and the token itself is one-way — written, never returned over the socket.
+
+Membership is resolved fresh by the collector on every request, so
+`sudo usermod -aG ghr-stats <user>` takes effect immediately — no re-login. An
+unauthorized edit is refused with guidance rather than silently failing. Hooks
+(`[h]`) and the raw-file editor (`[o]`) still shell out with sudo.
+
 ### GitHub API (optional, read-only)
 
 The online/busy reconcile needs a **fine-grained, read-only PAT per org** (a

@@ -20,7 +20,8 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 /// The same binary ships both halves, so a mismatch means the installed service
 /// is older/newer than the TUI binary — restart the service after upgrading.
 /// v2: added `RunnerStates` (persisted liveness edges for the "For" duration).
-pub const VERSION: u16 = 2;
+/// v3: added authorized config mutations (`SetMetricsPull`, `AddOrgToken`).
+pub const VERSION: u16 = 3;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -40,6 +41,12 @@ pub enum Request {
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
+    // --- mutations: authorized (uid 0 or `ghr-stats` group) writes to /etc ---
+    /// Toggle the Prometheus pull endpoint (mirrors the TUI's `[m]`).
+    SetMetricsPull { enabled: bool, addr: String },
+    /// Add/replace a read-only PAT for an org (mirrors the wizard's `[a]`). The
+    /// token is one-way: it is written but never returned in any response.
+    AddOrgToken { org: String, token: String },
 }
 
 /// One runner's GitHub state, paired with its id. A `Vec` of these — not a
@@ -66,6 +73,10 @@ pub enum Response {
     /// Persisted liveness edges; `RunnerState.agent_id` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
+    /// A mutation was authorized and persisted.
+    Mutated,
+    /// A mutation was refused — the peer is neither root nor in `ghr-stats`.
+    Denied,
     Error(String),
 }
 
@@ -132,5 +143,52 @@ mod tests {
         write_frame(&mut buf, &Request::HostSeries { limit: 10 }).unwrap();
         buf.truncate(buf.len() - 2); // lose the tail of the body
         assert!(read_frame::<_, Request>(&mut &buf[..]).is_err());
+    }
+
+    #[test]
+    fn mutation_request_variants_round_trip() {
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::SetMetricsPull {
+                enabled: true,
+                addr: "127.0.0.1:9477".to_string(),
+            },
+        )
+        .unwrap();
+        let back: Request = read_frame(&mut &buf[..]).unwrap();
+        assert!(matches!(
+            back,
+            Request::SetMetricsPull { enabled: true, addr } if addr == "127.0.0.1:9477"
+        ));
+
+        let mut buf = Vec::new();
+        write_frame(
+            &mut buf,
+            &Request::AddOrgToken {
+                org: "acme".to_string(),
+                token: "github_pat_ABC".to_string(),
+            },
+        )
+        .unwrap();
+        let back: Request = read_frame(&mut &buf[..]).unwrap();
+        assert!(matches!(
+            back,
+            Request::AddOrgToken { org, token } if org == "acme" && token == "github_pat_ABC"
+        ));
+    }
+
+    /// The mutation-reply variants carry no payload — structurally, no `Response`
+    /// can return a token. This pins that: their JSON bodies mention neither a
+    /// token nor a value, only the tag.
+    #[test]
+    fn mutation_replies_are_payload_free() {
+        for resp in [Response::Mutated, Response::Denied] {
+            let body = serde_json::to_string(&resp).unwrap();
+            assert!(
+                body == "\"Mutated\"" || body == "\"Denied\"",
+                "mutation reply must be a bare tag, got {body}"
+            );
+        }
     }
 }

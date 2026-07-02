@@ -18,6 +18,12 @@
 
 use std::path::{Path, PathBuf};
 
+/// The Unix group whose members (plus root) may mutate the root-owned system
+/// config over the IPC socket. `systemd install` provisions it and adds the
+/// operator; the collector's peer-cred authz ([`crate::service::ipc_server`])
+/// checks it. One literal, so the installer and the authz gate never drift.
+pub(crate) const ADMIN_GROUP: &str = "ghr-stats";
+
 /// Which on-disk layout a run uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {

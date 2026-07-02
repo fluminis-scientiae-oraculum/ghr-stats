@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::SystemdAction;
 use crate::shared::config::Config;
-use crate::shared::paths::Scope;
+use crate::shared::paths::{ADMIN_GROUP, Scope};
 
 const UNIT_NAME: &str = "ghr-stats.service";
 
@@ -59,6 +59,60 @@ fn install(scope: Scope) -> Result<()> {
     println!("  config: {}", scope.config_file().display());
     println!("  data:   {}", scope.data_dir().display());
     println!("  socket: {}", scope.socket_path().display());
+    // The admin group only gates the root collector's /etc writes; a user-scope
+    // collector owns its config outright, so provision it for System only.
+    if scope == Scope::System {
+        provision_admin_group();
+    }
+    Ok(())
+}
+
+/// Idempotently create the `ghr-stats` admin group and add the invoking operator
+/// (`$SUDO_USER`) to it, so an authorized non-root TUI can edit the root-owned
+/// system config over the socket without per-edit sudo. Best-effort: a failure
+/// here does NOT fail the install (the service is already up) — it prints the
+/// manual command instead. Membership is resolved fresh by the collector on each
+/// request, so it takes effect immediately (no re-login).
+fn provision_admin_group() {
+    // `groupadd -f`: succeeds whether or not the group already exists (idempotent).
+    if let Err(e) = run_tool("groupadd", &["-f", ADMIN_GROUP]) {
+        println!("  note: could not create the `{ADMIN_GROUP}` group ({e}).");
+        println!("        create it + add operators to allow non-root config edits:");
+        println!("          sudo groupadd -f {ADMIN_GROUP} && sudo usermod -aG {ADMIN_GROUP} <user>");
+        return;
+    }
+    // Add the human who ran `sudo` (never root itself) to the group.
+    match std::env::var("SUDO_USER") {
+        Ok(user) if !user.is_empty() && user != "root" => {
+            match run_tool("usermod", &["-aG", ADMIN_GROUP, &user]) {
+                Ok(()) => println!(
+                    "  group:  added {user} to `{ADMIN_GROUP}` — {user} can now edit config \
+                     from a non-root TUI (no re-login needed)"
+                ),
+                Err(e) => {
+                    println!("  note: created `{ADMIN_GROUP}` but could not add {user} ({e}).");
+                    println!("        run: sudo usermod -aG {ADMIN_GROUP} {user}");
+                }
+            }
+        }
+        // Installed directly as root (no SUDO_USER): nothing to add automatically.
+        _ => println!(
+            "  group:  `{ADMIN_GROUP}` ready — allow a non-root TUI to edit config with: \
+             sudo usermod -aG {ADMIN_GROUP} <user>"
+        ),
+    }
+}
+
+/// Run a system administration tool, mapping a non-zero exit / missing binary to
+/// an `Err` the caller reports (never propagated — group setup is best-effort).
+fn run_tool(tool: &str, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new(tool)
+        .args(args)
+        .status()
+        .with_context(|| format!("running {tool}"))?;
+    if !status.success() {
+        bail!("{tool} {} failed ({status})", args.join(" "));
+    }
     Ok(())
 }
 

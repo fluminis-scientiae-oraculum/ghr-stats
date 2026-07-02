@@ -28,6 +28,18 @@ pub(crate) enum Mode {
     Persistent,
 }
 
+/// Result of a config mutation attempted over the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutateOutcome {
+    /// The authorized collector persisted the change.
+    Mutated,
+    /// The collector refused — the peer isn't root or in the `ghr-stats` group.
+    Denied,
+    /// No collector reachable (Ephemeral) or the request errored — caller falls
+    /// back to a direct write.
+    Unreachable,
+}
+
 /// The App's history source: an in-memory ring buffer, or a live collector.
 pub(crate) enum DataSource {
     Ephemeral,
@@ -148,6 +160,32 @@ impl DataSource {
         }) {
             Some(Response::ActiveJob(j)) => j,
             _ => None, // Persistent-only
+        }
+    }
+
+    // --- authorized mutations (the collector writes /etc on our behalf) ---
+
+    pub(crate) fn set_metrics_pull(&mut self, enabled: bool, addr: &str) -> MutateOutcome {
+        self.mutate(Request::SetMetricsPull {
+            enabled,
+            addr: addr.to_string(),
+        })
+    }
+
+    pub(crate) fn add_org_token(&mut self, org: &str, token: &str) -> MutateOutcome {
+        self.mutate(Request::AddOrgToken {
+            org: org.to_string(),
+            token: token.to_string(),
+        })
+    }
+
+    /// Send a mutation request; map the reply. `Unreachable` when Ephemeral or on
+    /// any error (the caller then falls back to a direct write).
+    fn mutate(&mut self, req: Request) -> MutateOutcome {
+        match self.query(&req) {
+            Some(Response::Mutated) => MutateOutcome::Mutated,
+            Some(Response::Denied) => MutateOutcome::Denied,
+            _ => MutateOutcome::Unreachable,
         }
     }
 }

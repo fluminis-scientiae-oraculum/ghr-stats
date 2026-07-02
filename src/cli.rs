@@ -59,7 +59,9 @@ pub enum Command {
         and never clobbering a foreign hook (it chains after it or prints a snippet instead). \
         Writing the system config and editing runner .env files both need root, hence sudo. \
         The same settings can be changed live from the TUI's Config tab ([a]/[h]/[m]/[o]) when \
-        the dashboard is run as `sudo ghr-stats`."
+        the dashboard is run as `sudo ghr-stats` — or, for [a]/[m], as an ordinary user in the \
+        `ghr-stats` group, which lets the root collector apply the edit over its socket without \
+        sudo (see `systemd install`)."
     )]
     Config,
 
@@ -135,6 +137,14 @@ pub enum UninstallDomain {
 #[derive(Subcommand, Debug)]
 pub enum SystemdAction {
     /// Install + enable the service, copying the binary to a stable system path.
+    #[command(
+        long_about = "Copy the running binary to a stable absolute path, render + enable the \
+        `serve` unit, and start it. A system install (root) also provisions the `ghr-stats` \
+        group and adds the invoking operator ($SUDO_USER) to it: members (and root) may edit the \
+        root-owned system config from a non-root TUI — the collector applies [a]/[m] edits over \
+        its socket, authorized by the peer's kernel-reported uid. Membership takes effect \
+        immediately (no re-login); add more operators with `sudo usermod -aG ghr-stats <user>`."
+    )]
     Install {
         /// System-wide service under /etc + /var/lib (needs root).
         #[arg(long, conflicts_with = "user")]

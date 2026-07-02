@@ -13,17 +13,64 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rusqlite::Connection;
 
 use crate::service::store::{self, reader};
-use crate::shared::config::Config;
+use crate::shared::config::{Config, persist};
 use crate::shared::ipc::{self, ApiRow, Request, Response, VERSION};
-use crate::shared::paths::Scope;
+use crate::shared::paths::{self, ADMIN_GROUP, Scope};
 
 /// How often the non-blocking accept loop wakes to re-check the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
 /// Per-connection I/O timeout — a wedged client can't stall the accept loop.
 const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The authenticated peer of a connection, from `SO_PEERCRED` (kernel-provided,
+/// unspoofable). Resolved once per connection.
+#[derive(Clone, Copy)]
+struct Auth {
+    uid: u32,
+    in_admin_group: bool,
+}
+
+/// Whether a peer may mutate config: root, or a member of [`ADMIN_GROUP`]. Pure.
+fn authorized(uid: u32, in_admin_group: bool) -> bool {
+    uid == 0 || in_admin_group
+}
+
+/// Read the connection's peer credentials and resolve group membership. Fails
+/// CLOSED — an unreadable peer is treated as unprivileged, never authorized.
+fn peer_auth(stream: &UnixStream) -> Auth {
+    match getsockopt(stream, PeerCredentials) {
+        Ok(cred) => {
+            let uid = cred.uid();
+            Auth {
+                uid,
+                in_admin_group: uid_in_group(uid, ADMIN_GROUP),
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ipc: peer credentials unavailable — treating as unprivileged");
+            Auth {
+                uid: u32::MAX,
+                in_admin_group: false,
+            }
+        }
+    }
+}
+
+/// Whether `uid`'s group memberships (resolved from the group DB, so `usermod
+/// -aG` takes effect without a re-login) include `group`.
+fn uid_in_group(uid: u32, group: &str) -> bool {
+    let Some(user) = uzers::get_user_by_uid(uid) else {
+        return false;
+    };
+    uzers::get_user_groups(user.name(), user.primary_group_id())
+        .into_iter()
+        .flatten()
+        .any(|g| g.name().to_str() == Some(group))
+}
 
 /// Spawn the IPC server thread. Always spawns; a bind failure is logged and the
 /// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
@@ -54,12 +101,14 @@ fn run(sock: &Path, db: &Path, term: &AtomicBool) {
     tracing::info!(sock = %sock.display(), "ipc listening");
 
     let conn = store::open_reader(db);
+    // Authorized mutations write the canonical system config (/etc).
+    let config_path = paths::config_write_target(None);
     while !term.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 // One local client at a low rate — serve inline. A slow client is
                 // bounded by CONN_TIMEOUT, so it can't wedge the accept loop.
-                if let Err(e) = serve_conn(stream, conn.as_ref()) {
+                if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path) {
                     tracing::debug!(error = %e, "ipc: connection ended");
                 }
             }
@@ -98,9 +147,15 @@ fn bind(sock: &Path) -> io::Result<UnixListener> {
 }
 
 /// Serve requests on one connection until the client hangs up (EOF) or errors.
-fn serve_conn(mut stream: UnixStream, conn: Option<&Connection>) -> io::Result<()> {
+fn serve_conn(
+    mut stream: UnixStream,
+    conn: Option<&Connection>,
+    config_path: &Path,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(CONN_TIMEOUT))?;
     stream.set_write_timeout(Some(CONN_TIMEOUT))?;
+    // Resolve the peer's identity once, from the kernel — used to gate mutations.
+    let auth = peer_auth(&stream);
     loop {
         let req: Request = match ipc::read_frame(&mut stream) {
             Ok(r) => r,
@@ -108,21 +163,37 @@ fn serve_conn(mut stream: UnixStream, conn: Option<&Connection>) -> io::Result<(
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        ipc::write_frame(&mut stream, &handle(&req, conn))?;
+        ipc::write_frame(&mut stream, &handle(&req, conn, auth, config_path))?;
     }
 }
 
-/// Map one request to a response via `store::reader`. A DB/query error becomes
-/// `Response::Error` (logged client-side) rather than dropping the connection.
-fn handle(req: &Request, conn: Option<&Connection>) -> Response {
-    if let Request::Hello { .. } = req {
-        return Response::Hello { server: VERSION };
+/// Map one request to a response. Reads go through `store::reader`; mutations go
+/// through the authz gate to `config::persist` (writing `config_path`). A DB or
+/// query error becomes `Response::Error` rather than dropping the connection.
+fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Path) -> Response {
+    match req {
+        Request::Hello { .. } => return Response::Hello { server: VERSION },
+        // Mutations: authorized writes to the system config (need no DB).
+        Request::SetMetricsPull { enabled, addr } => {
+            return mutate(auth, "set_metrics_pull", || {
+                persist::set_metrics_pull(config_path, *enabled, addr)
+            });
+        }
+        Request::AddOrgToken { org, token } => {
+            return mutate(auth, "add_org_token", || {
+                persist::set_org_token(config_path, org, token)
+            });
+        }
+        _ => {}
     }
+    // Reads need the DB reader connection.
     let Some(conn) = conn else {
         return Response::Error("db unavailable".to_string());
     };
     match req {
-        Request::Hello { .. } => unreachable!("handled above"),
+        Request::Hello { .. }
+        | Request::SetMetricsPull { .. }
+        | Request::AddOrgToken { .. } => unreachable!("handled above"),
         Request::HostSeries { limit } => {
             wrap(reader::host_series(conn, *limit), Response::HostSeries)
         }
@@ -152,6 +223,26 @@ fn handle(req: &Request, conn: Option<&Connection>) -> Response {
     }
 }
 
+/// Run a config mutation behind the authz gate: `Denied` for an unauthorized peer
+/// (logged), else persist and reply `Mutated` (audit-logged with the peer uid).
+fn mutate(
+    auth: Auth,
+    action: &str,
+    f: impl FnOnce() -> crate::shared::error::Result<()>,
+) -> Response {
+    if !authorized(auth.uid, auth.in_admin_group) {
+        tracing::warn!(peer_uid = auth.uid, action, "ipc: config mutation denied (need root or the ghr-stats group)");
+        return Response::Denied;
+    }
+    match f() {
+        Ok(()) => {
+            tracing::info!(peer_uid = auth.uid, action, "ipc: config mutated");
+            Response::Mutated
+        }
+        Err(e) => Response::Error(e.to_string()),
+    }
+}
+
 /// Fold a reader `Result<T>` into a `Response`: `ok` on success, `Error` on failure.
 fn wrap<T>(res: crate::shared::error::Result<T>, ok: impl FnOnce(T) -> Response) -> Response {
     match res {
@@ -163,6 +254,8 @@ fn wrap<T>(res: crate::shared::error::Result<T>, ok: impl FnOnce(T) -> Response)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
 
     fn seeded() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -176,10 +269,25 @@ mod tests {
         conn
     }
 
+    // Auth fixtures + a config path reads never touch.
+    const ROOT: Auth = Auth { uid: 0, in_admin_group: false };
+    const MEMBER: Auth = Auth { uid: 1000, in_admin_group: true };
+    const NOBODY: Auth = Auth { uid: 1000, in_admin_group: false };
+    fn noconf() -> PathBuf {
+        PathBuf::from("/nonexistent/ghr-stats-unused.toml")
+    }
+
+    #[test]
+    fn authorized_only_for_root_or_group_member() {
+        assert!(authorized(0, false)); // root
+        assert!(authorized(1000, true)); // group member
+        assert!(!authorized(1000, false)); // neither
+    }
+
     #[test]
     fn hello_replies_with_server_version_without_a_db() {
         assert!(matches!(
-            handle(&Request::Hello { client: VERSION }, None),
+            handle(&Request::Hello { client: VERSION }, None, NOBODY, &noconf()),
             Response::Hello { server } if server == VERSION
         ));
     }
@@ -187,7 +295,7 @@ mod tests {
     #[test]
     fn data_request_without_db_is_an_error_not_a_panic() {
         assert!(matches!(
-            handle(&Request::HostSeries { limit: 5 }, None),
+            handle(&Request::HostSeries { limit: 5 }, None, ROOT, &noconf()),
             Response::Error(_)
         ));
     }
@@ -196,7 +304,7 @@ mod tests {
     fn host_series_request_returns_rows() {
         let conn = seeded();
         assert!(matches!(
-            handle(&Request::HostSeries { limit: 5 }, Some(&conn)),
+            handle(&Request::HostSeries { limit: 5 }, Some(&conn), ROOT, &noconf()),
             Response::HostSeries(v) if v.len() == 1 && v[0].ts == 100
         ));
     }
@@ -210,7 +318,7 @@ mod tests {
             [],
         )
         .unwrap();
-        match handle(&Request::LatestApiRunners, Some(&conn)) {
+        match handle(&Request::LatestApiRunners, Some(&conn), ROOT, &noconf()) {
             Response::LatestApiRunners(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 9);
@@ -229,7 +337,7 @@ mod tests {
             [],
         )
         .unwrap();
-        match handle(&Request::RunnerStates, Some(&conn)) {
+        match handle(&Request::RunnerStates, Some(&conn), ROOT, &noconf()) {
             Response::RunnerStates(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 7);
@@ -237,5 +345,34 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn mutation_denied_for_unauthorized_peer_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let req = Request::SetMetricsPull {
+            enabled: true,
+            addr: "127.0.0.1:9999".to_string(),
+        };
+        assert!(matches!(
+            handle(&req, None, NOBODY, &cfg),
+            Response::Denied
+        ));
+        assert!(!cfg.exists(), "denied mutation must not write the config");
+    }
+
+    #[test]
+    fn mutation_persists_for_authorized_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let req = Request::SetMetricsPull {
+            enabled: true,
+            addr: "127.0.0.1:9999".to_string(),
+        };
+        // A group member is authorized (as is root).
+        assert!(matches!(handle(&req, None, MEMBER, &cfg), Response::Mutated));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("9999"), "persisted config should hold the new addr");
     }
 }

@@ -12,7 +12,6 @@
 //! — the wizard only intercepts Enter/Esc for navigation.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
@@ -22,14 +21,15 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::shared::config::persist;
 use crate::shared::github::validate::{self, Verdict};
 
 /// What the wizard needs from the app to act: the locally-discovered runner
-/// agentIds (for the agentId-confirm) and the config file to write.
+/// agentIds, for the agentId-confirm. The *how* of persisting is injected as a
+/// `save` closure at key-time (see [`WizardMode::on_key`]), so the wizard is
+/// agnostic to whether the token lands via the root collector (IPC) or a direct
+/// config write.
 pub(crate) struct WizardCtx {
     pub local_ids: HashSet<i64>,
-    pub target: PathBuf,
 }
 
 // ---- typestate states (data-carrying; private fields ⇒ un-fabricable) ----
@@ -133,10 +133,13 @@ impl Wizard<PatInput> {
 }
 
 impl Wizard<Confirmed> {
-    /// Persist the validated token. The ONLY persist path — reachable only from a
-    /// successful `validate`.
-    fn write(self, target: &Path) -> Wizard<Done> {
-        let done = match persist::set_org_token(target, &self.state.org, &self.state.pat) {
+    /// Persist the validated token via the injected `save` sink. The ONLY persist
+    /// path — reachable only from a successful `validate`, so the typestate keeps
+    /// its "validated-only persist" guarantee regardless of the sink (IPC to the
+    /// root collector, or a direct config write). `save` returns `Err(msg)` with a
+    /// human reason (unauthorized / write failed) that is surfaced in `Done`.
+    fn write(self, save: impl FnOnce(&str, &str) -> Result<(), String>) -> Wizard<Done> {
+        let done = match save(&self.state.org, &self.state.pat) {
             Ok(()) => Done {
                 message: format!(
                     "saved read-only token for {} ({}/{} local runners matched)",
@@ -177,8 +180,16 @@ impl WizardMode {
 
     /// Route one key. Consumes `self` (the typestate). The text states intercept
     /// Enter/Esc for navigation and hand every other key to the input widget;
-    /// `validate`/`write` block briefly (a sync network call / a file write).
-    pub(crate) fn on_key(self, key: KeyEvent, ctx: &WizardCtx) -> Step {
+    /// `validate`/`write` block briefly (a sync network call / a persist round-trip).
+    /// `save` is the injected persist sink, invoked only when a `Confirmed` wizard
+    /// is committed — the App routes it through the root collector (IPC) with a
+    /// direct-write fallback.
+    pub(crate) fn on_key(
+        self,
+        key: KeyEvent,
+        ctx: &WizardCtx,
+        save: impl FnOnce(&str, &str) -> Result<(), String>,
+    ) -> Step {
         match self {
             WizardMode::PickAction(w) => match key.code {
                 KeyCode::Char('a') => Step::Stay(WizardMode::OrgInput(w.add_org())),
@@ -209,7 +220,7 @@ impl WizardMode {
             },
             WizardMode::Confirmed(w) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    Step::Stay(WizardMode::Done(w.write(&ctx.target)))
+                    Step::Stay(WizardMode::Done(w.write(save)))
                 }
                 KeyCode::Esc | KeyCode::Char('n') => Step::Close(false),
                 _ => Step::Stay(WizardMode::Confirmed(w)),
@@ -357,7 +368,6 @@ mod tests {
     fn org_then_pat_flow_without_network() {
         let ctx = WizardCtx {
             local_ids: HashSet::new(),
-            target: PathBuf::from("/tmp/x"),
         };
         let mut mode = WizardMode::new();
         mode = step(mode, ev(KeyCode::Char('a')), &ctx); // → OrgInput
@@ -369,7 +379,7 @@ mod tests {
         assert!(matches!(mode, WizardMode::PatInput(_)));
         // Esc closes without a change.
         assert!(matches!(
-            mode.on_key(ev(KeyCode::Esc), &ctx),
+            mode.on_key(ev(KeyCode::Esc), &ctx, no_save),
             Step::Close(false)
         ));
     }
@@ -378,7 +388,6 @@ mod tests {
     fn empty_org_cannot_advance() {
         let ctx = WizardCtx {
             local_ids: HashSet::new(),
-            target: PathBuf::from("/tmp/x"),
         };
         let mode = step(WizardMode::new(), ev(KeyCode::Char('a')), &ctx);
         // Enter with an empty org stays in OrgInput.
@@ -386,8 +395,14 @@ mod tests {
         assert!(matches!(mode, WizardMode::OrgInput(_)));
     }
 
+    /// A no-op persist sink for the navigation tests — these never reach the
+    /// `Confirmed` state (that needs a live `validate`), so it is never invoked.
+    fn no_save(_org: &str, _token: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     fn step(mode: WizardMode, key: KeyEvent, ctx: &WizardCtx) -> WizardMode {
-        match mode.on_key(key, ctx) {
+        match mode.on_key(key, ctx, no_save) {
             Step::Stay(m) => m,
             Step::Close(_) => panic!("unexpected close"),
         }
