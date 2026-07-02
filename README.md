@@ -110,13 +110,17 @@ same file.
 
 ## Configure
 
-`ghr-stats config` is a consent-first wizard: it discovers runner install dirs,
-collects an optional GitHub token per org (masked input, validated), and offers
-to set up the job hooks. It writes `config.toml` at mode `0600`.
+`sudo ghr-stats config` is a consent-first wizard: it discovers runner install
+dirs, collects an optional GitHub token per org (masked input, validated), and
+offers to set up the job hooks. It writes the config at mode `0600`.
 
-Config search order: `--config FLAG` → `$GHR_STATS_CONFIG` →
-`/etc/ghr-stats/config.toml` → `$XDG_CONFIG_HOME/ghr-stats/config.toml`. Every
-field has a default, so the tool runs with no config at all. See
+The config is a **single system-scope artifact at `/etc/ghr-stats/config.toml`**
+(root:root, `0600`) — it holds your PATs and is the collector's source of truth,
+so it lives there once rather than duplicated per-user. Writing it needs root
+(`sudo`); reading it does too, so run the dashboard as `sudo ghr-stats` for the
+live view (a non-root TUI still shows persistent data over the socket, but has no
+local config). An explicit `--config FLAG` or `$GHR_STATS_CONFIG` overrides the
+location. Every field has a default, so the tool runs with no config at all. See
 [`config.example.toml`](config.example.toml) for every field.
 
 ### GitHub API (optional, read-only)

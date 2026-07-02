@@ -469,9 +469,6 @@ fn write_config(path: &Path, contents: &str) -> Result<()> {
         .with_context(|| format!("opening {}", path.display()))?;
     f.write_all(contents.as_bytes())?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    // If we're root only for the hooks step, the config is still the invoking
-    // user's — hand it (and the dir we made) back so their non-root TUI reads it.
-    crate::shared::paths::chown_to_invoker(path);
     Ok(())
 }
 

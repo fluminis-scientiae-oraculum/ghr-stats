@@ -274,8 +274,9 @@ impl App {
     }
 
     /// The config file the TUI writes — the `--config` override, else the
-    /// invoking user's config (SUDO_USER-aware, matches `ghr-stats config`), so a
-    /// sudo TUI still writes where the plain TUI reads.
+    /// canonical system config at `/etc` (matches `ghr-stats config`). Writing it
+    /// needs root, so config edits work when the dashboard is run as `sudo
+    /// ghr-stats`; a non-root edit fails with a clear "re-run with sudo" error.
     pub(crate) fn config_target(&self) -> PathBuf {
         crate::shared::paths::config_write_target(self.config_path.as_deref())
     }

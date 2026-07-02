@@ -35,13 +35,20 @@ fn write_table(target: &Path, doc: &Table) -> Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(target)
-        .map_err(|e| Error::Config(format!("opening {}: {e}", target.display())))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                Error::Config(format!(
+                    "{} is the root-owned system config — re-run with sudo",
+                    target.display()
+                ))
+            } else {
+                Error::Config(format!("opening {}: {e}", target.display()))
+            }
+        })?;
     f.write_all(body.as_bytes())
         .map_err(|e| Error::Config(format!("writing {}: {e}", target.display())))?;
     // Enforce 0600 even if the file pre-existed with looser perms — it holds a PAT.
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600)).ok();
-    // If a sudo TUI wrote it, hand it back to the invoking user (matches the CLI).
-    crate::shared::paths::chown_to_invoker(target);
     Ok(())
 }
 

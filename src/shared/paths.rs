@@ -6,7 +6,11 @@
 //! hand-rolling `/etc` vs XDG; that separation is the whole reason this module
 //! exists. A system deployment (root `serve` service + `sudo ghr-stats` TUI)
 //! keeps everything under `/etc` + `/var/lib`; a personal/dev deployment is
-//! all-user under the XDG base dirs. Config + data dirs are never mixed across
+//! all-user under the XDG base dirs. **Config is the exception: it is always the
+//! canonical system file at `/etc/ghr-stats/config.toml`** ([`resolve_config`] /
+//! [`config_write_target`]) — one root-owned source of truth for the collector,
+//! never duplicated per-user (secrets live there once). Only the data / runtime
+//! / unit / binary paths are scope-derived. Data dirs are never mixed across
 //! scopes (plan §2/S9) — the one deliberate exception is the TUI's IPC client,
 //! which may `connect` to another scope's collector socket to read (only)
 //! derived fleet stats, so a non-root dashboard can observe a root system
@@ -110,13 +114,10 @@ impl Scope {
 }
 
 /// An explicitly-pointed config target, shared by load-resolution AND the
-/// write-target so the two can never diverge on the tiers they have in common:
-/// an explicit `--config`, then `$GHR_STATS_CONFIG`. `None` ⇒ neither was given,
-/// so the caller falls back to its own policy (load: the scope file if it exists;
-/// write: the sudo-invoker's home, else the scope file). Keeping this in one
-/// place is the whole point — a config edit must land back in the file it was
-/// loaded from (previously `$GHR_STATS_CONFIG` was honored on load but ignored on
-/// write, so edits silently went to a different file).
+/// write-target so the two can never diverge: an explicit `--config`, then
+/// `$GHR_STATS_CONFIG`. `None` ⇒ neither was given, so both fall back to the
+/// canonical system path. Keeping this in one place is the whole point — a
+/// config edit must land back in the file it was loaded from.
 fn explicit_config_target(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
@@ -124,65 +125,26 @@ fn explicit_config_target(explicit: Option<&Path>) -> Option<PathBuf> {
     std::env::var_os("GHR_STATS_CONFIG").map(PathBuf::from)
 }
 
-/// Resolve which config file to load, if any.
-///
-/// Order: explicit `--config` → `$GHR_STATS_CONFIG` → the scope's `config.toml`
-/// if it exists. `None` ⇒ run on built-in defaults.
+/// The single canonical config location: the **system** file at
+/// `/etc/ghr-stats/config.toml`. The config holds secrets (PATs) + the fleet
+/// roots and is the collector's source of truth, so it is one root-owned artifact
+/// — never duplicated per-user (that only invites secret sprawl + drift). An
+/// explicit `--config`/`$GHR_STATS_CONFIG` still overrides it (tests, non-default
+/// deployments).
 pub fn resolve_config(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit_config_target(explicit) {
         return Some(p);
     }
-    let scoped = Scope::detect().config_file();
-    scoped.exists().then_some(scoped)
+    let system = Scope::System.config_file();
+    system.exists().then_some(system)
 }
 
-/// The user a root process is really acting for: `$SUDO_USER` when invoked via
-/// sudo, else `None`. `ghr-stats config` is run as root only to reach a
-/// privileged step (hook install); the CONFIG it writes is user-facing and must
-/// land where that user's own non-root TUI reads it.
-fn sudo_invoker() -> Option<uzers::User> {
-    let name = std::env::var_os("SUDO_USER")?;
-    if name.is_empty() {
-        return None;
-    }
-    uzers::get_user_by_name(&name)
-}
-
-/// Where `ghr-stats config` and the TUI's config edits WRITE the config file.
-///
-/// Order: explicit `--config` → `$GHR_STATS_CONFIG` → (under sudo) the invoking
-/// user's `~/.config/ghr-stats/config.toml` (so their non-root TUI reads it —
-/// NOT root's `/etc`, which a non-root process can't read) → the current scope's
-/// file. The first two tiers are shared verbatim with [`resolve_config`] via
-/// [`explicit_config_target`], so a config loaded from `$GHR_STATS_CONFIG` is
-/// also WRITTEN there (edits round-trip to the same file). Pair with
-/// [`chown_to_invoker`] so a `0600` file written by root stays readable by that
-/// user. This is what lets `sudo ghr-stats config` (sudo only for hooks) coexist
-/// with a plain `ghr-stats` TUI.
+/// Where `ghr-stats config` and the TUI's config edits WRITE the config: the same
+/// canonical `/etc` file [`resolve_config`] reads (or the explicit override).
+/// Writing `/etc` needs root — the system-deployment model (`sudo ghr-stats`)
+/// already has it; a non-root write fails with a "re-run with sudo" error.
 pub fn config_write_target(explicit: Option<&Path>) -> PathBuf {
-    use uzers::os::unix::UserExt;
-    if let Some(p) = explicit_config_target(explicit) {
-        return p;
-    }
-    if let Some(u) = sudo_invoker() {
-        return u.home_dir().join(".config/ghr-stats/config.toml");
-    }
-    Scope::detect().config_file()
-}
-
-/// Hand a just-written user-facing file (and the dir we created for it) back to
-/// the sudo invoker, so their non-root processes can read a `0600` config.
-/// No-op when not under sudo or the user is unknown; best-effort.
-pub fn chown_to_invoker(path: &Path) {
-    let Some(u) = sudo_invoker() else {
-        return;
-    };
-    let uid = Some(nix::unistd::Uid::from_raw(u.uid()));
-    let gid = Some(nix::unistd::Gid::from_raw(u.primary_group_id()));
-    if let Some(parent) = path.parent() {
-        let _ = nix::unistd::chown(parent, uid, gid);
-    }
-    let _ = nix::unistd::chown(path, uid, gid);
+    explicit_config_target(explicit).unwrap_or_else(|| Scope::System.config_file())
 }
 
 fn home() -> PathBuf {
@@ -258,7 +220,7 @@ mod tests {
         let p = Path::new("/etc/ghr-stats/pinned.toml");
         assert_eq!(explicit_config_target(Some(p)), Some(p.to_path_buf()));
         assert_eq!(resolve_config(Some(p)), Some(p.to_path_buf()));
-        // Explicit wins over the sudo-invoker / scope fallback in write-target.
+        // Explicit wins over the canonical `/etc` default in write-target.
         assert_eq!(config_write_target(Some(p)), p.to_path_buf());
     }
 

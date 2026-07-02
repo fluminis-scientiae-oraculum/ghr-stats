@@ -2,11 +2,12 @@
 #
 #   install -Dm600 config.example.toml ~/.config/ghr-stats/config.toml
 #
-# Every field has a default, so the tool runs with no config at all. Keep the
-# file mode 0600 if it holds GitHub tokens.
+# Every field has a default, so the tool runs with no config at all. It holds
+# GitHub tokens, so it is root-owned mode 0600.
 #
-# Search order: --config FLAG, then $GHR_STATS_CONFIG, then
-# /etc/ghr-stats/config.toml, then $XDG_CONFIG_HOME/ghr-stats/config.toml.
+# Canonical location: /etc/ghr-stats/config.toml (system-scope, root:root 0600) —
+# one source of truth the collector reads and `sudo ghr-stats config` writes.
+# An explicit --config FLAG or $GHR_STATS_CONFIG overrides it.
 
 # SQLite database (the collector service writes it; the TUI reads it over the IPC socket).
 # Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).

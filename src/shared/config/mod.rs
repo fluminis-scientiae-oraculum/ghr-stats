@@ -134,12 +134,23 @@ impl Default for PushConfig {
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         match crate::shared::paths::resolve_config(explicit) {
-            Some(p) => {
-                let text = std::fs::read_to_string(&p)
-                    .map_err(|e| Error::Config(format!("reading {}: {e}", p.display())))?;
-                toml::from_str(&text)
-                    .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))
-            }
+            Some(p) => match std::fs::read_to_string(&p) {
+                Ok(text) => toml::from_str(&text)
+                    .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display()))),
+                // A non-root process can't read the root-owned system config
+                // (0600 at /etc). That's expected in a system deployment — run
+                // `sudo ghr-stats` for local config. Fall back to defaults so the
+                // dashboard still launches and reads persistent data over the
+                // socket, rather than refusing to start.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::warn!(
+                        path = %p.display(),
+                        "config not readable without root — using defaults (run `sudo ghr-stats` for local config)"
+                    );
+                    Ok(Config::default())
+                }
+                Err(e) => Err(Error::Config(format!("reading {}: {e}", p.display()))),
+            },
             None => Ok(Config::default()),
         }
     }

@@ -48,15 +48,18 @@ pub enum Command {
     )]
     Serve,
 
-    /// Interactive first-run setup: runner root, per-org PATs, metrics, and hooks.
+    /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
+    /// metrics, and hooks. Writes the system config at /etc.
     #[command(
-        long_about = "Consent-first interactive configuration. Four steps — discover \
-        runners under a root you choose, add read-only fine-grained PATs per org (validated \
-        before saving), optionally enable Prometheus metrics, and write a 0600 config — then \
-        offers to install/repair each runner's job hooks, detect-first and never clobbering a \
-        foreign hook (it chains after it or prints a snippet instead). Installing hooks edits \
-        root-owned runner .env files, so re-run this with sudo to reach that step. The same \
-        settings can be changed live from the TUI's Config tab ([a]/[h]/[m]/[o])."
+        long_about = "Consent-first interactive configuration — run with sudo. Four steps — \
+        discover runners under a root you choose, add read-only fine-grained PATs per org \
+        (validated before saving), optionally enable Prometheus metrics, and write the \
+        root-owned 0600 system config at /etc/ghr-stats/config.toml (the collector's single \
+        source of truth) — then offers to install/repair each runner's job hooks, detect-first \
+        and never clobbering a foreign hook (it chains after it or prints a snippet instead). \
+        Writing the system config and editing runner .env files both need root, hence sudo. \
+        The same settings can be changed live from the TUI's Config tab ([a]/[h]/[m]/[o]) when \
+        the dashboard is run as `sudo ghr-stats`."
     )]
     Config,
 
