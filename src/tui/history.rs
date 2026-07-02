@@ -147,6 +147,16 @@ impl DataSource {
         }
     }
 
+    /// The configured token org logins as seen by the collector (which reads the
+    /// root-owned /etc config) — presence only, no token values. `None` in
+    /// Ephemeral mode or on error, so the caller falls back to its own loaded cfg.
+    pub(crate) fn configured_token_orgs(&mut self) -> Option<Vec<String>> {
+        match self.query(&Request::ConfiguredTokenOrgs) {
+            Some(Response::ConfiguredTokenOrgs(orgs)) => Some(orgs),
+            _ => None,
+        }
+    }
+
     pub(crate) fn recent_jobs(&mut self, limit: usize) -> Vec<JobRow> {
         match self.query(&Request::RecentJobs { limit }) {
             Some(Response::RecentJobs(v)) => v,

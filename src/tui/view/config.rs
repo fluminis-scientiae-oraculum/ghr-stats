@@ -78,13 +78,28 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::raw(""));
 
     lines.push(heading("GitHub tokens (read-only PATs)"));
-    if cfg.github.tokens.is_empty() {
+    // Presence from the collector (Persistent — the authoritative /etc view) or
+    // this run's loaded cfg (Ephemeral), NOT `cfg.github.tokens` directly, so a
+    // non-root TUI that can't read the root-owned config still shows the truth.
+    let orgs = app.configured_orgs();
+    if orgs.is_empty() {
+        // Only in Ephemeral (no collector to ask) can an on-disk-but-unreadable
+        // root config masquerade as "none" — distinguish it. In Persistent the
+        // collector already answered authoritatively, so empty means empty.
+        let unreadable = mode == Mode::Ephemeral && {
+            let p = installed_config(&app.config_target());
+            p.exists() && std::fs::read_to_string(&p).is_err()
+        };
         lines.push(Line::from(Span::styled(
-            "  (none configured)",
+            if unreadable {
+                "  (configured, but the root-owned config isn't readable here — run `sudo ghr-stats`)"
+            } else {
+                "  (none configured)"
+            },
             Style::new().fg(Color::DarkGray),
         )));
     } else {
-        for org in cfg.github.tokens.keys() {
+        for org in orgs {
             // Natural spacing (not the fixed 16-col `key`): org logins can exceed
             // 16 chars and would otherwise run into "present".
             lines.push(Line::from(vec![
@@ -153,7 +168,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     // First-run invite (#4): if nothing is discoverable/configured, point at the
     // actions rather than leaving a dead end. Otherwise the footer's [a]/[h]/[m]/
     // [o] hints suffice.
-    if cfg.runner_roots.is_empty() || cfg.github.tokens.is_empty() {
+    if cfg.runner_roots.is_empty() || app.configured_orgs().is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  First run? [a] add an org + PAT · [h] install hooks · or `ghr-stats config`.",

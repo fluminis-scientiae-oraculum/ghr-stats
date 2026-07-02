@@ -151,6 +151,12 @@ pub(crate) struct App {
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
     pub(crate) api_state: HashMap<i64, ApiState>,
+    /// Org logins with a configured read-only PAT. In Persistent mode this is the
+    /// collector's authoritative view of the root-owned /etc config (presence
+    /// only, no tokens); in Ephemeral mode it falls back to this run's loaded cfg.
+    /// So the Config tab + GitHub-view messaging are correct even for a non-root
+    /// TUI that cannot itself read /etc.
+    configured_orgs: Vec<String>,
     pub(crate) status: Option<String>,
     pub(crate) should_quit: bool,
     pub(crate) hits: RefCell<Hits>,
@@ -183,6 +189,7 @@ impl App {
             trend_busy: Vec::new(),
             jobs: Vec::new(),
             api_state: HashMap::new(),
+            configured_orgs: Vec::new(),
             status: None,
             should_quit: false,
             hits: RefCell::new(Hits::default()),
@@ -206,8 +213,16 @@ impl App {
     }
 
     /// Whether any read-only PAT is configured (feeds GitHub-view messaging).
+    /// Uses the collector-reported orgs (Persistent) / loaded cfg (Ephemeral) so a
+    /// non-root TUI doesn't falsely report "no PAT" for a root-owned /etc config.
     pub(crate) fn has_tokens(&self) -> bool {
-        !self.cfg.github.tokens.is_empty()
+        !self.configured_orgs.is_empty()
+    }
+
+    /// Org logins with a configured read-only PAT (presence only) — for the
+    /// Config tab's token list. See [`Self::configured_orgs`] field docs.
+    pub(crate) fn configured_orgs(&self) -> &[String] {
+        &self.configured_orgs
     }
 
     /// Whether the GitHub reconcile has returned any runner state this session.
@@ -388,6 +403,12 @@ impl App {
         // The collector's persisted liveness edges (Persistent only) — the true,
         // restart-surviving `since_ts` for the "For" duration. Empty in Ephemeral.
         let persisted = self.source.runner_states();
+        // Configured token orgs: the collector's authoritative /etc view when
+        // Persistent (so a non-root TUI reflects the real PATs), else this run's
+        // own loaded config when Ephemeral.
+        let orgs = self.source.configured_token_orgs();
+        self.configured_orgs =
+            orgs.unwrap_or_else(|| self.cfg.github.tokens.keys().cloned().collect());
         // A hook counts as "ours" if it points under ANY scope's hooks dir —
         // hooks always install System-scope (they need root), but this dashboard
         // is normally run non-root, so keying off `Scope::detect()` alone

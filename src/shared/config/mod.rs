@@ -192,6 +192,27 @@ pub(crate) fn count_tokens(config_text: &str) -> Option<usize> {
     Some(peek.github.tokens.len() + usize::from(peek.github.token.is_some()))
 }
 
+/// The org logins that have a configured per-org read-only PAT — presence only,
+/// no token value — parsed leniently from a config file's TEXT (ignoring every
+/// other field, so it survives schema drift). Empty if the text doesn't parse.
+/// Lets the root collector report which orgs are configured to a non-root TUI
+/// over the IPC socket without ever exposing a secret. Sorted (BTreeMap). Pure.
+pub(crate) fn token_orgs(config_text: &str) -> Vec<String> {
+    #[derive(Deserialize, Default)]
+    struct Peek {
+        #[serde(default)]
+        github: Gh,
+    }
+    #[derive(Deserialize, Default)]
+    struct Gh {
+        #[serde(default)]
+        tokens: BTreeMap<String, toml::Value>,
+    }
+    toml::from_str::<Peek>(config_text)
+        .map(|p| p.github.tokens.into_keys().collect())
+        .unwrap_or_default()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -283,6 +304,18 @@ mod tests {
         assert_eq!(count_tokens("runner_roots = []\n"), Some(0));
         // Malformed ⇒ None (the caller still shows the file, just can't count).
         assert_eq!(count_tokens("this is not = = toml ["), None);
+    }
+
+    #[test]
+    fn token_orgs_returns_sorted_keys_without_exposing_values() {
+        let cfg = "runner_roots = []\n\n[github.tokens]\nwidgets = \"github_pat_SECRET\"\nacme = \"github_pat_OTHER\"\n";
+        // Sorted (BTreeMap), and never the token values.
+        assert_eq!(token_orgs(cfg), vec!["acme", "widgets"]);
+        // Fallback-only / no per-org tokens ⇒ empty (matches the per-org display).
+        assert!(token_orgs("[github]\ntoken = \"github_pat_x\"\n").is_empty());
+        assert!(token_orgs("runner_roots = []\n").is_empty());
+        // Malformed ⇒ empty (best-effort peek, never panics).
+        assert!(token_orgs("this is not = = toml [").is_empty());
     }
 
     #[test]

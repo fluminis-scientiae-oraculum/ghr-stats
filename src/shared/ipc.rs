@@ -21,7 +21,9 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 /// is older/newer than the TUI binary — restart the service after upgrading.
 /// v2: added `RunnerStates` (persisted liveness edges for the "For" duration).
 /// v3: added authorized config mutations (`SetMetricsPull`, `AddOrgToken`).
-pub const VERSION: u16 = 3;
+/// v4: added `ConfiguredTokenOrgs` (presence-only view of the root config's
+///     configured org logins — so a non-root TUI reflects the true PAT state).
+pub const VERSION: u16 = 4;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -41,6 +43,10 @@ pub enum Request {
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
+    /// The org logins that have a configured read-only PAT — presence ONLY, never
+    /// the token. Lets a non-root TUI (which can't read the root-owned /etc config)
+    /// show the true configured-token state via the root collector.
+    ConfiguredTokenOrgs,
     // --- mutations: authorized (uid 0 or `ghr-stats` group) writes to /etc ---
     /// Toggle the Prometheus pull endpoint (mirrors the TUI's `[m]`).
     SetMetricsPull { enabled: bool, addr: String },
@@ -73,6 +79,8 @@ pub enum Response {
     /// Persisted liveness edges; `RunnerState.agent_id` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
+    /// Configured org logins (presence only — no token values ever cross here).
+    ConfiguredTokenOrgs(Vec<String>),
     /// A mutation was authorized and persisted.
     Mutated,
     /// A mutation was refused — the peer is neither root nor in `ghr-stats`.

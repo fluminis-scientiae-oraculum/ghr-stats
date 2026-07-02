@@ -173,6 +173,11 @@ fn serve_conn(
 fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Path) -> Response {
     match req {
         Request::Hello { .. } => return Response::Hello { server: VERSION },
+        // Presence-only view of the configured token orgs (no DB, no auth — org
+        // logins aren't secret and already appear in the fleet data served here).
+        Request::ConfiguredTokenOrgs => {
+            return Response::ConfiguredTokenOrgs(configured_token_orgs(config_path));
+        }
         // Mutations: authorized writes to the system config (need no DB).
         Request::SetMetricsPull { enabled, addr } => {
             return mutate(auth, "set_metrics_pull", || {
@@ -192,6 +197,7 @@ fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Pa
     };
     match req {
         Request::Hello { .. }
+        | Request::ConfiguredTokenOrgs
         | Request::SetMetricsPull { .. }
         | Request::AddOrgToken { .. } => unreachable!("handled above"),
         Request::HostSeries { limit } => {
@@ -221,6 +227,15 @@ fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Pa
             Response::RunnerStates(m.into_values().collect())
         }),
     }
+}
+
+/// The configured token org logins, read FRESH from the system config (so a
+/// just-persisted `[a]` addition is reflected without a collector restart) —
+/// presence only, never a token value. An unreadable/malformed config ⇒ empty.
+fn configured_token_orgs(config_path: &Path) -> Vec<String> {
+    std::fs::read_to_string(config_path)
+        .map(|text| crate::shared::config::token_orgs(&text))
+        .unwrap_or_default()
 }
 
 /// Run a config mutation behind the authz gate: `Denied` for an unauthorized peer
@@ -345,6 +360,30 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn configured_token_orgs_reads_the_config_needs_no_auth_and_hides_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[github.tokens]\nwidgets = \"github_pat_SECRET\"\nacme = \"github_pat_OTHER\"\n",
+        )
+        .unwrap();
+        // NOBODY (unauthorized for mutations) can still read presence — org logins
+        // aren't secret. No DB needed.
+        match handle(&Request::ConfiguredTokenOrgs, None, NOBODY, &cfg) {
+            Response::ConfiguredTokenOrgs(orgs) => {
+                assert_eq!(orgs, vec!["acme".to_string(), "widgets".to_string()]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // A missing/unreadable config yields an empty list, never an error.
+        assert!(matches!(
+            handle(&Request::ConfiguredTokenOrgs, None, NOBODY, &noconf()),
+            Response::ConfiguredTokenOrgs(orgs) if orgs.is_empty()
+        ));
     }
 
     #[test]
