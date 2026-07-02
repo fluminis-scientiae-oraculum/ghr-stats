@@ -23,17 +23,17 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, Mous
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
-use crate::collectors::cpu::CpuRateTracker;
-use crate::collectors::{self, runners};
-use crate::config::Config;
-use crate::hooks::install::{self, HookStatus};
-use crate::model::Liveness;
-use crate::paths::Scope;
-use crate::store::reader::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
-use crate::tui::action::{ActionKind, RecycleRunner, RestartRunner};
+use crate::shared::collectors::cpu::CpuRateTracker;
+use crate::shared::collectors::{self, runners};
+use crate::shared::config::Config;
+use crate::shared::hooks::install::{self, HookStatus};
+use crate::shared::models::Liveness;
+use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::paths::Scope;
+use crate::shared::util::now_epoch;
 use crate::tui::history::{DataSource, Mode, Rings};
-use crate::tui::wizard::{self, WizardMode};
-use crate::util::now_epoch;
+use crate::tui::input::action::{ActionKind, RecycleRunner, RestartRunner};
+use crate::tui::widgets::wizard::{self, WizardMode};
 
 const HISTORY_POINTS: usize = 120;
 const TREND_POINTS: usize = 240;
@@ -193,6 +193,24 @@ impl App {
         self.source.scope()
     }
 
+    /// Whether any read-only PAT is configured (feeds GitHub-view messaging).
+    pub(crate) fn has_tokens(&self) -> bool {
+        !self.cfg.github.tokens.is_empty()
+    }
+
+    /// Whether the GitHub reconcile has returned any runner state this session.
+    pub(crate) fn reconcile_populated(&self) -> bool {
+        !self.api_state.is_empty()
+    }
+
+    /// How many runners carry the ghr-stats job hook (feeds Jobs-tab messaging).
+    pub(crate) fn hooked_runner_count(&self) -> usize {
+        self.runners
+            .iter()
+            .filter(|r| matches!(r.hook, HookStatus::Ours))
+            .count()
+    }
+
     // ---- modal overlays (config wizard / help / info) ----
 
     /// Whether a modal overlay is open (⇒ the loop routes every key to it).
@@ -258,7 +276,7 @@ impl App {
     /// invoking user's config (SUDO_USER-aware, matches `ghr-stats config`), so a
     /// sudo TUI still writes where the plain TUI reads.
     pub(crate) fn config_target(&self) -> PathBuf {
-        crate::paths::config_write_target(self.config_path.as_deref())
+        crate::shared::paths::config_write_target(self.config_path.as_deref())
     }
 
     /// Toggle the Prometheus `/metrics` pull endpoint (Config `[m]`), persisting
@@ -266,7 +284,11 @@ impl App {
     pub(crate) fn toggle_metrics(&mut self) {
         let enabled = !self.cfg.metrics.pull.enabled;
         let addr = self.cfg.metrics.pull.addr.clone();
-        match crate::config::persist::set_metrics_pull(&self.config_target(), enabled, &addr) {
+        match crate::shared::config::persist::set_metrics_pull(
+            &self.config_target(),
+            enabled,
+            &addr,
+        ) {
             Ok(()) => {
                 self.reload_cfg();
                 let state = if enabled { "enabled" } else { "disabled" };

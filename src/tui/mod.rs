@@ -1,5 +1,5 @@
 //! Interactive dashboard. Fully synchronous — blocking terminal I/O, called
-//! directly from `main`. The dashboard never writes: it is a pure client — an
+//! directly from `entrypoint`. The dashboard never writes: it is a pure client — an
 //! in-memory live sampler always, plus (in Persistent mode) an IPC reader of the
 //! collector (see `app` + `history`).
 //!
@@ -7,13 +7,13 @@
 //! `ScreenState`, routes each event through it, and owns terminal teardown for
 //! the suspend window an action needs.
 
-mod action;
 mod app;
-mod help;
 mod history;
-mod screen;
-mod views;
-mod wizard;
+mod input;
+mod ipc_client;
+mod view;
+mod viewmodel;
+mod widgets;
 
 use std::io::stdout;
 use std::path::Path;
@@ -26,11 +26,11 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::{DefaultTerminal, Frame};
 
-use action::{ActionKind, InstallHooks, OpenConfig};
 use app::{App, Overlay, Tab};
-use screen::{Confirm, Screen, ScreenState, Suspension};
+use input::action::{ActionKind, InstallHooks, OpenConfig};
+use input::screen::{Confirm, Screen, ScreenState, Suspension};
 
-use crate::config::Config;
+use crate::shared::config::Config;
 
 /// Live view refresh cadence (the loop still redraws immediately on input).
 const REFRESH: Duration = Duration::from_millis(2000);
@@ -126,7 +126,7 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
                         return Next::Mode(ScreenState::Confirm(scr.confirm(action)));
                     }
                     KeyCode::Char('h') => {
-                        if crate::privileged::is_root() {
+                        if crate::shared::privileged::is_root() {
                             let action = ActionKind::InstallHooks(InstallHooks {
                                 roots: app.cfg().runner_roots.clone(),
                             });
@@ -134,7 +134,7 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
                         }
                         app.open_info(
                             "Hook install needs root",
-                            crate::privileged::root_guidance(),
+                            crate::shared::privileged::root_guidance(),
                         );
                         return Next::Mode(ScreenState::Browsing(scr));
                     }
@@ -189,17 +189,17 @@ fn run_suspended(
 }
 
 fn render(f: &mut Frame, app: &App, mode: &ScreenState) {
-    views::draw(f, app);
+    view::draw(f, app);
     if let ScreenState::Confirm(scr) = mode {
-        views::draw_confirm(f, &scr.prompt());
+        view::draw_confirm(f, &scr.prompt());
     }
     // The modal overlay is drawn last so it sits atop the dashboard + any confirm
     // popup. (In practice they are mutually exclusive — overlays open only from
     // Browsing.)
     match app.overlay() {
-        Some(Overlay::Wizard(w)) => wizard::draw(f, w),
-        Some(Overlay::Help) => help::draw_help(f),
-        Some(Overlay::Info { title, body }) => help::draw_info(f, title, body),
+        Some(Overlay::Wizard(w)) => widgets::wizard::draw(f, w),
+        Some(Overlay::Help) => widgets::help::draw_help(f),
+        Some(Overlay::Info { title, body }) => widgets::help::draw_info(f, title, body),
         None => {}
     }
 }

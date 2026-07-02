@@ -15,25 +15,17 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::ipc::client::{self, Client};
-use crate::ipc::{Request, Response};
-use crate::paths::Scope;
-use crate::store::reader::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::ipc::{Request, Response};
+use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow};
+use crate::shared::paths::Scope;
+use crate::tui::ipc_client::{self, Client};
 
-/// Which data plane the TUI is on. Drives the header badge + Config tab.
+/// Which data plane the TUI is on. Drives the header badge + Config tab. A pure
+/// data enum — how it is rendered (label, colour) lives in `viewmodel::style`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Ephemeral,
     Persistent,
-}
-
-impl Mode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Mode::Ephemeral => "EPHEMERAL",
-            Mode::Persistent => "PERSISTENT",
-        }
-    }
 }
 
 /// The App's history source: an in-memory ring buffer, or a live collector.
@@ -97,7 +89,7 @@ impl DataSource {
 
     pub(crate) fn latest_api_runners(&mut self) -> HashMap<i64, ApiState> {
         match self.query(&Request::LatestApiRunners) {
-            Some(Response::LatestApiRunners(rows)) => client::api_map(rows),
+            Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only
         }
     }

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["github-actions", "self-hosted", "runner", "tui", "prometheus"]
 categories = ["command-line-utilities", "development-tools"]
 
+[[bin]]
+name = "ghr-stats"
+path = "src/entrypoint.rs"
+
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
