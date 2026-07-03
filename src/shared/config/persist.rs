@@ -8,7 +8,7 @@
 
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
@@ -75,6 +75,43 @@ pub(crate) fn set_org_token(target: &Path, org: &str, token: &str) -> Result<()>
     write_table(target, &doc)
 }
 
+/// Set the runner install roots (the CLI wizard's Step 1 result) under
+/// `runner_roots`, preserving every OTHER setting — so re-running `config` never
+/// drops an existing PAT, the push config, or custom intervals. Faithful edit,
+/// never a template rewrite.
+pub(crate) fn set_runner_roots(target: &Path, roots: &[PathBuf]) -> Result<()> {
+    let mut doc = load_table(target)?;
+    let arr = roots
+        .iter()
+        .map(|p| Value::String(p.display().to_string()))
+        .collect();
+    doc.insert("runner_roots".to_string(), Value::Array(arr));
+    write_table(target, &doc)
+}
+
+/// Remove a per-org PAT and forget the org: drop `[github.tokens].<org>`, prune
+/// `<org>` from any explicit `orgs` list, and tidy the now-empty `[github.tokens]`
+/// / `[github]` tables. Every other setting is preserved. Faithful edit — the
+/// inverse of [`set_org_token`]. Removing an absent org is a no-op (idempotent).
+pub(crate) fn remove_org_token(target: &Path, org: &str) -> Result<()> {
+    let mut doc = load_table(target)?;
+    if let Some(github) = doc.get_mut("github").and_then(Value::as_table_mut) {
+        if let Some(tokens) = github.get_mut("tokens").and_then(Value::as_table_mut) {
+            tokens.remove(org);
+            if tokens.is_empty() {
+                github.remove("tokens"); // no dangling empty [github.tokens]
+            }
+        }
+        if github.is_empty() {
+            doc.remove("github");
+        }
+    }
+    if let Some(Value::Array(orgs)) = doc.get_mut("orgs") {
+        orgs.retain(|v| v.as_str() != Some(org));
+    }
+    write_table(target, &doc)
+}
+
 /// Toggle + address the Prometheus pull endpoint under `[metrics.pull]` (the
 /// Config tab's `[m]` action). Preserves the address when only toggling.
 pub(crate) fn set_metrics_pull(target: &Path, enabled: bool, addr: &str) -> Result<()> {
@@ -116,6 +153,79 @@ mod tests {
         // Secret-bearing file is 0600.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn set_runner_roots_preserves_existing_pats_and_push() {
+        // The exact complaint: re-running the wizard (which now sets roots via a
+        // faithful edit) must NOT drop an already-configured PAT or push config.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "runner_roots = [\"/old\"]\n\
+             [github.tokens]\nacme = \"github_pat_KEEP\"\n\
+             [metrics.push]\nenabled = true\nendpoint = \"http://x\"\n",
+        )
+        .unwrap();
+
+        set_runner_roots(&path, &[PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]).unwrap();
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            cfg.runner_roots,
+            vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
+        );
+        // The PAT survives — the whole point.
+        assert_eq!(
+            cfg.github_token_for("acme").as_deref(),
+            Some("github_pat_KEEP")
+        );
+        assert!(cfg.metrics.push.enabled);
+    }
+
+    #[test]
+    fn remove_org_token_drops_pat_forgets_org_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "runner_roots = [\"/srv/r\"]\norgs = [\"acme\", \"widgets\"]\n\
+             [github.tokens]\nacme = \"github_pat_A\"\nwidgets = \"github_pat_W\"\n\
+             [metrics.push]\nenabled = true\n",
+        )
+        .unwrap();
+
+        remove_org_token(&path, "acme").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("github_pat_A"), "acme PAT still present:\n{text}");
+        assert!(text.contains("github_pat_W"), "widgets PAT was dropped:\n{text}");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert!(!cfg.github.tokens.contains_key("acme"));
+        assert!(cfg.github.tokens.contains_key("widgets"));
+        assert_eq!(cfg.orgs, vec!["widgets"]); // org forgotten from the reconcile list
+        assert!(cfg.metrics.push.enabled); // untouched settings survive
+        assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/r")]);
+    }
+
+    #[test]
+    fn remove_last_org_token_cleans_the_empty_github_table_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "runner_roots = [\"/srv/r\"]\n[github.tokens]\nacme = \"github_pat_A\"\n",
+        )
+        .unwrap();
+
+        remove_org_token(&path, "acme").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("github"), "empty github table should be gone:\n{text}");
+        // Removing an already-absent org is a harmless no-op.
+        remove_org_token(&path, "acme").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cfg.github.tokens.is_empty());
     }
 
     #[test]

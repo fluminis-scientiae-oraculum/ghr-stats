@@ -35,7 +35,7 @@ pub(crate) fn draw_help(f: &mut Frame) {
         ),
         blank(),
         section("Config actions"),
-        key("a", "add an org + read-only PAT (native wizard)"),
+        key("a", "manage org PATs — add / replace / remove (native wizard)"),
         key("h", "install / repair the runner job hooks (needs root)"),
         key("m", "toggle the Prometheus /metrics endpoint"),
         key("o", "open the config file in $EDITOR"),

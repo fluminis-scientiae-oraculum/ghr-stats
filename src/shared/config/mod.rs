@@ -25,10 +25,6 @@ pub struct Config {
     #[serde(default = "defaults::db_path")]
     pub db_path: PathBuf,
 
-    /// Append-only NDJSON job-event log written by the runner hooks.
-    #[serde(default = "defaults::event_log")]
-    pub event_log: PathBuf,
-
     /// Roots scanned for runner install dirs (each contains a `.runner` file).
     /// Empty by default — set via `ghr-stats config` (no host-specific guess).
     #[serde(default = "defaults::runner_roots")]
@@ -244,7 +240,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             db_path: defaults::db_path(),
-            event_log: defaults::event_log(),
             runner_roots: defaults::runner_roots(),
             orgs: Vec::new(),
             intervals: Intervals::default(),
@@ -272,10 +267,6 @@ mod defaults {
 
     pub fn db_path() -> PathBuf {
         Scope::detect().db_path()
-    }
-
-    pub fn event_log() -> PathBuf {
-        Scope::detect().event_log()
     }
 
     pub fn runner_roots() -> Vec<PathBuf> {

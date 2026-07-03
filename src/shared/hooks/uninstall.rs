@@ -150,7 +150,9 @@ fn plan_action(text: &str, our_dir: &Path) -> RevertAction {
             let oc = read_wrapped_original(&completed_wrapper);
             match (os, oc) {
                 (Some(os), Some(oc)) => RevertAction::Restore {
-                    new_env: install::rewrite_env(text, &os, &oc),
+                    // `None`: strip the GHR_STATS_EVENT_LOG we injected — never
+                    // carry our var into the restored foreign `.env`.
+                    new_env: install::rewrite_env(text, &os, &oc, None),
                     originals: (os, oc),
                     wrappers: vec![started_wrapper, completed_wrapper],
                 },

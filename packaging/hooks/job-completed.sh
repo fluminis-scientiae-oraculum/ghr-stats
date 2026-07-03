@@ -2,7 +2,8 @@
 # ghr-stats runner hook — JOB_COMPLETED.  See job-started.sh for the contract.
 # MUST NOT fail the job: best-effort, always exits 0.
 
-log="${GHR_STATS_EVENT_LOG:-/var/lib/ghr-stats/events.ndjson}"
+log="${GHR_STATS_EVENT_LOG:-}"
+[ -n "$log" ] || exit 0
 ts="$(date +%s 2>/dev/null || echo 0)"
 
 printf '{"phase":"completed","ts":%s,"repo":"%s","run_id":%s,"run_attempt":%s,"job":"%s","runner":"%s"}\n' \

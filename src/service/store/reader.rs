@@ -32,16 +32,15 @@ pub fn runner_history(conn: &Connection, agent_id: i64, limit: usize) -> Result<
     Ok(out)
 }
 
-/// The persisted byte offset for a tailed stream (0 if never recorded).
-pub fn ingest_offset(conn: &Connection, stream: &str) -> Result<u64> {
-    let v: Option<i64> = conn
-        .query_row(
-            "SELECT offset FROM ingest_offset WHERE stream = ?1",
-            params![stream],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(v.unwrap_or(0).max(0) as u64)
+/// Every tailed stream's persisted byte offset, keyed by stream id (the
+/// per-runner event-log path). Empty on a fresh DB; a stream absent from the map
+/// is tailed from 0. Loaded once at collector start to seed the hooks tailer.
+pub fn ingest_offsets(conn: &Connection) -> Result<HashMap<String, u64>> {
+    let mut stmt = conn.prepare_cached("SELECT stream, offset FROM ingest_offset")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Most recent jobs, newest first (by start, falling back to completion).
@@ -190,13 +189,16 @@ pub fn job_counts(conn: &Connection) -> Result<(i64, i64)> {
     .map_err(Into::into)
 }
 
-/// The runner's in-flight job, if any: the most recently started `job_event`
-/// for `runner_name` that has not completed. Local hook timing — immediate.
-pub fn active_job(conn: &Connection, runner_name: &str) -> Result<Option<JobRow>> {
+/// The runner's most recent job (running OR last completed), for the detail
+/// panel's "job" line. Newest by start, falling back to completion. Returns the
+/// full row so the caller can render "running Xs" vs "<conclusion>, Xs ago" —
+/// unlike an in-flight-only query, an idle runner still shows its last job rather
+/// than a bare "—". Local hook timing — immediate.
+pub fn latest_job(conn: &Connection, runner_name: &str) -> Result<Option<JobRow>> {
     conn.query_row(
         "SELECT runner_name, repo, job, started_at, completed_at, conclusion \
-         FROM job_event WHERE runner_name = ?1 AND completed_at IS NULL \
-         ORDER BY started_at DESC LIMIT 1",
+         FROM job_event WHERE runner_name = ?1 \
+         ORDER BY COALESCE(started_at, completed_at) DESC LIMIT 1",
         params![runner_name],
         |r| {
             Ok(JobRow {
@@ -328,23 +330,50 @@ mod tests {
     }
 
     #[test]
-    fn active_job_is_the_incomplete_one() {
+    fn ingest_offsets_loads_every_stream_and_is_empty_on_fresh_db() {
         let conn = mem_db();
+        assert!(ingest_offsets(&conn).unwrap().is_empty());
+        for (stream, off) in [("/srv/runners/runner-01/.ghr-stats-events.ndjson", 40), ("/srv/runners/runner-02/.ghr-stats-events.ndjson", 128)] {
+            conn.execute(
+                "INSERT INTO ingest_offset (stream, offset) VALUES (?1, ?2)",
+                params![stream, off],
+            )
+            .unwrap();
+        }
+        let m = ingest_offsets(&conn).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["/srv/runners/runner-01/.ghr-stats-events.ndjson"], 40);
+        assert_eq!(m["/srv/runners/runner-02/.ghr-stats-events.ndjson"], 128);
+    }
+
+    #[test]
+    fn latest_job_is_the_most_recent_running_or_done() {
+        let conn = mem_db();
+        // Older, completed.
         conn.execute(
-            "INSERT INTO job_event (run_id,job,runner_name,started_at,completed_at) \
-             VALUES (1,'a','r',100,150)",
+            "INSERT INTO job_event (run_id,job,repo,runner_name,started_at,completed_at) \
+             VALUES (1,'a','o/x','r',100,150)",
             [],
         )
         .unwrap();
+        // Newer, still running.
         conn.execute(
             "INSERT INTO job_event (run_id,job,repo,runner_name,started_at) \
-             VALUES (2,'b','o/x','r',200)",
+             VALUES (2,'b','o/y','r',200)",
             [],
         )
         .unwrap();
-        let j = active_job(&conn, "r").unwrap().unwrap();
-        assert_eq!(j.job, "b");
-        assert_eq!(j.repo, "o/x");
-        assert!(active_job(&conn, "nobody").unwrap().is_none());
+        let j = latest_job(&conn, "r").unwrap().unwrap();
+        assert_eq!((j.job.as_str(), j.repo.as_str()), ("b", "o/y"));
+        assert!(j.completed_at.is_none()); // running
+
+        // Once it completes it is STILL the latest — an idle runner shows its last
+        // job, not a bare "—" (the whole point of latest_job vs in-flight-only).
+        conn.execute("UPDATE job_event SET completed_at=260 WHERE run_id=2", [])
+            .unwrap();
+        let j = latest_job(&conn, "r").unwrap().unwrap();
+        assert_eq!((j.job.as_str(), j.completed_at), ("b", Some(260)));
+
+        assert!(latest_job(&conn, "nobody").unwrap().is_none());
     }
 }

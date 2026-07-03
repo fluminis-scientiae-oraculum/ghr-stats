@@ -22,7 +22,7 @@
 //!   fast local cadence, so it can never delay local sampling.
 //! - The bounded channel gives natural backpressure if the writer falls behind.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,6 +83,8 @@ enum Sample {
         rows: Vec<ApiRunnerRow>,
     },
     Hook {
+        /// The tailed log's stream id (the per-runner event-log path).
+        stream: String,
         events: Vec<HookEvent>,
         offset: u64,
     },
@@ -140,12 +142,13 @@ pub fn run(cfg: &Config) -> Result<()> {
             .context("spawning api-reconcile")?
     };
     let hooks = {
-        // Resume tailing from the last persisted offset.
-        let start_offset = reader::ingest_offset(store.conn(), "hooks").unwrap_or(0);
+        // Resume tailing each runner's log from its last persisted offset. A
+        // runner absent from this map (a new runner) is tailed from 0.
+        let start_offsets = reader::ingest_offsets(store.conn()).unwrap_or_default();
         let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("hooks-tail".into())
-            .spawn(move || hooks_loop(&cfg, &term, &tx, start_offset))
+            .spawn(move || hooks_loop(&cfg, &term, &tx, start_offsets))
             .context("spawning hooks-tail")?
     };
     // Metrics exporter threads (pull/push): always spawned, each reconciles its
@@ -186,14 +189,16 @@ pub fn run(cfg: &Config) -> Result<()> {
                     Err(e) => tracing::error!(error = %e, "api write failed"),
                 }
             }
-            Sample::Hook { events, offset } => {
-                match writer::apply_hook_events(store.conn_mut(), &events, offset) {
-                    Ok(()) => {
-                        tracing::debug!(events = events.len(), offset, "hook events persisted")
-                    }
-                    Err(e) => tracing::error!(error = %e, "hook write failed"),
+            Sample::Hook {
+                stream,
+                events,
+                offset,
+            } => match writer::apply_hook_events(store.conn_mut(), &stream, &events, offset) {
+                Ok(()) => {
+                    tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
                 }
-            }
+                Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
+            },
         }
     }
 
@@ -269,28 +274,45 @@ fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
     }
 }
 
-/// Producer: tail the NDJSON job-event log and forward batches + the advanced
-/// offset. Tracks the offset in memory (seeded from the DB) so it shares no
-/// state with the writer.
-fn hooks_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>, mut offset: u64) {
+/// Producer: tail every runner's OWN NDJSON job-event log and forward batches +
+/// the advanced per-log offset. Each runner writes a log it owns (in its install
+/// dir) and the collector reads it as root — so there is no shared-writable file
+/// and no permission coordination. Runners are rediscovered each tick (the same
+/// cheap `.runner` scan the local sampler does), so a runner added later is
+/// picked up with no restart. Offsets are tracked in memory (seeded from the DB),
+/// keyed by log path, so this thread shares no state with the writer.
+fn hooks_loop(
+    cfg: &SharedConfig,
+    term: &AtomicBool,
+    tx: &Sender<Sample>,
+    mut offsets: HashMap<String, u64>,
+) {
     const TAIL_PERIOD: Duration = Duration::from_secs(2);
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            let path = cfg.snapshot().event_log.clone();
-            let (events, new_offset) = crate::shared::hooks::ingest::tail_events(&path, offset);
-            if (!events.is_empty() || new_offset != offset)
-                && tx
-                    .send(Sample::Hook {
-                        events,
-                        offset: new_offset,
-                    })
-                    .is_err()
-            {
-                break; // writer gone
+            let c = cfg.snapshot();
+            for r in collectors::runners::discover(&c.runner_roots) {
+                let path = crate::shared::hooks::runner_event_log(&r.dir);
+                let stream = path.to_string_lossy().into_owned();
+                let offset = offsets.get(&stream).copied().unwrap_or(0);
+                let (events, new_offset) =
+                    crate::shared::hooks::ingest::tail_events(&path, offset);
+                if !events.is_empty() || new_offset != offset {
+                    if tx
+                        .send(Sample::Hook {
+                            stream: stream.clone(),
+                            events,
+                            offset: new_offset,
+                        })
+                        .is_err()
+                    {
+                        return; // writer gone
+                    }
+                    offsets.insert(stream, new_offset);
+                }
             }
-            offset = new_offset;
             next = Instant::now() + TAIL_PERIOD;
         }
         sleep_until(next, term);

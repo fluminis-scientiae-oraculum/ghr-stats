@@ -32,6 +32,15 @@ pub(crate) struct WizardCtx {
     pub local_ids: HashSet<i64>,
 }
 
+/// The persist operation a committed wizard asks of its injected sink. One sink
+/// handles both add/replace and remove, so the caller borrows its source (the
+/// IPC client / config file) exactly once — two separate closures would each need
+/// `&mut source` and could not coexist.
+pub(crate) enum TokenOp<'a> {
+    Set { org: &'a str, token: &'a str },
+    Remove { org: &'a str },
+}
+
 // ---- typestate states (data-carrying; private fields ⇒ un-fabricable) ----
 
 pub(crate) struct PickAction;
@@ -49,6 +58,14 @@ pub(crate) struct Confirmed {
     matched: usize,
     local: usize,
 }
+/// Type the org whose PAT to remove (the `[r]` flow).
+pub(crate) struct RemoveOrgInput {
+    org: Input,
+}
+/// Confirm removing `org`'s PAT (and forgetting the org).
+pub(crate) struct RemoveConfirm {
+    org: String,
+}
 pub(crate) struct Done {
     message: String,
     ok: bool,
@@ -65,6 +82,55 @@ impl Wizard<PickAction> {
                 org: Input::default(),
             },
         }
+    }
+    fn remove_org(self) -> Wizard<RemoveOrgInput> {
+        Wizard {
+            state: RemoveOrgInput {
+                org: Input::default(),
+            },
+        }
+    }
+}
+
+/// The two next-states from the remove-org field (mirrors [`OrgNext`]).
+enum RemoveNext {
+    Confirm(Wizard<RemoveConfirm>),
+    Stay(Wizard<RemoveOrgInput>),
+}
+
+impl Wizard<RemoveOrgInput> {
+    fn edit(&mut self, key: KeyEvent) {
+        self.state.org.handle_event(&Event::Key(key));
+    }
+    /// Advance to the confirm step — only with a non-empty org (else stay put).
+    fn next(self) -> RemoveNext {
+        let org = self.state.org.value().trim().to_string();
+        if org.is_empty() {
+            return RemoveNext::Stay(self);
+        }
+        RemoveNext::Confirm(Wizard {
+            state: RemoveConfirm { org },
+        })
+    }
+}
+
+impl Wizard<RemoveConfirm> {
+    /// Remove the org's PAT via the injected sink (IPC to the collector, or a
+    /// direct config write). No PAT to validate — removal is unconditional.
+    fn write_remove(self, apply: impl FnOnce(TokenOp) -> Result<(), String>) -> Wizard<Done> {
+        let done = match apply(TokenOp::Remove {
+            org: &self.state.org,
+        }) {
+            Ok(()) => Done {
+                message: format!("removed token and forgot org {}", self.state.org),
+                ok: true,
+            },
+            Err(e) => Done {
+                message: format!("remove failed: {e}"),
+                ok: false,
+            },
+        };
+        Wizard { state: done }
     }
 }
 
@@ -138,8 +204,11 @@ impl Wizard<Confirmed> {
     /// its "validated-only persist" guarantee regardless of the sink (IPC to the
     /// root collector, or a direct config write). `save` returns `Err(msg)` with a
     /// human reason (unauthorized / write failed) that is surfaced in `Done`.
-    fn write(self, save: impl FnOnce(&str, &str) -> Result<(), String>) -> Wizard<Done> {
-        let done = match save(&self.state.org, &self.state.pat) {
+    fn write(self, apply: impl FnOnce(TokenOp) -> Result<(), String>) -> Wizard<Done> {
+        let done = match apply(TokenOp::Set {
+            org: &self.state.org,
+            token: &self.state.pat,
+        }) {
             Ok(()) => Done {
                 message: format!(
                     "saved read-only token for {} ({}/{} local runners matched)",
@@ -163,6 +232,8 @@ pub(crate) enum WizardMode {
     OrgInput(Wizard<OrgInput>),
     PatInput(Wizard<PatInput>),
     Confirmed(Wizard<Confirmed>),
+    RemoveOrgInput(Wizard<RemoveOrgInput>),
+    RemoveConfirm(Wizard<RemoveConfirm>),
     Done(Wizard<Done>),
 }
 
@@ -188,11 +259,12 @@ impl WizardMode {
         self,
         key: KeyEvent,
         ctx: &WizardCtx,
-        save: impl FnOnce(&str, &str) -> Result<(), String>,
+        apply: impl FnOnce(TokenOp) -> Result<(), String>,
     ) -> Step {
         match self {
             WizardMode::PickAction(w) => match key.code {
                 KeyCode::Char('a') => Step::Stay(WizardMode::OrgInput(w.add_org())),
+                KeyCode::Char('r') => Step::Stay(WizardMode::RemoveOrgInput(w.remove_org())),
                 KeyCode::Esc => Step::Close(false),
                 _ => Step::Stay(WizardMode::PickAction(w)),
             },
@@ -220,10 +292,28 @@ impl WizardMode {
             },
             WizardMode::Confirmed(w) => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    Step::Stay(WizardMode::Done(w.write(save)))
+                    Step::Stay(WizardMode::Done(w.write(apply)))
                 }
                 KeyCode::Esc | KeyCode::Char('n') => Step::Close(false),
                 _ => Step::Stay(WizardMode::Confirmed(w)),
+            },
+            WizardMode::RemoveOrgInput(mut w) => match key.code {
+                KeyCode::Esc => Step::Close(false),
+                KeyCode::Enter => match w.next() {
+                    RemoveNext::Confirm(next) => Step::Stay(WizardMode::RemoveConfirm(next)),
+                    RemoveNext::Stay(same) => Step::Stay(WizardMode::RemoveOrgInput(same)),
+                },
+                _ => {
+                    w.edit(key);
+                    Step::Stay(WizardMode::RemoveOrgInput(w))
+                }
+            },
+            WizardMode::RemoveConfirm(w) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    Step::Stay(WizardMode::Done(w.write_remove(apply)))
+                }
+                KeyCode::Esc | KeyCode::Char('n') => Step::Close(false),
+                _ => Step::Stay(WizardMode::RemoveConfirm(w)),
             },
             // Any key dismisses the result; reload iff the write succeeded.
             WizardMode::Done(w) => Step::Close(w.state.ok),
@@ -241,9 +331,10 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             " Configure ",
             vec![
                 Line::from(""),
-                Line::from("  [a]  add org + read-only PAT"),
+                Line::from("  [a]  add / replace org + read-only PAT"),
+                Line::from("  [r]  remove org (drops its PAT)"),
                 Line::from(""),
-                footer("[a] add · [Esc] close"),
+                footer("[a] add/replace · [r] remove · [Esc] close"),
             ],
         ),
         WizardMode::OrgInput(w) => (
@@ -287,6 +378,31 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
                 Line::from("  Save this read-only token to the config (0600)?"),
                 Line::from(""),
                 footer("[y] save · [n] cancel"),
+            ],
+        ),
+        WizardMode::RemoveOrgInput(w) => (
+            " Remove org ",
+            vec![
+                Line::from(""),
+                input_line("GitHub org login to remove", &w.state.org, false),
+                Line::from(""),
+                footer("[Enter] next · [Esc] cancel"),
+            ],
+        ),
+        WizardMode::RemoveConfirm(w) => (
+            " Confirm remove ",
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  Remove the read-only PAT for "),
+                    Span::styled(
+                        w.state.org.clone(),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" and forget the org?"),
+                ]),
+                Line::from(""),
+                footer("[y] remove · [n] cancel"),
             ],
         ),
         WizardMode::Done(w) => {
@@ -379,9 +495,41 @@ mod tests {
         assert!(matches!(mode, WizardMode::PatInput(_)));
         // Esc closes without a change.
         assert!(matches!(
-            mode.on_key(ev(KeyCode::Esc), &ctx, no_save),
+            mode.on_key(ev(KeyCode::Esc), &ctx, no_apply),
             Step::Close(false)
         ));
+    }
+
+    // The remove flow: PickAction → [r] → RemoveOrgInput → (type + Enter) →
+    // RemoveConfirm → [y] commits via the remove sink and reloads on success.
+    #[test]
+    fn remove_org_flow_confirms_and_saves() {
+        let ctx = WizardCtx {
+            local_ids: HashSet::new(),
+        };
+        let mut mode = step(WizardMode::new(), ev(KeyCode::Char('r')), &ctx);
+        assert!(matches!(mode, WizardMode::RemoveOrgInput(_)));
+        // Empty org can't advance.
+        mode = step(mode, ev(KeyCode::Enter), &ctx);
+        assert!(matches!(mode, WizardMode::RemoveOrgInput(_)));
+        for c in "acme".chars() {
+            mode = step(mode, ev(KeyCode::Char(c)), &ctx);
+        }
+        mode = step(mode, ev(KeyCode::Enter), &ctx); // → RemoveConfirm
+        assert!(matches!(mode, WizardMode::RemoveConfirm(_)));
+        // [y] runs the remove op and advances to Done.
+        let removed = std::cell::Cell::new(None);
+        let apply = |op: TokenOp| {
+            if let TokenOp::Remove { org } = op {
+                removed.set(Some(org.to_string()));
+            }
+            Ok(())
+        };
+        assert!(matches!(
+            mode.on_key(ev(KeyCode::Char('y')), &ctx, apply),
+            Step::Stay(WizardMode::Done(_))
+        ));
+        assert_eq!(removed.into_inner().as_deref(), Some("acme"));
     }
 
     #[test]
@@ -395,14 +543,14 @@ mod tests {
         assert!(matches!(mode, WizardMode::OrgInput(_)));
     }
 
-    /// A no-op persist sink for the navigation tests — these never reach the
-    /// `Confirmed` state (that needs a live `validate`), so it is never invoked.
-    fn no_save(_org: &str, _token: &str) -> Result<(), String> {
+    /// A no-op persist sink for the navigation tests — most never reach a commit
+    /// state (which needs a live `validate`), so it is usually never invoked.
+    fn no_apply(_op: TokenOp) -> Result<(), String> {
         Ok(())
     }
 
     fn step(mode: WizardMode, key: KeyEvent, ctx: &WizardCtx) -> WizardMode {
-        match mode.on_key(key, ctx, no_save) {
+        match mode.on_key(key, ctx, no_apply) {
             Step::Stay(m) => m,
             Step::Close(_) => panic!("unexpected close"),
         }
@@ -485,6 +633,26 @@ mod tests {
                 message: "saved read-only token for example-org (3/4 local runners matched)"
                     .to_string(),
                 ok: true,
+            },
+        });
+        insta::assert_snapshot!(render(&mode));
+    }
+
+    #[test]
+    fn snapshot_remove_org_input() {
+        let mode = WizardMode::RemoveOrgInput(Wizard {
+            state: RemoveOrgInput {
+                org: Input::from("example-org".to_string()),
+            },
+        });
+        insta::assert_snapshot!(render(&mode));
+    }
+
+    #[test]
+    fn snapshot_remove_confirm() {
+        let mode = WizardMode::RemoveConfirm(Wizard {
+            state: RemoveConfirm {
+                org: "example-org".to_string(),
             },
         });
         insta::assert_snapshot!(render(&mode));

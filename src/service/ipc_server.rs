@@ -239,8 +239,8 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Resp
         Query::RecentJobs { limit } => {
             with_db(conn, |c| wrap(reader::recent_jobs(c, *limit), Response::RecentJobs))
         }
-        Query::ActiveJob { runner_name } => with_db(conn, |c| {
-            wrap(reader::active_job(c, runner_name), Response::ActiveJob)
+        Query::LatestJob { runner_name } => with_db(conn, |c| {
+            wrap(reader::latest_job(c, runner_name), Response::LatestJob)
         }),
         Query::LatestApiRunners => with_db(conn, |c| {
             wrap(reader::latest_api_runners(c), |m| {
@@ -270,6 +270,7 @@ fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
             persist::set_metrics_pull(config_path, *enabled, addr)
         }
         Mutation::AddOrgToken { org, token } => persist::set_org_token(config_path, org, token),
+        Mutation::RemoveOrgToken { org } => persist::remove_org_token(config_path, org),
     };
     match result {
         Ok(()) => {

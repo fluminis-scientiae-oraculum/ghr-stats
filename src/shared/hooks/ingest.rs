@@ -1,10 +1,13 @@
-//! Ingest of the runner job-event log: an append-only NDJSON file the runner
+//! Ingest of a runner's job-event log: an append-only NDJSON file the runner
 //! hooks write (one line per job start/completion). We tail it from a persisted
 //! byte offset so ingestion is resume-safe across restarts.
 //!
-//! Hooks run as the *runner* user, the collector as the operator, so the log
-//! lives at a shared path (see `config.event_log`). Single-line appends under
-//! the pipe-buffer size are atomic, so concurrent writers interleave safely.
+//! Each runner writes its OWN log, in its own install dir
+//! (`crate::shared::hooks::runner_event_log`) — a file the *runner* user owns and
+//! the collector reads as root. That sidesteps any shared-writable-file
+//! permission problem; the collector tails every runner's log independently, one
+//! byte offset per log. Single-line appends under the pipe-buffer size are atomic,
+//! so a runner's concurrent job-start/-completion writes never tear.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # ghr-stats runner hook — JOB_STARTED.
 #
-# Appends ONE NDJSON line to the shared event log that the ghr-stats collector
-# tails. This runs as the *runner* user, so the log must be writable by every
-# runner user and readable by the collector user (see packaging/hooks/README.md).
+# Appends ONE NDJSON line to this runner's OWN event log, which the ghr-stats
+# collector tails. The installer sets GHR_STATS_EVENT_LOG in the runner's .env to
+# a file in the runner's install dir — owned by this (runner) user, so the append
+# always succeeds; the collector reads it as root (see packaging/hooks/README.md).
 #
 # It MUST NOT fail the job: every step is best-effort and the script always
 # exits 0.
 
-log="${GHR_STATS_EVENT_LOG:-/var/lib/ghr-stats/events.ndjson}"
+# The installer sets GHR_STATS_EVENT_LOG to THIS runner's own log (in its install
+# dir) — the exact path the collector tails. If it's unset, the runner wasn't
+# wired by ghr-stats: do nothing rather than write a log the collector never reads.
+log="${GHR_STATS_EVENT_LOG:-}"
+[ -n "$log" ] || exit 0
 ts="$(date +%s 2>/dev/null || echo 0)"
 
 printf '{"phase":"started","ts":%s,"repo":"%s","run_id":%s,"run_attempt":%s,"job":"%s","runner":"%s"}\n' \

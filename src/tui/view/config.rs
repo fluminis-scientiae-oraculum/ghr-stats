@@ -1,6 +1,7 @@
 //! The Config tab: resolved paths, mode + collector status, configured tokens,
-//! and metrics settings, plus the in-TUI actions — `[a]` add org+PAT (native
-//! wizard), `[h]` install hooks, `[m]` toggle metrics, `[o]` open the file. The
+//! and metrics settings, plus the in-TUI actions — `[a]` manage org PATs
+//! (add/replace/remove, native wizard), `[h]` install hooks, `[m]` toggle
+//! metrics, `[o]` open the file. The
 //! CLI `ghr-stats config` remains for a full guided first-run.
 
 use std::path::{Path, PathBuf};
@@ -23,7 +24,13 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     lines.push(heading("Paths"));
     lines.push(kv("database", &cfg.db_path.display().to_string()));
-    lines.push(kv("event log", &cfg.event_log.display().to_string()));
+    lines.push(kv(
+        "event log",
+        &format!(
+            "<runner-dir>/{} (per runner)",
+            crate::shared::hooks::RUNNER_EVENT_LOG
+        ),
+    ));
     let roots = if cfg.runner_roots.is_empty() {
         "(none — set with `ghr-stats config`)".to_string()
     } else {

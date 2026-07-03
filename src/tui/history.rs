@@ -164,11 +164,11 @@ impl DataSource {
         }
     }
 
-    pub(crate) fn active_job(&mut self, runner_name: &str) -> Option<JobRow> {
-        match self.query(&Request::Query(Query::ActiveJob {
+    pub(crate) fn latest_job(&mut self, runner_name: &str) -> Option<JobRow> {
+        match self.query(&Request::Query(Query::LatestJob {
             runner_name: runner_name.to_string(),
         })) {
-            Some(Response::ActiveJob(j)) => j,
+            Some(Response::LatestJob(j)) => j,
             _ => None, // Persistent-only
         }
     }
@@ -186,6 +186,12 @@ impl DataSource {
         self.mutate(Request::Mutate(Mutation::AddOrgToken {
             org: org.to_string(),
             token: token.to_string(),
+        }))
+    }
+
+    pub(crate) fn remove_org_token(&mut self, org: &str) -> MutateOutcome {
+        self.mutate(Request::Mutate(Mutation::RemoveOrgToken {
+            org: org.to_string(),
         }))
     }
 
@@ -328,7 +334,7 @@ mod tests {
         let mut s = DataSource::Ephemeral;
         assert_eq!(s.mode(), Mode::Ephemeral);
         assert!(s.recent_jobs(10).is_empty());
-        assert!(s.active_job("r").is_none());
+        assert!(s.latest_job("r").is_none());
         assert!(s.latest_api_runners().is_empty());
         assert!(s.scope().is_none());
     }

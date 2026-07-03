@@ -6,18 +6,18 @@
 //! to install/repair the runner job hooks. Nothing is read, sent, stored, or
 //! changed without an explicit confirmation; tokens are masked + redacted.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Password, Select};
-use serde::Serialize;
 
 use crate::shared::privileged;
 use crate::shared::collectors::runners;
+use crate::shared::config::persist;
 use crate::shared::github::validate::{self, Verdict};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
@@ -64,38 +64,60 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
         );
     }
 
-    // 2) Per-org read-only PAT (bounded validation).
+    // The config file we read the current PAT state from and write back to.
+    let target = config_target(config_override);
+
+    // 2) Per-org read-only PAT: add / replace / remove (bounded validation). We
+    // read which orgs already have a PAT so each one offers the right action.
     println!("\n── Step 2 of 4 · Read-only GitHub PATs (optional) ──");
-    let tokens = collect_tokens(&theme, &orgs, &discovered)?;
+    let existing = existing_token_orgs(&target);
+    let plan = manage_tokens(&theme, &discovered, &existing)?;
 
     // 3) Metrics (opt-in).
     println!("\n── Step 3 of 4 · Prometheus metrics (optional) ──");
     let metrics = prompt_metrics(&theme)?;
 
-    // 4) Write the config (with consent), tokens redacted in the preview.
-    println!("\n── Step 4 of 4 · Write config ──");
-    let target = config_target(config_override);
-    let write_ok = !target.exists()
-        || confirm(
-            &theme,
-            &format!("{} exists — overwrite?", target.display()),
-            false,
-        )?;
-    if write_ok {
-        let redacted: BTreeMap<String, String> = tokens
-            .keys()
-            .map(|k| (k.clone(), "***".to_string()))
-            .collect();
-        println!("\nWill write {} (mode 0600):\n", target.display());
-        println!("{}", render_config(&roots, &redacted, &metrics));
-        if confirm(&theme, "Write it?", true)? {
-            write_config(&target, &render_config(&roots, &tokens, &metrics))?;
-            println!("✓ wrote {}", target.display());
-        } else {
-            println!("nothing written.");
-        }
+    // 4) Update the config as FAITHFUL in-place edits (never a full rewrite): we
+    // change only what you set this run and preserve every other setting — an
+    // existing PAT you don't touch, the push metrics config, custom intervals,
+    // the org list. Re-running `config` is therefore safe and non-destructive.
+    println!("\n── Step 4 of 4 · Update config ──");
+    println!(
+        "\nWill update {} (mode 0600), preserving every other setting \
+         (existing PATs, push, intervals):",
+        target.display()
+    );
+    println!(
+        "  runner_roots = [{}]",
+        roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if plan.is_empty() {
+        println!("  github tokens: unchanged (existing PATs kept)");
     } else {
-        println!("kept existing config; nothing written.");
+        for org in plan.set.keys() {
+            println!("  github.tokens.{org} = *** (set/replaced)");
+        }
+        for org in &plan.remove {
+            println!("  github.tokens.{org} = REMOVED (org forgotten)");
+        }
+    }
+    if metrics.pull {
+        println!("  metrics.pull = enabled @ {}", metrics.addr);
+    } else {
+        println!("  metrics: unchanged");
+    }
+    if confirm(&theme, "Apply these changes?", true)? {
+        apply_config(&target, &roots, &plan, &metrics)?;
+        println!(
+            "✓ updated {} (existing PATs and other settings preserved)",
+            target.display()
+        );
+    } else {
+        println!("no changes written.");
     }
 
     // 5) Runner hooks (opt-in, detect-first).
@@ -150,60 +172,143 @@ fn expand_tilde(s: &str) -> String {
     }
 }
 
-/// Collect a validated read-only PAT per org. Bounded validation: fine-grained
-/// only, then read + agentId-confirm. Rejections re-prompt that org.
-fn collect_tokens(
+/// The per-org PAT changes the token step decided: orgs to set/replace (with the
+/// validated token) and orgs to remove. Applied via faithful `persist` edits.
+#[derive(Default)]
+struct TokenPlan {
+    set: BTreeMap<String, String>,
+    remove: BTreeSet<String>,
+}
+
+impl TokenPlan {
+    fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// The org logins that already have a PAT in `target` — presence only, read from
+/// the file text (so it survives schema drift). Empty when the file is absent or
+/// unreadable (a non-root run can't read the root-owned `/etc` config, so it
+/// degrades to add-only rather than failing).
+fn existing_token_orgs(target: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(target)
+        .ok()
+        .map(|t| crate::shared::config::token_orgs(&t).into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Per-org PAT management: for an org that already has a PAT, offer keep /
+/// replace / remove; for one without, offer to add. Candidates are the union of
+/// discovered orgs and orgs that already hold a PAT (so a stale one — whose
+/// runners are gone — can still be removed). Bounded validation on set/replace.
+fn manage_tokens(
     theme: &ColorfulTheme,
-    orgs: &[String],
     discovered: &[RunnerInfo],
-) -> Result<BTreeMap<String, String>> {
-    let mut tokens = BTreeMap::new();
-    if orgs.is_empty()
+    existing: &BTreeSet<String>,
+) -> Result<TokenPlan> {
+    let mut plan = TokenPlan::default();
+    let mut candidates: BTreeSet<String> = discovered.iter().map(|r| r.org.clone()).collect();
+    candidates.extend(existing.iter().cloned());
+    if candidates.is_empty()
         || !confirm(
             theme,
-            "Add read-only GitHub PATs now? (optional; needs 'Self-hosted runners: Read')",
+            "Manage read-only GitHub PATs now? (add / replace / remove; needs 'Self-hosted runners: Read')",
             false,
         )?
     {
-        return Ok(tokens);
+        return Ok(plan);
     }
-    for org in orgs {
-        if !confirm(theme, &format!("  Token for {org}?"), false)? {
-            continue;
-        }
+    for org in &candidates {
         let local_ids: HashSet<i64> = discovered
             .iter()
             .filter(|r| &r.org == org)
             .map(|r| r.agent_id)
             .collect();
-        loop {
-            let token = Password::with_theme(theme)
-                .with_prompt(format!("  Paste fine-grained PAT for {org}"))
+        if existing.contains(org) {
+            let choice = Select::with_theme(theme)
+                .with_prompt(format!("  {org} already has a PAT — action?"))
+                .items(["Keep it", "Replace the PAT", "Remove it (forget this org)"])
+                .default(0)
                 .interact()?;
-            let token = token.trim().to_string();
-            if token.is_empty() {
-                break;
-            }
-            match validate::validate(&token, org, &local_ids) {
-                Verdict::Valid {
-                    runners,
-                    matched,
-                    local,
-                } => {
-                    println!("    ✓ valid — {runners} runners, matched {matched}/{local} local");
-                    tokens.insert(org.clone(), token);
-                    break;
-                }
-                Verdict::Rejected(why) => {
-                    println!("    ✗ {why}");
-                    if !confirm(theme, "    try again?", true)? {
-                        break;
+            match choice {
+                1 => {
+                    if let Some(t) = prompt_validated_pat(theme, org, &local_ids)? {
+                        plan.set.insert(org.clone(), t);
                     }
+                }
+                2 => {
+                    plan.remove.insert(org.clone());
+                    println!("    • will remove {org}'s PAT");
+                }
+                _ => {}
+            }
+        } else if confirm(theme, &format!("  Add a token for {org}?"), false)?
+            && let Some(t) = prompt_validated_pat(theme, org, &local_ids)?
+        {
+            plan.set.insert(org.clone(), t);
+        }
+    }
+    Ok(plan)
+}
+
+/// Prompt for a fine-grained PAT and validate it (fine-grained only, read +
+/// agentId-confirm). `Some(token)` once valid; `None` if left blank or the user
+/// gives up after a rejection. Shared by the add and replace paths.
+fn prompt_validated_pat(
+    theme: &ColorfulTheme,
+    org: &str,
+    local_ids: &HashSet<i64>,
+) -> Result<Option<String>> {
+    loop {
+        let token = Password::with_theme(theme)
+            .with_prompt(format!("  Paste fine-grained PAT for {org}"))
+            .interact()?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Ok(None);
+        }
+        match validate::validate(&token, org, local_ids) {
+            Verdict::Valid {
+                runners,
+                matched,
+                local,
+            } => {
+                println!("    ✓ valid — {runners} runners, matched {matched}/{local} local");
+                return Ok(Some(token));
+            }
+            Verdict::Rejected(why) => {
+                println!("    ✗ {why}");
+                if !confirm(theme, "    try again?", true)? {
+                    return Ok(None);
                 }
             }
         }
     }
-    Ok(tokens)
+}
+
+/// Apply the wizard's decisions as faithful in-place `persist` edits: set the
+/// roots, set/replace the collected PATs, remove the ones marked for removal, and
+/// enable metrics if chosen. Every OTHER setting in the file is preserved. Pure
+/// of prompts (all consent happened already), so it is unit-testable end-to-end.
+fn apply_config(
+    target: &Path,
+    roots: &[PathBuf],
+    plan: &TokenPlan,
+    metrics: &MetricsChoice,
+) -> Result<()> {
+    persist::set_runner_roots(target, roots)?;
+    for (org, token) in &plan.set {
+        persist::set_org_token(target, org, token)?;
+    }
+    for org in &plan.remove {
+        persist::remove_org_token(target, org)?;
+    }
+    // Only touch metrics when enabling — declining leaves any existing pull/push
+    // config alone rather than clobbering it.
+    if metrics.pull {
+        persist::set_metrics_pull(target, true, &metrics.addr)?;
+    }
+    Ok(())
 }
 
 struct MetricsChoice {
@@ -298,7 +403,7 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
 
     for r in discovered {
         match install::detect(&r.dir, &our_dir) {
-            HookStatus::Ours => println!("  ✓ {} already wired to ghr-stats", r.name),
+            HookStatus::Ours => repair_event_log(r),
             HookStatus::Unreadable => println!(
                 "  ? {} — .env not readable; re-run as the runner user or root",
                 r.name
@@ -336,11 +441,35 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     Ok(())
 }
 
+/// Already wired to us: ensure the runner's `.env` also carries its per-runner
+/// event-log path, then restart if we had to add it. This makes `config` a
+/// self-healing upgrade path — a runner wired by a version that predates
+/// `GHR_STATS_EVENT_LOG` (detected `Ours`, so install/chain are skipped) would
+/// otherwise never emit events.
+fn repair_event_log(r: &RunnerInfo) {
+    let env_path = r.dir.join(".env");
+    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let event_log = crate::shared::hooks::runner_event_log(&r.dir);
+    match install::ensure_event_log(&existing, &event_log) {
+        None => println!("  ✓ {} already wired to ghr-stats", r.name),
+        Some(new) => {
+            let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
+            if out.is_ok() {
+                println!("  ✓ {} — added missing event-log path", r.name);
+                restart_runner(r);
+            } else {
+                println!("    ✗ {}", out.describe("repair .env"));
+            }
+        }
+    }
+}
+
 /// Clean install: point the runner's `.env` hook vars at our scripts, restart.
 fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
     let env_path = r.dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let new = install::rewrite_env(&existing, started, completed);
+    let event_log = crate::shared::hooks::runner_event_log(&r.dir);
+    let new = install::rewrite_env(&existing, started, completed, Some(&event_log));
     let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
     if out.is_ok() {
         restart_runner(r);
@@ -364,7 +493,8 @@ fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: 
         let w = install::render_chain_wrapper(Path::new(&o), our_completed);
         let _ = write_script(&wrap_completed, &w);
     }
-    let new = install::rewrite_env(&existing, &wrap_started, &wrap_completed);
+    let event_log = crate::shared::hooks::runner_event_log(&r.dir);
+    let new = install::rewrite_env(&existing, &wrap_started, &wrap_completed, Some(&event_log));
     let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
     if out.is_ok() {
         restart_runner(r);
@@ -396,82 +526,6 @@ fn restart_runner(r: &RunnerInfo) {
     }
 }
 
-// ---- config rendering (pure + tested) ----
-
-#[derive(Serialize)]
-struct OutConfig {
-    runner_roots: Vec<String>,
-    intervals: OutIntervals,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    github: Option<OutGithub>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metrics: Option<OutMetrics>,
-}
-
-#[derive(Serialize)]
-struct OutIntervals {
-    local_secs: u64,
-    api_secs: u64,
-}
-
-#[derive(Serialize)]
-struct OutGithub {
-    tokens: BTreeMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct OutMetrics {
-    pull: OutPull,
-}
-
-#[derive(Serialize)]
-struct OutPull {
-    enabled: bool,
-    addr: String,
-}
-
-/// Render a config TOML via the serializer (proper escaping). Pure + tested.
-fn render_config(
-    roots: &[PathBuf],
-    tokens: &BTreeMap<String, String>,
-    metrics: &MetricsChoice,
-) -> String {
-    let out = OutConfig {
-        runner_roots: roots.iter().map(|p| p.display().to_string()).collect(),
-        intervals: OutIntervals {
-            local_secs: 5,
-            api_secs: 60,
-        },
-        github: (!tokens.is_empty()).then(|| OutGithub {
-            tokens: tokens.clone(),
-        }),
-        metrics: metrics.pull.then(|| OutMetrics {
-            pull: OutPull {
-                enabled: true,
-                addr: metrics.addr.clone(),
-            },
-        }),
-    };
-    let body = toml::to_string_pretty(&out).unwrap_or_default();
-    format!("# ghr-stats config (written by `ghr-stats config`). Keep mode 0600.\n\n{body}")
-}
-
-fn write_config(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    f.write_all(contents.as_bytes())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
 fn config_target(config_override: Option<&Path>) -> PathBuf {
     crate::shared::paths::config_write_target(config_override)
 }
@@ -480,48 +534,58 @@ fn config_target(config_override: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn no_metrics() -> MetricsChoice {
-        MetricsChoice {
+    /// The wizard's apply step, end-to-end against a real config file: set a new
+    /// PAT, replace an existing one, remove another, and set the roots — while
+    /// every untouched setting (here the push config) survives. This is the
+    /// CLI-side of add/replace/remove, proven without the interactive prompts.
+    #[test]
+    fn apply_config_sets_replaces_removes_and_preserves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "runner_roots = [\"/old\"]\n\
+             [github.tokens]\nacme = \"github_pat_OLD\"\nwidgets = \"github_pat_W\"\n\
+             [metrics.push]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let mut plan = TokenPlan::default();
+        plan.set.insert("acme".into(), "github_pat_NEW".into()); // replace
+        plan.set.insert("beta".into(), "github_pat_B".into()); // add
+        plan.remove.insert("widgets".into()); // remove
+        let metrics = MetricsChoice {
             pull: false,
-            addr: "127.0.0.1:9477".to_string(),
-        }
-    }
-
-    #[test]
-    fn render_round_trips_into_config() {
-        let mut tokens = BTreeMap::new();
-        tokens.insert("example-org".to_string(), "github_pat_xyz".to_string());
-        let toml = render_config(&[PathBuf::from("/srv/runners")], &tokens, &no_metrics());
-
-        assert!(toml.contains("[github.tokens]"));
-        assert!(toml.contains("example-org"));
-        let cfg: crate::shared::config::Config =
-            toml::from_str(&toml).expect("generated config parses");
-        assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/runners")]);
-        assert_eq!(
-            cfg.github_token_for("example-org").as_deref(),
-            Some("github_pat_xyz")
-        );
-    }
-
-    #[test]
-    fn render_with_metrics_enables_pull() {
-        let m = MetricsChoice {
-            pull: true,
-            addr: "127.0.0.1:9999".to_string(),
+            addr: "127.0.0.1:9477".into(),
         };
-        let toml = render_config(&[PathBuf::from("/x")], &BTreeMap::new(), &m);
-        assert!(toml.contains("[metrics.pull]"));
-        let cfg: crate::shared::config::Config = toml::from_str(&toml).expect("parses");
-        assert!(cfg.metrics.pull.enabled);
-        assert_eq!(cfg.metrics.pull.addr, "127.0.0.1:9999");
+
+        apply_config(&path, &[PathBuf::from("/srv/r")], &plan, &metrics).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg: crate::shared::config::Config = toml::from_str(&text).unwrap();
+        // Per-org tokens take precedence over env/fallback, so these are deterministic.
+        assert_eq!(cfg.github_token_for("acme").as_deref(), Some("github_pat_NEW"));
+        assert_eq!(cfg.github_token_for("beta").as_deref(), Some("github_pat_B"));
+        // widgets removed (presence check is env-independent).
+        assert!(!cfg.github.tokens.contains_key("widgets"));
+        assert!(!text.contains("github_pat_W"));
+        // Untouched settings + the new roots.
+        assert!(cfg.metrics.push.enabled);
+        assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/r")]);
     }
 
     #[test]
-    fn render_without_tokens_or_metrics_omits_sections() {
-        let toml = render_config(&[PathBuf::from("/x")], &BTreeMap::new(), &no_metrics());
-        assert!(!toml.contains("[github"));
-        assert!(!toml.contains("[metrics"));
-        let _cfg: crate::shared::config::Config = toml::from_str(&toml).expect("parses");
+    fn existing_token_orgs_reads_configured_orgs_empty_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(existing_token_orgs(&path).is_empty()); // no file yet
+        std::fs::write(
+            &path,
+            "[github.tokens]\nacme = \"github_pat_A\"\nwidgets = \"github_pat_W\"\n",
+        )
+        .unwrap();
+        let got = existing_token_orgs(&path);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains("acme") && got.contains("widgets"));
     }
 }

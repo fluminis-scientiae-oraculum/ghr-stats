@@ -10,7 +10,7 @@ use super::{
     ChartSpec, draw_time_chart, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime,
     liveness_label,
 };
-use crate::shared::models::ApiState;
+use crate::shared::models::{ApiState, JobRow};
 use crate::shared::util::now_epoch;
 use crate::tui::app::App;
 use crate::tui::viewmodel;
@@ -73,7 +73,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             fmt_uptime(r.uptime_s)
         )),
         Line::from(format!("github  {}", gh_text(r.gh, app))),
-        Line::from(format!("job     {}", active_job_text(app))),
+        Line::from(format!("job     {}", last_job_text(app))),
     ];
     f.render_widget(
         Paragraph::new(info).block(
@@ -87,17 +87,32 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     draw_charts(f, app, chunks[1]);
 }
 
-/// The runner's in-flight job (from local hook events), or "—".
-fn active_job_text(app: &App) -> String {
-    match &app.detail_active_job {
-        Some(j) => {
-            let elapsed = j
-                .started_at
-                .map(|s| fmt_dur((now_epoch() - s).max(0) as u64))
-                .unwrap_or_else(|| "?".to_string());
-            format!("{} · {}  (running {elapsed})", j.repo, j.job)
+/// The runner's most recent job line, resolving the clock once.
+fn last_job_text(app: &App) -> String {
+    render_last_job(app.detail_last_job.as_ref(), now_epoch())
+}
+
+/// Pure renderer for the detail "job" line: "running Xs" while in-flight, else
+/// "<conclusion>, Xs ago" for the last completed one, or "—" if the runner has
+/// never run a job. Split out from [`last_job_text`] so it is testable without an
+/// `App` or the wall clock.
+fn render_last_job(job: Option<&JobRow>, now: i64) -> String {
+    let Some(j) = job else {
+        return "—".to_string();
+    };
+    let label = format!("{} · {}", j.repo, j.job);
+    match (j.started_at, j.completed_at) {
+        // In-flight: no completion yet.
+        (Some(s), None) => format!("{label}  (running {})", fmt_dur((now - s).max(0) as u64)),
+        // Completed: the API conclusion (or a neutral "done") + how long ago.
+        (_, Some(c)) => {
+            let outcome = j.conclusion.as_deref().unwrap_or("done");
+            format!(
+                "{label}  ({outcome}, {} ago)",
+                fmt_dur((now - c).max(0) as u64)
+            )
         }
-        None => "—".to_string(),
+        (None, None) => label,
     }
 }
 
@@ -176,4 +191,52 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
             color: Color::Green,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_last_job;
+    use crate::shared::models::JobRow;
+
+    fn job(started: Option<i64>, completed: Option<i64>, conclusion: Option<&str>) -> JobRow {
+        JobRow {
+            runner_name: "runner-01".into(),
+            repo: "example-org/foo".into(),
+            job: "build".into(),
+            started_at: started,
+            completed_at: completed,
+            conclusion: conclusion.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_job_renders_dash() {
+        assert_eq!(render_last_job(None, 1_000), "—");
+    }
+
+    #[test]
+    fn in_flight_job_shows_running_elapsed() {
+        let j = job(Some(1_000), None, None);
+        // now 90s after start.
+        assert_eq!(
+            render_last_job(Some(&j), 1_090),
+            "example-org/foo · build  (running 1m30s)"
+        );
+    }
+
+    #[test]
+    fn completed_job_shows_conclusion_and_age() {
+        let j = job(Some(1_000), Some(1_100), Some("success"));
+        // now 30s after completion.
+        assert_eq!(
+            render_last_job(Some(&j), 1_130),
+            "example-org/foo · build  (success, 30s ago)"
+        );
+        // Conclusion not yet reconciled ⇒ neutral "done".
+        let j = job(Some(1_000), Some(1_100), None);
+        assert_eq!(
+            render_last_job(Some(&j), 1_100),
+            "example-org/foo · build  (done, 0s ago)"
+        );
+    }
 }

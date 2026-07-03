@@ -146,7 +146,7 @@ pub(crate) struct App {
     pub(crate) drill: Option<usize>,
     pub(crate) table: TableState,
     pub(crate) detail_history: Vec<HistPoint>,
-    pub(crate) detail_active_job: Option<JobRow>,
+    pub(crate) detail_last_job: Option<JobRow>,
     pub(crate) trend_host: Vec<HostPoint>,
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
@@ -184,7 +184,7 @@ impl App {
             drill: None,
             table,
             detail_history: Vec::new(),
-            detail_active_job: None,
+            detail_last_job: None,
             trend_host: Vec::new(),
             trend_busy: Vec::new(),
             jobs: Vec::new(),
@@ -283,17 +283,32 @@ impl App {
                 // sudo" error). Borrows only `self.source`, so it is released
                 // before the `Close` arm reloads config.
                 let source = &mut self.source;
-                let save = |org: &str, token: &str| -> Result<(), String> {
-                    match source.add_org_token(org, token) {
-                        MutateOutcome::Mutated => Ok(()),
-                        MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
-                        MutateOutcome::Unreachable => {
-                            crate::shared::config::persist::set_org_token(&target, org, token)
-                                .map_err(|e| e.to_string())
-                        }
+                // ONE sink for both add/replace and remove — a single `&mut source`
+                // borrow (two closures could not both hold it). Each op routes
+                // through the root collector (IPC) when authorized, else a direct
+                // config write (root ⇒ ok, else a "re-run with sudo" error).
+                let apply = |op: wizard::TokenOp| -> Result<(), String> {
+                    match op {
+                        wizard::TokenOp::Set { org, token } => match source.add_org_token(org, token)
+                        {
+                            MutateOutcome::Mutated => Ok(()),
+                            MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
+                            MutateOutcome::Unreachable => {
+                                crate::shared::config::persist::set_org_token(&target, org, token)
+                                    .map_err(|e| e.to_string())
+                            }
+                        },
+                        wizard::TokenOp::Remove { org } => match source.remove_org_token(org) {
+                            MutateOutcome::Mutated => Ok(()),
+                            MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
+                            MutateOutcome::Unreachable => {
+                                crate::shared::config::persist::remove_org_token(&target, org)
+                                    .map_err(|e| e.to_string())
+                            }
+                        },
                     }
                 };
-                match mode.on_key(key, &ctx, save) {
+                match mode.on_key(key, &ctx, apply) {
                     wizard::Step::Stay(next) => self.overlay = Some(Overlay::Wizard(next)),
                     wizard::Step::Close(changed) => {
                         // Re-read to reflect the new token in the Config tab. As a
@@ -663,11 +678,11 @@ impl App {
     fn load_detail(&mut self) {
         let Some((id, name)) = self.detail_runner().map(|r| (r.agent_id, r.name.clone())) else {
             self.detail_history.clear();
-            self.detail_active_job = None;
+            self.detail_last_job = None;
             return;
         };
         self.detail_history = self.source.runner_history(&self.rings, id, HISTORY_POINTS);
-        self.detail_active_job = self.source.active_job(&name);
+        self.detail_last_job = self.source.latest_job(&name);
     }
 
     fn load_trends(&mut self) {

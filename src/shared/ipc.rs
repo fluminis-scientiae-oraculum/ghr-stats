@@ -25,7 +25,11 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 ///     configured org logins — so a non-root TUI reflects the true PAT state).
 /// v5: split `Request` into `Query`/`Mutate` so authz is structural (mutations
 ///     are unreachable except past the gate).
-pub const VERSION: u16 = 5;
+/// v6: `ActiveJob` → `LatestJob` — the runner-detail job line now shows the most
+///     recent job (running OR last completed), not only an in-flight one.
+/// v7: added `RemoveOrgToken` (drop an org's PAT + forget the org) — the config
+///     wizard's `[r]` action.
+pub const VERSION: u16 = 7;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -57,7 +61,7 @@ pub enum Query {
     BusySeries { limit: usize },
     RunnerHistory { agent_id: i64, limit: usize },
     RecentJobs { limit: usize },
-    ActiveJob { runner_name: String },
+    LatestJob { runner_name: String },
     LatestApiRunners,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
@@ -78,6 +82,8 @@ pub enum Mutation {
     /// Add/replace a read-only PAT for an org (mirrors the wizard's `[a]`). The
     /// token is one-way: it is written but never returned in any response.
     AddOrgToken { org: String, token: String },
+    /// Remove an org's PAT and forget the org (mirrors the wizard's `[r]`).
+    RemoveOrgToken { org: String },
 }
 
 impl Mutation {
@@ -87,6 +93,7 @@ impl Mutation {
         match self {
             Mutation::SetMetricsPull { .. } => "set_metrics_pull",
             Mutation::AddOrgToken { .. } => "add_org_token",
+            Mutation::RemoveOrgToken { .. } => "remove_org_token",
         }
     }
 }
@@ -110,7 +117,7 @@ pub enum Response {
     BusySeries(Vec<BusyPoint>),
     RunnerHistory(Vec<HistPoint>),
     RecentJobs(Vec<JobRow>),
-    ActiveJob(Option<JobRow>),
+    LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
     /// Persisted liveness edges; `RunnerState.agent_id` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.

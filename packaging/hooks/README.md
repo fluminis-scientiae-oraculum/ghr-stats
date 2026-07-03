@@ -1,40 +1,38 @@
 # Runner job hooks
 
-These two scripts make each runner record job start/completion to the shared
-NDJSON event log that the `ghr-stats` collector tails to populate the Jobs view.
-They are best-effort and always exit 0 — they can never fail a job.
+These two scripts make each runner record job start/completion to an NDJSON event
+log that the `ghr-stats` collector tails to populate the Jobs view. They are
+best-effort and always exit 0 — they can never fail a job.
 
-## Shared event log
+## Per-runner event log (no shared file)
 
-Hooks run as the **runner** user; the collector runs as the **operator**. The
-log must therefore be writable by every runner user and readable by the
-operator. Single-line appends are atomic on a local filesystem, so concurrent
-runners interleave safely. Example one-time setup:
+Each runner writes its **own** log, a dotfile in its install-dir root:
+
+```
+<runner-install-dir>/.ghr-stats-events.ndjson
+```
+
+That directory is owned by the **runner** user, so the hook (which runs as that
+user) can always create and append to it — no shared file, no group setup, no
+`chmod` of a root-owned directory. The collector runs as root and reads every
+runner's log, tailing each independently (one byte offset per log). Single-line
+appends are atomic, so a runner's start/completion writes never tear.
+
+`ghr-stats config` (or the TUI `[h]` action) wires this automatically: it writes
+`GHR_STATS_EVENT_LOG=<runner-install-dir>/.ghr-stats-events.ndjson` into the
+runner's `.env` alongside the hook vars. If the var is unset the scripts do
+nothing (a runner that wasn't wired by ghr-stats).
+
+## Wiring (what the installer writes into the runner's `.env`)
 
 ```bash
-sudo install -d -m 0775 -o root -g ghr /var/lib/ghr-stats   # a group all runners share
-sudo touch /var/lib/ghr-stats/events.ndjson
-sudo chgrp ghr /var/lib/ghr-stats/events.ndjson
-sudo chmod 0664 /var/lib/ghr-stats/events.ndjson
+ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh
+ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh
+GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson
 ```
 
-Point ghr-stats at it in `config.toml`:
-
-```toml
-event_log = "/var/lib/ghr-stats/events.ndjson"
-```
-
-(Override per runner with `GHR_STATS_EVENT_LOG` if you prefer.)
-
-## Wiring (in fleet-scripts' runner env)
-
-Install the scripts somewhere the runner users can execute, then set the
-runner's hook env vars (e.g. in its `.env`):
-
-```bash
-ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ghr-stats/hooks/job-started.sh
-ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ghr-stats/hooks/job-completed.sh
-```
+The collector derives the same per-runner path from each discovered runner's
+install dir, so the writer and the reader can never point at different files.
 
 The collector fills job **timing** from these events; the **conclusion**
 (success/failure) is reconciled from the GitHub API.
