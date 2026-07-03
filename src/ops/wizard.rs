@@ -479,22 +479,37 @@ fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
 }
 
 /// Chain: wrap the existing hook (keep it) + append ours, repoint `.env`, restart.
+/// Per-slot: a slot with a foreign original gets a wrapper; a slot with no
+/// original (a `Foreign` runner with only ONE hook var set) is wired to our plain
+/// script directly — never to a wrapper we didn't write. Any wrapper write must
+/// succeed before we touch `.env`, so we can't point a runner at a missing script.
 fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: &Path) {
     let env_path = r.dir.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
     let (orig_started, orig_completed) = install::current_hook_paths(&existing);
     let wrap_started = our_dir.join(format!("chain-{}-started.sh", r.name));
     let wrap_completed = our_dir.join(format!("chain-{}-completed.sh", r.name));
-    if let Some(o) = orig_started {
-        let w = install::render_chain_wrapper(Path::new(&o), our_started);
-        let _ = write_script(&wrap_started, &w);
+
+    let (started_target, started_wrapper) =
+        install::plan_chain_slot(orig_started.as_deref(), our_started, &wrap_started);
+    let (completed_target, completed_wrapper) =
+        install::plan_chain_slot(orig_completed.as_deref(), our_completed, &wrap_completed);
+
+    // Write any wrappers FIRST; abort without touching `.env` if a write fails —
+    // never leave a runner pointed at a wrapper that isn't on disk.
+    for (path, content) in [started_wrapper, completed_wrapper].into_iter().flatten() {
+        if let Err(e) = write_script(&path, &content) {
+            println!(
+                "    ✗ {} — could not write {} ({e}); .env left unchanged",
+                r.name,
+                path.display()
+            );
+            return;
+        }
     }
-    if let Some(o) = orig_completed {
-        let w = install::render_chain_wrapper(Path::new(&o), our_completed);
-        let _ = write_script(&wrap_completed, &w);
-    }
+
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
-    let new = install::rewrite_env(&existing, &wrap_started, &wrap_completed, Some(&event_log));
+    let new = install::rewrite_env(&existing, &started_target, &completed_target, Some(&event_log));
     let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
     if out.is_ok() {
         restart_runner(r);

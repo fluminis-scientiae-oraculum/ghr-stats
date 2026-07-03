@@ -22,9 +22,9 @@
 //!   fast local cadence, so it can never delay local sampling.
 //! - The bounded channel gives natural backpressure if the writer falls behind.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -34,12 +34,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Sender, bounded};
 use nix::fcntl::{Flock, FlockArg};
 
-use crate::service::store::{Store, reader, writer};
+use rusqlite::Connection;
+
+use crate::service::store::{Store, open_reader, reader, writer};
 use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::{self};
 use crate::shared::config::{Config, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
-use crate::shared::models::{ApiRunnerRow, HostSample, RunnerSample};
+use crate::shared::models::{
+    ApiRunnerRow, HostSample, JobConclusion, PendingConclusion, RunnerSample,
+};
 use crate::shared::util::now_epoch;
 
 /// Walk the (expensive) `_work` trees once every N local ticks.
@@ -88,9 +92,12 @@ enum Sample {
         events: Vec<HookEvent>,
         offset: u64,
     },
+    JobConclusions {
+        updates: Vec<JobConclusion>,
+    },
 }
 
-pub fn run(cfg: &Config) -> Result<()> {
+pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     // `serve` is the systemd-managed collector, not an interactive command:
     // refuse to run attached to a terminal (systemd gives the service no TTY) and
     // point at the installer. `GHR_STATS_ALLOW_TTY=1` is the dev/CI escape hatch.
@@ -135,10 +142,13 @@ pub fn run(cfg: &Config) -> Result<()> {
             .context("spawning local-sampler")?
     };
     let api = {
+        // Its OWN WAL reader, used to find completed jobs still awaiting an API
+        // conclusion (the writer owns the only writer connection).
+        let reader = open_reader(&cfg.db_path);
         let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("api-reconcile".into())
-            .spawn(move || api_loop(&cfg, &term, &tx))
+            .spawn(move || api_loop(&cfg, &term, &tx, reader))
             .context("spawning api-reconcile")?
     };
     let hooks = {
@@ -159,7 +169,12 @@ pub fn run(cfg: &Config) -> Result<()> {
     // Unix socket (its own WAL reader connection), and reloads `shared` after an
     // authorized config mutation. This is what makes the collector reachable —
     // cross-scope included — without exposing the DB file.
-    let ipc = crate::service::ipc_server::spawn(&shared, Arc::clone(&term));
+    // The exact file config edits load from and write back to — an explicit
+    // `--config`, else the canonical `/etc` path. Threaded into the IPC server so
+    // an authorized mutation writes (and reloads) the SAME file `serve` loaded,
+    // not a hardcoded `/etc` that a `--config` run never touched.
+    let config_path = crate::shared::paths::config_write_target(config_override);
+    let ipc = crate::service::ipc_server::spawn(&shared, Arc::clone(&term), config_path);
 
     // The writer holds only `rx`; once the producers exit and drop their
     // senders, `rx` disconnects and the loop below ends.
@@ -199,6 +214,12 @@ pub fn run(cfg: &Config) -> Result<()> {
                 }
                 Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
             },
+            Sample::JobConclusions { updates } => {
+                match writer::apply_job_conclusions(store.conn_mut(), &updates) {
+                    Ok(()) => tracing::debug!(n = updates.len(), "job conclusions reconciled"),
+                    Err(e) => tracing::error!(error = %e, "job conclusion write failed"),
+                }
+            }
         }
     }
 
@@ -244,10 +265,16 @@ fn local_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
     }
 }
 
+/// Cap on how many pending job conclusions one reconcile cycle resolves — drains
+/// a large backlog a batch at a time instead of a burst of API calls.
+const JOB_RECONCILE_LIMIT: usize = 200;
+
 /// Producer: reconcile GitHub's view on `api_secs`. Uses the explicit
 /// `config.orgs` list when set, else discovers orgs from the runners' `.runner`
-/// files each cycle — so it shares no mutable state with the local sampler.
-fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
+/// files each cycle — so it shares no mutable state with the local sampler. Each
+/// cycle also resolves finished jobs' pass/fail `conclusion` from the Actions API
+/// (opportunistic — see [`reconcile_job_conclusions`]), using its own reader.
+fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>, reader: Option<Connection>) {
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
@@ -267,6 +294,14 @@ fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
             let rows = gather_api(&c, &orgs, term);
             if !rows.is_empty() && tx.send(Sample::Api { ts: now, rows }).is_err() {
                 break; // writer gone
+            }
+            if let Some(conn) = reader.as_ref() {
+                let updates = reconcile_job_conclusions(&c, conn, term);
+                if !updates.is_empty()
+                    && tx.send(Sample::JobConclusions { updates }).is_err()
+                {
+                    break; // writer gone
+                }
             }
             next = Instant::now() + Duration::from_secs(c.intervals.api_secs.max(10));
         }
@@ -368,6 +403,74 @@ fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<A
     out
 }
 
+/// Resolve finished jobs' pass/fail `conclusion` from the Actions API. The hook
+/// records job *timing*; this fills the conclusion. Opportunistic: it needs the
+/// token to also carry "Actions: read" — a runners-only token gets 403, which we
+/// log and skip so the job just keeps its neutral "done" state (no regression).
+/// One `list_run_jobs` call per (repo, run) with pending rows; bails on shutdown.
+fn reconcile_job_conclusions(
+    cfg: &Config,
+    conn: &Connection,
+    term: &AtomicBool,
+) -> Vec<JobConclusion> {
+    let pending = reader::jobs_awaiting_conclusion(conn, JOB_RECONCILE_LIMIT).unwrap_or_default();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    // One API call per run: group the pending rows by (org, repo, run_id).
+    let mut by_run: BTreeMap<(String, String, i64), Vec<PendingConclusion>> = BTreeMap::new();
+    for p in pending {
+        by_run
+            .entry((p.org.clone(), p.repo.clone(), p.run_id))
+            .or_default()
+            .push(p);
+    }
+    let mut updates = Vec::new();
+    for ((org, repo, run_id), jobs) in by_run {
+        if term.load(Ordering::SeqCst) {
+            break;
+        }
+        let Some(token) = cfg.github_token_for(&org) else {
+            continue;
+        };
+        match crate::shared::github::list_run_jobs(&token, &repo, run_id) {
+            Ok(api_jobs) => updates.extend(match_conclusions(&jobs, &api_jobs)),
+            Err(e) => tracing::debug!(error = %e, repo = %repo, run_id, "job-conclusion reconcile skipped"),
+        }
+    }
+    updates
+}
+
+/// Match each pending job to its API job and collect the resolved conclusions.
+/// A run with a single job maps regardless of name (covers a workflow `name:`
+/// that differs from the job id the hook recorded); otherwise match by name. A
+/// still-running job (conclusion `null`) is left for a later cycle. Pure.
+fn match_conclusions(
+    pending: &[PendingConclusion],
+    api_jobs: &[crate::shared::github::RunJob],
+) -> Vec<JobConclusion> {
+    pending
+        .iter()
+        .filter_map(|p| {
+            let concl = if api_jobs.len() == 1 {
+                api_jobs[0].conclusion.clone()
+            } else {
+                api_jobs
+                    .iter()
+                    .find(|aj| aj.name == p.job)
+                    .and_then(|aj| aj.conclusion.clone())
+            };
+            concl.map(|conclusion| JobConclusion {
+                run_id: p.run_id,
+                run_attempt: p.run_attempt,
+                job: p.job.clone(),
+                runner_name: p.runner_name.clone(),
+                conclusion,
+            })
+        })
+        .collect()
+}
+
 /// Sleep until `deadline`, waking early (within `SLEEP_STEP`) when a signal
 /// sets the terminate flag.
 fn sleep_until(deadline: Instant, term: &AtomicBool) {
@@ -377,5 +480,55 @@ fn sleep_until(deadline: Instant, term: &AtomicBool) {
             break;
         }
         thread::sleep(SLEEP_STEP.min(deadline - now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::github::RunJob;
+
+    fn pending(job: &str) -> PendingConclusion {
+        PendingConclusion {
+            org: "example-org".into(),
+            repo: "example-org/foo".into(),
+            run_id: 1,
+            run_attempt: 1,
+            job: job.into(),
+            runner_name: "runner-01".into(),
+        }
+    }
+    fn api(name: &str, concl: Option<&str>) -> RunJob {
+        RunJob {
+            name: name.into(),
+            conclusion: concl.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn match_conclusions_by_name_single_job_and_skips_running() {
+        // Multi-job run: match by name; the still-running one (null) is skipped.
+        let pend = [pending("build"), pending("test")];
+        let jobs = [api("build", Some("success")), api("test", None)];
+        let got = match_conclusions(&pend, &jobs);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].job.as_str(), got[0].conclusion.as_str()),
+            ("build", "success")
+        );
+
+        // Single-job run: mapped regardless of name (a custom workflow `name:`).
+        let got = match_conclusions(&[pending("deploy")], &[api("Deploy to prod", Some("failure"))]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].conclusion, "failure");
+
+        // No matching API job in a multi-job run → nothing resolved.
+        assert!(
+            match_conclusions(
+                &[pending("nope")],
+                &[api("a", Some("success")), api("b", Some("success"))]
+            )
+            .is_empty()
+        );
     }
 }

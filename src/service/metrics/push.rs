@@ -18,6 +18,11 @@ use crate::shared::util::now_epoch;
 /// Poll granularity for shutdown + config changes while idle/between posts.
 const TICK: Duration = Duration::from_millis(200);
 
+/// Read/write timeout for the push POST. ureq leaves these infinite by default,
+/// so a stalled ingestion endpoint would hang this thread and block the
+/// collector's SIGTERM shutdown. Bound it.
+const POST_TIMEOUT: Duration = Duration::from_secs(20);
+
 pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
     let db = shared.snapshot().db_path.clone(); // DB path is fixed for the run
     let version = env!("CARGO_PKG_VERSION");
@@ -59,7 +64,9 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
 }
 
 fn post(endpoint: &str, auth: Option<&str>, body: &str) {
-    let mut req = ureq::post(endpoint).set("Content-Type", "application/json");
+    let mut req = ureq::post(endpoint)
+        .timeout(POST_TIMEOUT)
+        .set("Content-Type", "application/json");
     if let Some(a) = auth {
         req = req.set("Authorization", a);
     }

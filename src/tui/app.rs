@@ -144,7 +144,11 @@ pub(crate) struct App {
     pub(crate) tab: Tab,
     /// `Some(row)` when Summary is drilled into Detail for `runners[row]`.
     pub(crate) drill: Option<usize>,
-    pub(crate) table: TableState,
+    /// Selection + scroll offset for the Summary table. `RefCell` because the
+    /// render pass (which only has `&App`) must write back ratatui's auto-scroll
+    /// offset — otherwise `select_at_row` (mouse click) reads a stale offset and
+    /// resolves the wrong runner once the list scrolls past one screen.
+    pub(crate) table: RefCell<TableState>,
     pub(crate) detail_history: Vec<HistPoint>,
     pub(crate) detail_last_job: Option<JobRow>,
     pub(crate) trend_host: Vec<HostPoint>,
@@ -182,7 +186,7 @@ impl App {
             host: None,
             tab: Tab::Summary,
             drill: None,
-            table,
+            table: RefCell::new(table),
             detail_history: Vec::new(),
             detail_last_job: None,
             trend_host: Vec::new(),
@@ -613,9 +617,9 @@ impl App {
         if !in_x || !in_y {
             return;
         }
-        let idx = self.table.offset() + (row - region.y) as usize;
+        let idx = self.table.borrow().offset() + (row - region.y) as usize;
         if idx < self.runners.len() {
-            self.table.select(Some(idx));
+            self.table.borrow_mut().select(Some(idx));
         }
     }
 
@@ -644,7 +648,8 @@ impl App {
     }
 
     fn enter_detail(&mut self) {
-        if let Some(i) = self.table.selected()
+        let sel = self.table.borrow().selected(); // release the borrow before load_detail
+        if let Some(i) = sel
             && i < self.runners.len()
         {
             self.drill = Some(i);
@@ -657,21 +662,23 @@ impl App {
             return;
         }
         let len = self.runners.len() as i64;
-        let cur = self.table.selected().unwrap_or(0) as i64;
+        let cur = self.table.borrow().selected().unwrap_or(0) as i64;
         self.table
+            .borrow_mut()
             .select(Some((cur + delta).rem_euclid(len) as usize));
     }
 
     fn clamp_selection(&mut self) {
         if self.runners.is_empty() {
-            self.table.select(None);
+            self.table.borrow_mut().select(None);
         } else {
             let i = self
                 .table
+                .borrow()
                 .selected()
                 .unwrap_or(0)
                 .min(self.runners.len() - 1);
-            self.table.select(Some(i));
+            self.table.borrow_mut().select(Some(i));
         }
     }
 

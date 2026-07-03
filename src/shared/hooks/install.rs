@@ -197,6 +197,35 @@ pub(crate) fn render_chain_wrapper(original: &Path, ours: &Path) -> String {
     )
 }
 
+/// Plan one hook slot (started OR completed) for the CHAIN path. Given the
+/// operator's ORIGINAL hook for that slot (if any), our plain script, and where a
+/// chain wrapper would live, decide what to wire into `.env` and what wrapper (if
+/// any) to write:
+/// - original present ⇒ write a wrapper (runs their hook, then ours) and wire the
+///   var at the wrapper;
+/// - original absent ⇒ nothing to chain for THIS slot, so wire our plain script
+///   directly and write no wrapper.
+///
+/// This is what makes chaining a `Foreign` runner that has only ONE of the two
+/// hook vars set safe: the empty slot gets our script directly instead of being
+/// pointed at a wrapper that was never written. Pure — the caller does the I/O.
+pub(crate) fn plan_chain_slot(
+    original: Option<&str>,
+    our_script: &Path,
+    wrapper_path: &Path,
+) -> (PathBuf, Option<(PathBuf, String)>) {
+    match original {
+        Some(o) => (
+            wrapper_path.to_path_buf(),
+            Some((
+                wrapper_path.to_path_buf(),
+                render_chain_wrapper(Path::new(o), our_script),
+            )),
+        ),
+        None => (our_script.to_path_buf(), None),
+    }
+}
+
 /// Remove our three vars (both hook vars + [`EVENT_LOG_VAR`]) from `.env`
 /// content, preserving every other line — the inverse of [`rewrite_env`] for a
 /// runner we installed *fresh* (its pre-install state was [`HookStatus::Unset`]).
@@ -389,6 +418,24 @@ mod tests {
         // or uninstall could strand the operator's hook. (Regression pin.)
         assert!(w.contains(WRAP_MARKER));
         assert_eq!(original_from_wrapper(&w).as_deref(), Some(orig));
+    }
+
+    #[test]
+    fn plan_chain_slot_wraps_when_original_present_else_wires_our_script() {
+        let our = Path::new("/var/lib/ghr-stats/hooks/job-started.sh");
+        let wrapper = Path::new("/var/lib/ghr-stats/hooks/chain-r1-started.sh");
+        // Original present → write a wrapper, wire the wrapper.
+        let (target, w) = plan_chain_slot(Some("/opt/orig.sh"), our, wrapper);
+        assert_eq!(target, wrapper);
+        let (wp, content) = w.expect("a wrapper to write");
+        assert_eq!(wp, wrapper);
+        assert!(content.contains("/opt/orig.sh"));
+        assert!(content.contains("job-started.sh"));
+        // No original (the one-var-Foreign case) → wire our script directly, NO
+        // wrapper (the bug was pointing the var at a wrapper never written).
+        let (target, w) = plan_chain_slot(None, our, wrapper);
+        assert_eq!(target, our);
+        assert!(w.is_none(), "must not fabricate a wrapper with nothing to chain");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::shared::error::Result;
 use crate::shared::hooks::ingest::HookEvent;
-use crate::shared::models::{ApiRunnerRow, HostSample, RunnerSample};
+use crate::shared::models::{ApiRunnerRow, HostSample, JobConclusion, RunnerSample};
 
 /// Persist one tick: all runner rows plus the host row, atomically.
 pub fn write_local(
@@ -170,6 +170,30 @@ pub fn apply_hook_events(
     Ok(())
 }
 
+/// Write resolved job conclusions back to `job_event` (the API reconcile pass).
+/// One transaction; a row that no longer matches (pruned/renamed) is a harmless
+/// no-op. Only fills the conclusion — never touches the hook-owned timing.
+pub fn apply_job_conclusions(conn: &mut Connection, updates: &[JobConclusion]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "UPDATE job_event SET conclusion = ?5 \
+             WHERE run_id = ?1 AND run_attempt = ?2 AND job = ?3 AND runner_name = ?4",
+        )?;
+        for u in updates {
+            stmt.execute(params![
+                u.run_id,
+                u.run_attempt,
+                u.job,
+                u.runner_name,
+                u.conclusion,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +303,53 @@ mod tests {
         let (events, off) = ingest::tail_events(&log1, offsets[&stream1]);
         assert!(events.is_empty());
         assert_eq!(off, offsets[&stream1]);
+    }
+
+    #[test]
+    fn apply_job_conclusions_fills_only_the_matched_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::service::store::schema_for_test(&mut conn);
+        conn.execute(
+            "INSERT INTO job_event (run_id,run_attempt,job,runner_name,started_at,completed_at) \
+             VALUES (7,1,'build','r0',100,150)",
+            [],
+        )
+        .unwrap();
+
+        apply_job_conclusions(
+            &mut conn,
+            &[JobConclusion {
+                run_id: 7,
+                run_attempt: 1,
+                job: "build".into(),
+                runner_name: "r0".into(),
+                conclusion: "success".into(),
+            }],
+        )
+        .unwrap();
+        let c: Option<String> = conn
+            .query_row("SELECT conclusion FROM job_event WHERE run_id=7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(c.as_deref(), Some("success"));
+
+        // A non-matching update is a harmless no-op — no panic, no new row.
+        apply_job_conclusions(
+            &mut conn,
+            &[JobConclusion {
+                run_id: 999,
+                run_attempt: 1,
+                job: "x".into(),
+                runner_name: "y".into(),
+                conclusion: "failure".into(),
+            }],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM job_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

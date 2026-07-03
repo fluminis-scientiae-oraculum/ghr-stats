@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         Some(Command::Config) => crate::ops::wizard::run(config_path.as_deref()),
         // Default (no subcommand) launches the TUI.
         None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()),
-        Some(Command::Serve) => crate::service::serve::run(&load()?),
+        Some(Command::Serve) => crate::service::serve::run(&load()?, config_path.as_deref()),
         Some(Command::Systemd { action }) => crate::ops::systemd::run(action, &load()?),
         Some(Command::Db { action }) => run_db(action, &load()?),
         // Uninstall must work when the config is absent or being removed, so it

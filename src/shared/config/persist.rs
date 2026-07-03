@@ -7,12 +7,43 @@
 //! once you edit via the TUI the file is machine-managed anyway.
 
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use nix::fcntl::{Flock, FlockArg};
 use toml::{Table, Value};
 
 use crate::shared::error::{Error, Result};
+
+/// Load-modify-write a config edit under an advisory exclusive lock spanning the
+/// whole read+write. The CLI wizard, the TUI's direct-write fallback, and the
+/// collector's IPC mutation handler all call these functions on the same file
+/// from independent processes; without the lock two of them could load the same
+/// "before" state and lost-update each other. Best-effort: if the lock can't be
+/// taken (e.g. a non-root run that can't create the sidecar in `/etc`), proceed
+/// rather than fail the edit — the subsequent write will surface any real error.
+fn edit(target: &Path, mutate: impl FnOnce(&mut Table) -> Result<()>) -> Result<()> {
+    let _lock = acquire_lock(target); // held until the fn returns
+    let mut doc = load_table(target)?;
+    mutate(&mut doc)?;
+    write_table(target, &doc)
+}
+
+/// Best-effort exclusive advisory lock on a sidecar `<config>.lock`, released when
+/// the returned guard drops. `None` when it can't be acquired.
+fn acquire_lock(target: &Path) -> Option<Flock<std::fs::File>> {
+    let lock_path = target.with_extension("lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    Flock::lock(file, FlockArg::LockExclusive).ok()
+}
 
 fn load_table(target: &Path) -> Result<Table> {
     if !target.exists() {
@@ -23,33 +54,47 @@ fn load_table(target: &Path) -> Result<Table> {
     toml::from_str(&text).map_err(|e| Error::Config(format!("parsing {}: {e}", target.display())))
 }
 
+/// Write `doc` to `target` atomically: stage it in an exclusive temp file in the
+/// SAME directory (same filesystem → the `rename` is atomic), fsync-free but
+/// crash-safe against torn writes, then rename over the target. A reader — or a
+/// crash — therefore sees either the whole old file or the whole new one, never a
+/// truncated config that has lost every PAT. The staging file is `0600` (it holds
+/// a token) and a random name (no predictable path a symlink could hijack).
 fn write_table(target: &Path, doc: &Table) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).ok();
     let body = toml::to_string_pretty(doc)
         .map_err(|e| Error::Config(format!("serializing config: {e}")))?;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(target)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                Error::Config(format!(
-                    "{} is the root-owned system config — re-run with sudo",
-                    target.display()
-                ))
-            } else {
-                Error::Config(format!("opening {}: {e}", target.display()))
-            }
-        })?;
-    f.write_all(body.as_bytes())
-        .map_err(|e| Error::Config(format!("writing {}: {e}", target.display())))?;
-    // Enforce 0600 even if the file pre-existed with looser perms — it holds a PAT.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ghr-stats-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| stage_err(target, &e))?;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).ok();
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| Error::Config(format!("writing staged config: {e}")))?;
+    tmp.persist(target)
+        .map_err(|e| Error::Config(format!("installing {}: {}", target.display(), e.error)))?;
+    // `rename` keeps the temp's 0600; re-assert defensively (a pre-existing file
+    // with looser perms is fully replaced, so this is belt-and-braces).
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600)).ok();
     Ok(())
+}
+
+/// Map a staging-file I/O error, preserving the "root-owned `/etc` → re-run with
+/// sudo" hint for the common non-root case.
+fn stage_err(target: &Path, e: &std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        Error::Config(format!(
+            "{} is the root-owned system config — re-run with sudo",
+            target.display()
+        ))
+    } else {
+        Error::Config(format!("staging config write for {}: {e}", target.display()))
+    }
 }
 
 /// Descend into (creating as needed) a nested table like `["metrics", "pull"]`.
@@ -69,10 +114,11 @@ fn nested_table<'a>(doc: &'a mut Table, path: &[&str]) -> Result<&'a mut Table> 
 /// Add/replace a per-org read-only PAT under `[github.tokens]` (the native
 /// wizard's write step).
 pub(crate) fn set_org_token(target: &Path, org: &str, token: &str) -> Result<()> {
-    let mut doc = load_table(target)?;
-    nested_table(&mut doc, &["github", "tokens"])?
-        .insert(org.to_string(), Value::String(token.to_string()));
-    write_table(target, &doc)
+    edit(target, |doc| {
+        nested_table(doc, &["github", "tokens"])?
+            .insert(org.to_string(), Value::String(token.to_string()));
+        Ok(())
+    })
 }
 
 /// Set the runner install roots (the CLI wizard's Step 1 result) under
@@ -80,13 +126,14 @@ pub(crate) fn set_org_token(target: &Path, org: &str, token: &str) -> Result<()>
 /// drops an existing PAT, the push config, or custom intervals. Faithful edit,
 /// never a template rewrite.
 pub(crate) fn set_runner_roots(target: &Path, roots: &[PathBuf]) -> Result<()> {
-    let mut doc = load_table(target)?;
-    let arr = roots
-        .iter()
-        .map(|p| Value::String(p.display().to_string()))
-        .collect();
-    doc.insert("runner_roots".to_string(), Value::Array(arr));
-    write_table(target, &doc)
+    edit(target, |doc| {
+        let arr = roots
+            .iter()
+            .map(|p| Value::String(p.display().to_string()))
+            .collect();
+        doc.insert("runner_roots".to_string(), Value::Array(arr));
+        Ok(())
+    })
 }
 
 /// Remove a per-org PAT and forget the org: drop `[github.tokens].<org>`, prune
@@ -94,32 +141,34 @@ pub(crate) fn set_runner_roots(target: &Path, roots: &[PathBuf]) -> Result<()> {
 /// / `[github]` tables. Every other setting is preserved. Faithful edit — the
 /// inverse of [`set_org_token`]. Removing an absent org is a no-op (idempotent).
 pub(crate) fn remove_org_token(target: &Path, org: &str) -> Result<()> {
-    let mut doc = load_table(target)?;
-    if let Some(github) = doc.get_mut("github").and_then(Value::as_table_mut) {
-        if let Some(tokens) = github.get_mut("tokens").and_then(Value::as_table_mut) {
-            tokens.remove(org);
-            if tokens.is_empty() {
-                github.remove("tokens"); // no dangling empty [github.tokens]
+    edit(target, |doc| {
+        if let Some(github) = doc.get_mut("github").and_then(Value::as_table_mut) {
+            if let Some(tokens) = github.get_mut("tokens").and_then(Value::as_table_mut) {
+                tokens.remove(org);
+                if tokens.is_empty() {
+                    github.remove("tokens"); // no dangling empty [github.tokens]
+                }
+            }
+            if github.is_empty() {
+                doc.remove("github");
             }
         }
-        if github.is_empty() {
-            doc.remove("github");
+        if let Some(Value::Array(orgs)) = doc.get_mut("orgs") {
+            orgs.retain(|v| v.as_str() != Some(org));
         }
-    }
-    if let Some(Value::Array(orgs)) = doc.get_mut("orgs") {
-        orgs.retain(|v| v.as_str() != Some(org));
-    }
-    write_table(target, &doc)
+        Ok(())
+    })
 }
 
 /// Toggle + address the Prometheus pull endpoint under `[metrics.pull]` (the
 /// Config tab's `[m]` action). Preserves the address when only toggling.
 pub(crate) fn set_metrics_pull(target: &Path, enabled: bool, addr: &str) -> Result<()> {
-    let mut doc = load_table(target)?;
-    let pull = nested_table(&mut doc, &["metrics", "pull"])?;
-    pull.insert("enabled".to_string(), Value::Boolean(enabled));
-    pull.insert("addr".to_string(), Value::String(addr.to_string()));
-    write_table(target, &doc)
+    edit(target, |doc| {
+        let pull = nested_table(doc, &["metrics", "pull"])?;
+        pull.insert("enabled".to_string(), Value::Boolean(enabled));
+        pull.insert("addr".to_string(), Value::String(addr.to_string()));
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -226,6 +275,40 @@ mod tests {
         remove_org_token(&path, "acme").unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(cfg.github.tokens.is_empty());
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_updates() {
+        use std::sync::Arc;
+        use std::thread;
+        // Eight threads each add a distinct org's PAT to the SAME file at once.
+        // The load-modify-write lock must serialize them; without it a classic
+        // read-modify-write race would drop some. (Same-process threads still
+        // contend: each `acquire_lock` opens its own fd and flock(LOCK_EX).)
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("config.toml"));
+        std::fs::write(&*path, "runner_roots = [\"/srv/r\"]\n").unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = Arc::clone(&path);
+                thread::spawn(move || {
+                    set_org_token(&p, &format!("org{i}"), &format!("github_pat_{i}")).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&*path).unwrap()).unwrap();
+        for i in 0..8 {
+            assert!(
+                cfg.github.tokens.contains_key(&format!("org{i}")),
+                "org{i}'s PAT was lost to a concurrent writer"
+            );
+        }
+        assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/r")]); // untouched
     }
 
     #[test]

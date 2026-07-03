@@ -35,4 +35,7 @@ The collector derives the same per-runner path from each discovered runner's
 install dir, so the writer and the reader can never point at different files.
 
 The collector fills job **timing** from these events; the **conclusion**
-(success/failure) is reconciled from the GitHub API.
+(success/failure) is reconciled from the GitHub Actions API on the next reconcile
+cycle — but only when the org's PAT also carries the fine-grained **"Actions:
+read"** repository permission. A runners-only token can't read run jobs, so
+conclusions simply stay a neutral "done" (timing still shows).

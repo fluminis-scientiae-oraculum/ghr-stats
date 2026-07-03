@@ -148,8 +148,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▌")
         .block(Block::bordered().title(format!(" runners ({}) ", app.runners.len())));
 
-    // Render needs &mut state; TableState is Copy, so copy to keep `app` shared.
-    let mut state = app.table;
+    // Render needs `&mut TableState`; borrow the interior-mutable state so
+    // ratatui's auto-scroll offset is written BACK to `app.table` (not discarded
+    // into a throwaway copy) — that's what keeps click-to-select accurate once the
+    // list scrolls past one screen.
+    let mut state = app.table.borrow_mut();
     f.render_stateful_widget(table, area, &mut state);
 
     // Cache the data-row region (inside the border, below the header) so a click

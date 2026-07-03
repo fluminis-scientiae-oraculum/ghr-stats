@@ -7,7 +7,7 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use crate::service::store::{self, reader};
 use crate::shared::config::{Config, SharedConfig, persist};
 use crate::shared::ipc::{self, ApiRow, Mutation, Query, Request, Response, VERSION};
-use crate::shared::paths::{self, ADMIN_GROUP, Scope};
+use crate::shared::paths::{ADMIN_GROUP, Scope};
 
 /// How often the non-blocking accept loop wakes to re-check the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
@@ -76,7 +76,11 @@ fn uid_in_group(uid: u32, group: &str) -> bool {
 /// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
 /// Holds the [`SharedConfig`] so it can reload the collector's config in-process
 /// after an authorized mutation (making a newly added PAT live without restart).
-pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
+pub fn spawn(
+    shared: &SharedConfig,
+    term: Arc<AtomicBool>,
+    config_path: PathBuf,
+) -> JoinHandle<()> {
     // Bind the socket for the process's own scope — the same scope `systemd
     // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats). The
     // DB path is fixed for the run, so snapshot it once here.
@@ -85,11 +89,11 @@ pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
     let shared = shared.clone();
     thread::Builder::new()
         .name("ipc-server".into())
-        .spawn(move || run(&sock, &db, &shared, &term))
+        .spawn(move || run(&sock, &db, &shared, &term, &config_path))
         .expect("spawn ipc-server")
 }
 
-fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool) {
+fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool, config_path: &Path) {
     let listener = match bind(sock) {
         Ok(l) => l,
         Err(e) => {
@@ -105,14 +109,14 @@ fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool) {
     tracing::info!(sock = %sock.display(), "ipc listening");
 
     let conn = store::open_reader(db);
-    // Authorized mutations write the canonical system config (/etc).
-    let config_path = paths::config_write_target(None);
     while !term.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _addr)) => {
-                // One local client at a low rate — serve inline. A slow client is
-                // bounded by CONN_TIMEOUT, so it can't wedge the accept loop.
-                if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path, shared) {
+                // One local client at a low rate — serve inline. `serve_conn`
+                // polls `term` and drops a stalled/idle connection at the read
+                // timeout, so neither a slow client nor a pending SIGTERM can
+                // wedge the accept loop.
+                if let Err(e) = serve_conn(stream, conn.as_ref(), config_path, shared, term) {
                     tracing::debug!(error = %e, "ipc: connection ended");
                 }
             }
@@ -150,24 +154,39 @@ fn bind(sock: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serve requests on one connection until the client hangs up (EOF) or errors.
-/// A successful mutation triggers an in-process config reload, so a change (e.g.
-/// a newly added PAT) reaches the sampler/reconcile threads without a restart.
+/// Serve requests on one connection until the client hangs up (EOF), the read
+/// times out (a stalled/idle client is dropped rather than held forever), or
+/// shutdown is signalled. Polls `term` between requests so a pending SIGTERM
+/// exits promptly instead of blocking on a connected client; the live TUI
+/// refreshes well inside `CONN_TIMEOUT`, so it is never dropped mid-use, and it
+/// reconnects on the next refresh if it ever is. A successful mutation triggers
+/// an in-process config reload so a change (e.g. a newly added PAT) reaches the
+/// sampler/reconcile threads without a restart.
 fn serve_conn(
     mut stream: UnixStream,
     conn: Option<&Connection>,
     config_path: &Path,
     shared: &SharedConfig,
+    term: &AtomicBool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONN_TIMEOUT))?;
     stream.set_write_timeout(Some(CONN_TIMEOUT))?;
     // Resolve the peer's identity once, from the kernel — used to gate mutations.
     let auth = peer_auth(&stream);
     loop {
+        if term.load(Ordering::SeqCst) {
+            return Ok(()); // shutdown — release the connection so `serve` can exit
+        }
         let req: Request = match ipc::read_frame(&mut stream) {
             Ok(r) => r,
             // Clean client hang-up between requests.
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            // Read timed out: the client sent no complete frame within the window.
+            // Drop it (freeing the accept loop) rather than hold the sole
+            // connection open indefinitely — a would-be local DoS.
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         let resp = handle(&req, conn, auth, config_path);
@@ -214,31 +233,53 @@ fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Pa
     }
 }
 
+/// Upper bound on any read query's `limit`. The IPC is unauthenticated by design
+/// and reachable by any local user (the socket is 0666), so an unclamped `limit`
+/// — `usize::MAX` casts to a negative `i64`, which SQLite treats as "no limit" —
+/// would force a full-table scan + full JSON serialize. Cap it far above any real
+/// history/trend window.
+const MAX_QUERY_LIMIT: usize = 10_000;
+
+/// Clamp a client-supplied query limit to [`MAX_QUERY_LIMIT`]. Pure + tested.
+fn clamped(limit: usize) -> usize {
+    limit.min(MAX_QUERY_LIMIT)
+}
+
 /// Serve a read query. Exhaustive over [`Query`] (a new read variant is a compile
 /// error until handled here — no `unreachable!`). The DB-availability check is
 /// factored into [`with_db`], so only the arms that need the reader carry it;
-/// `ConfiguredTokenOrgs` reads the config file instead.
+/// `ConfiguredTokenOrgs` reads the config file instead. Every `limit` is clamped
+/// to [`MAX_QUERY_LIMIT`] before it reaches the reader.
 fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Response {
     match q {
         // Presence-only view of configured token orgs (config file, not the DB).
         Query::ConfiguredTokenOrgs => {
             Response::ConfiguredTokenOrgs(configured_token_orgs(config_path))
         }
-        Query::HostSeries { limit } => {
-            with_db(conn, |c| wrap(reader::host_series(c, *limit), Response::HostSeries))
-        }
-        Query::BusySeries { limit } => {
-            with_db(conn, |c| wrap(reader::busy_series(c, *limit), Response::BusySeries))
-        }
+        Query::HostSeries { limit } => with_db(conn, |c| {
+            wrap(
+                reader::host_series(c, clamped(*limit)),
+                Response::HostSeries,
+            )
+        }),
+        Query::BusySeries { limit } => with_db(conn, |c| {
+            wrap(
+                reader::busy_series(c, clamped(*limit)),
+                Response::BusySeries,
+            )
+        }),
         Query::RunnerHistory { agent_id, limit } => with_db(conn, |c| {
             wrap(
-                reader::runner_history(c, *agent_id, *limit),
+                reader::runner_history(c, *agent_id, clamped(*limit)),
                 Response::RunnerHistory,
             )
         }),
-        Query::RecentJobs { limit } => {
-            with_db(conn, |c| wrap(reader::recent_jobs(c, *limit), Response::RecentJobs))
-        }
+        Query::RecentJobs { limit } => with_db(conn, |c| {
+            wrap(
+                reader::recent_jobs(c, clamped(*limit)),
+                Response::RecentJobs,
+            )
+        }),
         Query::LatestJob { runner_name } => with_db(conn, |c| {
             wrap(reader::latest_job(c, runner_name), Response::LatestJob)
         }),
@@ -312,6 +353,16 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+
+    #[test]
+    fn query_limit_is_clamped() {
+        // A hostile/huge limit is bounded; `usize::MAX` (which would cast to a
+        // negative i64 = SQLite "no limit") is capped, not passed through.
+        assert_eq!(clamped(5), 5);
+        assert_eq!(clamped(MAX_QUERY_LIMIT), MAX_QUERY_LIMIT);
+        assert_eq!(clamped(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
+        assert_eq!(clamped(usize::MAX), MAX_QUERY_LIMIT);
+    }
 
     fn seeded() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();

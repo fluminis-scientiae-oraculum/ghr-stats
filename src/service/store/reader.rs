@@ -10,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::shared::error::Result;
 use crate::shared::models::{
-    ApiState, BusyPoint, HistPoint, HostPoint, JobRow, Liveness, RunnerSample, RunnerState,
+    ApiState, BusyPoint, HistPoint, HostPoint, JobRow, Liveness, PendingConclusion, RunnerSample,
+    RunnerState,
 };
 
 /// The most recent `limit` samples for a runner, returned oldest → newest so
@@ -179,6 +180,30 @@ pub fn latest_host(conn: &Connection) -> Result<Option<HostPoint>> {
     Ok(host_series(conn, 1)?.pop())
 }
 
+/// Completed jobs whose pass/fail conclusion has not yet been resolved from the
+/// API — the reconcile's work-list. Newest completions first; bounded so a large
+/// backlog is drained a batch at a time. Only rows that carry an `org` + `repo`
+/// (the hook fills these) are returned, since both are needed to call the API.
+pub fn jobs_awaiting_conclusion(conn: &Connection, limit: usize) -> Result<Vec<PendingConclusion>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT org, repo, run_id, run_attempt, job, runner_name FROM job_event \
+         WHERE completed_at IS NOT NULL AND conclusion IS NULL \
+               AND org <> '' AND repo <> '' \
+         ORDER BY completed_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |r| {
+        Ok(PendingConclusion {
+            org: r.get(0)?,
+            repo: r.get(1)?,
+            run_id: r.get(2)?,
+            run_attempt: r.get(3)?,
+            job: r.get(4)?,
+            runner_name: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// `(total job_event rows, in-flight rows)` — jobs whose `completed_at` is NULL.
 pub fn job_counts(conn: &Connection) -> Result<(i64, i64)> {
     conn.query_row(
@@ -344,6 +369,46 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m["/srv/runners/runner-01/.ghr-stats-events.ndjson"], 40);
         assert_eq!(m["/srv/runners/runner-02/.ghr-stats-events.ndjson"], 128);
+    }
+
+    #[test]
+    fn jobs_awaiting_conclusion_only_completed_null_with_org_and_repo() {
+        let conn = mem_db();
+        // completed, no conclusion, has org+repo → the work-list.
+        conn.execute(
+            "INSERT INTO job_event (run_id,run_attempt,job,repo,org,runner_name,started_at,completed_at) \
+             VALUES (1,1,'build','o/x','o','r',10,20)",
+            [],
+        )
+        .unwrap();
+        // completed but already concluded → excluded.
+        conn.execute(
+            "INSERT INTO job_event (run_id,run_attempt,job,repo,org,runner_name,started_at,completed_at,conclusion) \
+             VALUES (2,1,'t','o/x','o','r',10,20,'success')",
+            [],
+        )
+        .unwrap();
+        // still running → excluded.
+        conn.execute(
+            "INSERT INTO job_event (run_id,run_attempt,job,repo,org,runner_name,started_at) \
+             VALUES (3,1,'run','o/x','o','r',10)",
+            [],
+        )
+        .unwrap();
+        // completed but no org/repo (can't call the API) → excluded.
+        conn.execute(
+            "INSERT INTO job_event (run_id,run_attempt,job,runner_name,started_at,completed_at) \
+             VALUES (4,1,'x','r',10,20)",
+            [],
+        )
+        .unwrap();
+
+        let p = jobs_awaiting_conclusion(&conn, 10).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            (p[0].run_id, p[0].job.as_str(), p[0].repo.as_str(), p[0].org.as_str()),
+            (1, "build", "o/x", "o")
+        );
     }
 
     #[test]
