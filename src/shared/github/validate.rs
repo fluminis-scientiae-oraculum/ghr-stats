@@ -15,8 +15,8 @@ use super::list_org_runners;
 
 const FINE_PREFIX: &str = "github_pat_";
 const CLASSIC_PREFIXES: [&str; 5] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
-const GUIDANCE: &str =
-    "use a FINE-GRAINED token (github_pat_…) with Organization → Self-hosted runners: Read";
+const GUIDANCE: &str = "use a FINE-GRAINED token (github_pat_…) with Organization → \
+     Self-hosted runners: Read (+ Repository → Actions: Read for job results)";
 
 /// The result of validating a PAT for an org.
 pub(crate) enum Verdict {

@@ -53,7 +53,9 @@ pub enum Command {
     #[command(
         long_about = "Consent-first interactive configuration — run with sudo. Four steps — \
         discover runners under a root you choose, add read-only fine-grained PATs per org \
-        (validated before saving), optionally enable Prometheus metrics, and write the \
+        (validated before saving; each needs Organization → Self-hosted runners: Read, plus \
+        Repository → Actions: Read if you want job success/failure filled in the Jobs view), \
+        optionally enable Prometheus metrics, and write the \
         root-owned 0600 system config at /etc/ghr-stats/config.toml (the collector's single \
         source of truth) — then offers to install/repair each runner's job hooks, detect-first \
         and never clobbering a foreign hook (it chains after it or prints a snippet instead). \

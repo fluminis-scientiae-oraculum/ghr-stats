@@ -1,5 +1,5 @@
 ---
-source: src/tui/wizard.rs
+source: src/tui/widgets/wizard.rs
 expression: render(&mode)
 ---
 "                                                                                "
@@ -13,10 +13,10 @@ expression: render(&mode)
 "                │  org  example-org                            │                "
 "                │  Fine-grained PAT (github_pat_…):            │                "
 "                │•••••••••••••••                               │                "
+"                │  needs Self-hosted runners: Read  (+ Actions:│                "
+"                │Read for job results)                         │                "
 "                │  ✗ token lacks 'Self-hosted runners: Read' on│                "
 "                │example-org                                   │                "
-"                │                                              │                "
-"                │  [Enter] validate · [Esc] cancel             │                "
 "                │                                              │                "
 "                └──────────────────────────────────────────────┘                "
 "                                                                                "

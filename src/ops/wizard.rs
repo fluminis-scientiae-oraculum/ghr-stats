@@ -29,7 +29,10 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     println!("ghr-stats config\n");
     println!("This will, only after you confirm each step:");
     println!("  • read each runner's .runner under the root you choose");
-    println!("  • optionally validate a read-only fine-grained PAT per org");
+    println!(
+        "  • optionally validate a read-only fine-grained PAT per org \
+         (Self-hosted runners: Read; + Actions: Read for job results)"
+    );
     println!("  • optionally enable Prometheus metrics");
     println!(
         "  • optionally install/repair the runner job hooks (never clobbering an existing one)"
@@ -70,6 +73,11 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     // 2) Per-org read-only PAT: add / replace / remove (bounded validation). We
     // read which orgs already have a PAT so each one offers the right action.
     println!("\n── Step 2 of 4 · Read-only GitHub PATs (optional) ──");
+    println!(
+        "  Fine-grained PAT per org. Required: Organization → Self-hosted runners → Read-only.\n  \
+         Optional: Repository → Actions → Read-only (fills each job's success/failure — needs\n  \
+         repo access set to All/selected repos, NOT \"Public repositories\")."
+    );
     let existing = existing_token_orgs(&target);
     let plan = manage_tokens(&theme, &discovered, &existing)?;
 
@@ -212,7 +220,7 @@ fn manage_tokens(
     if candidates.is_empty()
         || !confirm(
             theme,
-            "Manage read-only GitHub PATs now? (add / replace / remove; needs 'Self-hosted runners: Read')",
+            "Manage read-only GitHub PATs now? (add / replace / remove; needs 'Self-hosted runners: Read', + 'Actions: Read' for job results)",
             false,
         )?
     {

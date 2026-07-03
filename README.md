@@ -149,9 +149,21 @@ fine-grained PAT is scoped to one resource owner):
 
 1. GitHub → Settings → Developer settings → Personal access tokens →
    Fine-grained tokens → Generate.
-2. Resource owner: the **organization**. Repository access: none.
-3. Organization permissions → **Self-hosted runners → Read-only** (only this).
-4. Bounded expiration; approve if the org requires it.
+2. Resource owner: the **organization**.
+3. Organization permissions → **Self-hosted runners → Read-only** — **required**
+   (runner online/busy).
+4. Repository permissions → **Actions → Read-only** — **optional**: lets the
+   collector fill each finished job's **success/failure** in the Jobs view.
+   Without it, jobs still show timing, just a neutral "done".
+5. Bounded expiration; approve if the org requires it.
+
+> **Note on repository access.** The **Actions** permission only appears when
+> "Repository access" is **All repositories** or **Only select repositories** —
+> the **"Public repositories"** option is a fixed read-only scope that exposes no
+> repository permissions (and can't see private repos, where self-hosted runners
+> usually live). Pick All/selected repos to get "Actions: Read". The
+> **Self-hosted runners** permission is organization-scoped and independent of
+> this.
 
 The wizard requires the `github_pat_` prefix and rejects classic tokens with a
 pointer to the right token type. Tokens are stored under `[github.tokens]`

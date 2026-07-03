@@ -356,6 +356,10 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
                     ),
                 ]),
                 input_line("Fine-grained PAT (github_pat_…)", &w.state.pat, true),
+                Line::from(Span::styled(
+                    "  needs Self-hosted runners: Read  (+ Actions: Read for job results)",
+                    Style::new().fg(Color::DarkGray),
+                )),
             ];
             if let Some(err) = &w.state.error {
                 lines.push(Line::from(Span::styled(
