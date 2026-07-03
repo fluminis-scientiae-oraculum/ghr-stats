@@ -2,6 +2,8 @@
 name = "ghr-stats"
 version = "0.1.0"
 edition = "2024"
+# MSRV: edition 2024 needs 1.85; stable `let`-chains (used in a few places) need 1.88.
+rust-version = "1.88"
 description = "Live TUI + collector service (history, jobs, Prometheus) for self-hosted GitHub Actions runner fleets"
 authors = ["Aditya Kresna <https://github.com/Ujang360>"]
 license = "MIT"
@@ -9,6 +11,10 @@ repository = "https://github.com/fluminis-scientiae-oraculum/ghr-stats"
 readme = "README.md"
 keywords = ["github-actions", "self-hosted", "runner", "tui", "prometheus"]
 categories = ["command-line-utilities", "development-tools"]
+# Keep internal dev/tooling files out of the published tarball. `.fso-amem/`
+# carries an internal server URL; `.cargo/config.toml` pins target-cpu (a footgun
+# if a downstream builds from the extracted tarball on an older CPU).
+exclude = [".fso-amem/", ".cargo/"]
 
 [[bin]]
 name = "ghr-stats"
