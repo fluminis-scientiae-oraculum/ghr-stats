@@ -36,16 +36,41 @@ use crate::shared::config::Config;
 const REFRESH: Duration = Duration::from_millis(2000);
 
 /// Set up the terminal, run the event loop, and always restore on exit.
-/// `ratatui::init` also installs a panic hook that restores the terminal.
+/// `ratatui::init` installs a panic hook that restores the terminal — but only
+/// raw mode + the alternate screen, NOT mouse capture (which we enable below,
+/// outside ratatui's knowledge). The `MouseCapture` guard closes that gap so a
+/// panic can't strand the terminal in mouse-reporting mode.
 /// `config_path` is the resolved `--config` override (if any) — threaded so the
 /// native config wizard writes back to the same file the run loaded.
 pub fn run(cfg: &Config, config_path: Option<&Path>) -> Result<()> {
     let mut terminal = ratatui::init();
-    let _ = execute!(stdout(), EnableMouseCapture);
+    let mouse = MouseCapture::enable();
     let result = event_loop(&mut terminal, cfg, config_path);
-    let _ = execute!(stdout(), DisableMouseCapture);
+    drop(mouse); // release capture BEFORE ratatui leaves the alt screen (normal path)
     ratatui::restore();
     result
+}
+
+/// RAII guard for terminal mouse capture, enabled OUTSIDE ratatui's lifecycle.
+/// The panic hook `ratatui::init` installs restores only raw mode + the alternate
+/// screen — it never disables mouse capture, so a panic would otherwise strand the
+/// terminal (and any multiplexer pane, e.g. tmux/zellij) reporting mouse events.
+/// Emitting `DisableMouseCapture` from `Drop` makes teardown fire on unwind as
+/// well as on the normal return path. crossterm's mouse toggles are idempotent,
+/// matching the assumption the `Suspension` guard in `input::screen` relies on.
+struct MouseCapture;
+
+impl MouseCapture {
+    fn enable() -> Self {
+        let _ = execute!(stdout(), EnableMouseCapture);
+        MouseCapture
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableMouseCapture);
+    }
 }
 
 /// What an input handler decides the loop should do next.
