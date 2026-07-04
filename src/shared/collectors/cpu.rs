@@ -90,8 +90,8 @@ mod tests {
         // apart in the same tick, the shape that produced the 785% bug when a
         // single shared `agentId` key alternated between two different counters.
         let mut t = CpuRateTracker::<PathBuf>::new();
-        let a = PathBuf::from("/srv/ghr/gpo_03"); // cumulative ~20_000_000 µs
-        let b = PathBuf::from("/srv/ghr/ujang_kkp"); // cumulative ~99_000_000 µs
+        let a = PathBuf::from("/srv/runners/org-a-runner-1"); // cumulative ~20_000_000 µs
+        let b = PathBuf::from("/srv/runners/org-b-runner-1"); // cumulative ~99_000_000 µs
         let t0 = Instant::now();
 
         // First tick: both seed, both None (no prior observation).
