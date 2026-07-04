@@ -1,4 +1,4 @@
-//! Bounded PAT validation. MECE (plan §5a/S4): require a fine-grained
+//! Bounded PAT validation: require a fine-grained
 //! `github_pat_` token, then confirm it can read the org's runners and that they
 //! match locally-discovered runners by agentId. Reject anything else with the
 //! exact minimal-permission guidance.

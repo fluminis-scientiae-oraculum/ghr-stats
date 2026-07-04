@@ -1,7 +1,7 @@
 [package]
 # crates.io crate name; the installed binary stays `ghr-stats` (see [[bin]]).
 name = "fso-ghr-stats"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # MSRV: edition 2024 needs 1.85; stable `let`-chains (used in a few places) need 1.88.
 rust-version = "1.88"
@@ -49,7 +49,7 @@ walkdir = "2.5.0"
 insta = "1"
 
 # Distribution build. NB: do NOT pin `target-cpu` here — it would break others'
-# `cargo install`. The static-musl x86-64-v2 build sets it via RUSTFLAGS (P9).
+# `cargo install`. The static-musl x86-64-v2 build sets it via RUSTFLAGS.
 [profile.release]
 lto = "thin"
 codegen-units = 1

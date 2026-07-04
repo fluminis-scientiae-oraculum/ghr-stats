@@ -11,7 +11,7 @@
 //! [`config_write_target`]) — one root-owned source of truth for the collector,
 //! never duplicated per-user (secrets live there once). Only the data / runtime
 //! / unit / binary paths are scope-derived. Data dirs are never mixed across
-//! scopes (plan §2/S9) — the one deliberate exception is the TUI's IPC client,
+//! scopes — the one deliberate exception is the TUI's IPC client,
 //! which may `connect` to another scope's collector socket to read (only)
 //! derived fleet stats, so a non-root dashboard can observe a root system
 //! service without ever touching its `/var/lib` database.
@@ -84,7 +84,7 @@ impl Scope {
     }
 
     /// Absolute install path for the binary, so a `systemd install` unit and a
-    /// later `sudo ghr-stats` resolve the same file (the sudo-PATH gap, #8).
+    /// later `sudo ghr-stats` resolve the same file (the sudo-PATH gap).
     pub fn bin_path(self) -> PathBuf {
         match self {
             Scope::System => PathBuf::from("/usr/local/bin/ghr-stats"),

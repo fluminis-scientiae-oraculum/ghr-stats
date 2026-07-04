@@ -164,11 +164,17 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
 }
 
 fn route_mouse(mode: ScreenState, app: &mut App, m: MouseEvent) -> Next {
-    // Only browsing handles mouse (tab clicks / scroll); confirm/suspended ignore.
-    if let ScreenState::Browsing(_) = mode {
-        app.on_mouse(m);
+    // Only browsing handles mouse (tab/footer clicks, scroll); confirm/suspended
+    // ignore. A click that resolves to a key — a footer hint, or a double-click
+    // on a row — is dispatched through the SAME path as the keyboard (`route_key`),
+    // so footer buttons and double-click reuse every existing action.
+    if !matches!(mode, ScreenState::Browsing(_)) {
+        return Next::Mode(mode);
     }
-    Next::Mode(mode)
+    match app.on_mouse(m) {
+        Some(code) => route_key(mode, app, code),
+        None => Next::Mode(mode),
+    }
 }
 
 /// Suspend ratatui, run the action on the real TTY, resume. Only the loop can do
