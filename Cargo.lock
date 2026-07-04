@@ -682,6 +682,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "fso-ghr-stats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossbeam-channel",
+ "ctrlc",
+ "dialoguer",
+ "insta",
+ "mimalloc",
+ "nix 0.31.3",
+ "ratatui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiny_http",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tui-input",
+ "ureq",
+ "uzers",
+ "walkdir",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -747,35 +776,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
-]
-
-[[package]]
-name = "ghr-stats"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossbeam-channel",
- "ctrlc",
- "dialoguer",
- "insta",
- "mimalloc",
- "nix 0.31.3",
- "ratatui",
- "rusqlite",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.18",
- "tiny_http",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tui-input",
- "ureq",
- "uzers",
- "walkdir",
 ]
 
 [[package]]
