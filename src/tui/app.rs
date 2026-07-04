@@ -137,8 +137,9 @@ pub(crate) struct App {
     /// Derives per-runner CPU% from cgroup-usage deltas between ticks.
     cpu: CpuRateTracker,
     /// Per-runner liveness edge `(current, since_ts)`, tracked in-memory so
-    /// "idle/active for <dur>" works standalone (no `serve`/DB needed).
-    edges: HashMap<i64, (Liveness, i64)>,
+    /// "idle/active for <dur>" works standalone (no `serve`/DB needed). Keyed by
+    /// install `dir` (locally unique) — agentId collides across orgs.
+    edges: HashMap<String, (Liveness, i64)>,
     pub(crate) runners: Vec<LiveRunner>,
     pub(crate) host: Option<HostPoint>,
     pub(crate) tab: Tab,
@@ -154,7 +155,7 @@ pub(crate) struct App {
     pub(crate) trend_host: Vec<HostPoint>,
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
-    pub(crate) api_state: HashMap<i64, ApiState>,
+    pub(crate) api_state: HashMap<(String, i64), ApiState>,
     /// Org logins with a configured read-only PAT. In Persistent mode this is the
     /// collector's authoritative view of the root-owned /etc config (presence
     /// only, no tokens); in Ephemeral mode it falls back to this run's loaded cfg.
@@ -293,7 +294,8 @@ impl App {
                 // config write (root ⇒ ok, else a "re-run with sudo" error).
                 let apply = |op: wizard::TokenOp| -> Result<(), String> {
                     match op {
-                        wizard::TokenOp::Set { org, token } => match source.add_org_token(org, token)
+                        wizard::TokenOp::Set { org, token } => match source
+                            .add_org_token(org, token)
                         {
                             MutateOutcome::Mutated => Ok(()),
                             MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
@@ -357,14 +359,12 @@ impl App {
         let result = match self.source.set_metrics_pull(enabled, &addr) {
             MutateOutcome::Mutated => Ok(()),
             MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
-            MutateOutcome::Unreachable => {
-                crate::shared::config::persist::set_metrics_pull(
-                    &self.config_target(),
-                    enabled,
-                    &addr,
-                )
-                .map_err(|e| e.to_string())
-            }
+            MutateOutcome::Unreachable => crate::shared::config::persist::set_metrics_pull(
+                &self.config_target(),
+                enabled,
+                &addr,
+            )
+            .map_err(|e| e.to_string()),
         };
         match result {
             Ok(()) => {
@@ -442,10 +442,17 @@ impl App {
         let (mut busy, mut online) = (0u32, 0u32);
         for p in snap.runners {
             let id = p.info.agent_id;
-            let cpu_pct = self.cpu.rate(id, p.cpu_usage_usec, sampled_at);
+            // Local identity is the install dir (locally unique), NOT agent_id —
+            // agentId collides across orgs, which cross-contaminated CPU, the
+            // liveness edge, and the sparkline ring. Key all per-runner local
+            // state by `dirkey`; join GitHub's view by `(org, agent_id)`.
+            let dirkey = p.info.dir.to_string_lossy().into_owned();
+            let cpu_pct = self
+                .cpu
+                .rate(p.info.dir.clone(), p.cpu_usage_usec, sampled_at);
             // Feed the Ephemeral-mode sparkline ring from the same live sample.
             self.rings.push_runner(
-                id,
+                dirkey.clone(),
                 HistPoint {
                     ts: now,
                     cpu_pct,
@@ -461,21 +468,21 @@ impl App {
                 Liveness::Offline => {}
             }
             // In-memory liveness edge: keep `since` while unchanged, else now.
-            let edge_since = match self.edges.get(&id) {
+            let edge_since = match self.edges.get(&dirkey) {
                 Some((prev, since)) if *prev == p.liveness => *since,
                 _ => now,
             };
-            edges.insert(id, (p.liveness, edge_since));
+            edges.insert(dirkey.clone(), (p.liveness, edge_since));
             // Prefer the collector's persisted edge (survives TUI restarts) when it
             // agrees with the live-sampled liveness; else the in-memory edge
             // (Ephemeral, or a transition the collector hasn't persisted yet).
-            let since = pick_since(persisted.get(&id), p.liveness, edge_since);
+            let since = pick_since(persisted.get(&dirkey), p.liveness, edge_since);
             runners.push(LiveRunner {
                 liveness: p.liveness,
                 cpu_pct,
                 mem_bytes: p.mem_bytes,
                 uptime_s: p.uptime_s,
-                gh: api.get(&id).copied(),
+                gh: api.get(&(p.info.org.clone(), id)).copied(),
                 state_seconds: Some((now - since).max(0)),
                 hook: install::detect_in(&p.info.dir, &our_dirs),
                 work_folder: p.info.work_folder,
@@ -683,12 +690,17 @@ impl App {
     }
 
     fn load_detail(&mut self) {
-        let Some((id, name)) = self.detail_runner().map(|r| (r.agent_id, r.name.clone())) else {
+        let Some((dir, name)) = self
+            .detail_runner()
+            .map(|r| (r.dir.to_string_lossy().into_owned(), r.name.clone()))
+        else {
             self.detail_history.clear();
             self.detail_last_job = None;
             return;
         };
-        self.detail_history = self.source.runner_history(&self.rings, id, HISTORY_POINTS);
+        self.detail_history = self
+            .source
+            .runner_history(&self.rings, &dir, HISTORY_POINTS);
         self.detail_last_job = self.source.latest_job(&name);
     }
 
@@ -719,7 +731,7 @@ mod tests {
 
     fn state(liveness: Liveness, since_ts: i64) -> RunnerState {
         RunnerState {
-            agent_id: 1,
+            dir: "/srv/r1".into(),
             liveness,
             since_ts,
             last_seen_ts: since_ts,

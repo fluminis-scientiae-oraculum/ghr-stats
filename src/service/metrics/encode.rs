@@ -71,10 +71,10 @@ impl Snapshot {
                     Liveness::Offline => offline += 1,
                 }
                 let state_seconds = states
-                    .get(&r.agent_id)
+                    .get(&r.dir)
                     .map(|s| (now - s.since_ts).max(0))
                     .unwrap_or(0);
-                let gh = api.get(&r.agent_id);
+                let gh = api.get(&(r.org.clone(), r.agent_id));
                 RunnerMetric {
                     agent_id: r.agent_id,
                     name: r.name,
@@ -272,15 +272,15 @@ mod tests {
         crate::service::store::schema_for_test(&mut c);
         for (id, name, live) in [(1, "r1", "busy"), (2, "r2", "idle")] {
             c.execute(
-                "INSERT INTO runner_sample (ts,agent_id,name,org,liveness,cpu_pct,mem_bytes) \
-                 VALUES (1000,?1,?2,'acme',?3,12.5,1048576)",
-                params![id, name, live],
+                "INSERT INTO runner_sample (ts,agent_id,name,org,liveness,cpu_pct,mem_bytes,dir) \
+                 VALUES (1000,?1,?2,'acme',?3,12.5,1048576,?4)",
+                params![id, name, live, format!("/srv/{name}")],
             )
             .unwrap();
         }
         c.execute(
-            "INSERT INTO runner_state (agent_id,liveness,since_ts,last_seen_ts) \
-             VALUES (1,'busy',900,1000)",
+            "INSERT INTO runner_state (dir,liveness,since_ts,last_seen_ts) \
+             VALUES ('/srv/r1','busy',900,1000)",
             [],
         )
         .unwrap();

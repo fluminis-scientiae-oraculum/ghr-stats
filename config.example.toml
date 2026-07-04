@@ -29,6 +29,13 @@ api_secs = 60
 # ── GitHub API (optional, read-only) ───────────────────────────────────────
 # Runner online/busy reconcile; `ghr-stats config` validates each token.
 #
+# ORGANIZATION runners only: the reconcile calls /orgs/{org}/actions/runners,
+# gated by the ORG-scoped "Self-hosted runners" fine-grained-PAT permission —
+# which exists only on an organization resource owner. Personal-account
+# (repository-level) self-hosted runners have no equivalent PAT permission, so
+# they get no GitHub online/busy reconcile; they are still sampled locally
+# (liveness / CPU / memory / uptime — no PAT needed).
+#
 # Create a FINE-GRAINED personal access token PER ORG (a fine-grained PAT is
 # scoped to one resource owner):
 #   GitHub → Settings → Developer settings → Personal access tokens →

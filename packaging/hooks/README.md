@@ -8,7 +8,7 @@ best-effort and always exit 0 — they can never fail a job.
 
 Each runner writes its **own** log, a dotfile in its install-dir root:
 
-```
+```text
 <runner-install-dir>/.ghr-stats-events.ndjson
 ```
 

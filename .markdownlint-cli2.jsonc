@@ -1,0 +1,19 @@
+{
+  // markdownlint-cli2 config. `config` holds the rule set; `ignores` scopes the
+  // file walk (so a local `**/*.md` run doesn't lint the packaged copies under
+  // the gitignored target/ dir — CI never checks those out anyway).
+  "config": {
+    // All default rules on, with one relaxation:
+    "default": true,
+    // Line length: 80 → 100. The docs are hand-wrapped near 80; 100 keeps that
+    // discipline while allowing the occasional longer line without noise. Code
+    // fences (ASCII TUI mockups) and tables are exempt — wrapping them is worse
+    // than letting them run wide.
+    "MD013": {
+      "line_length": 100,
+      "code_blocks": false,
+      "tables": false
+    }
+  },
+  "ignores": ["target/**"]
+}

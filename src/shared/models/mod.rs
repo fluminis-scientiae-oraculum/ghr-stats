@@ -2,8 +2,12 @@
 //!
 //! Runner identity comes from each runner's own `.runner` config file
 //! (authoritative) plus the owning OS user of its install directory — never
-//! from parsing systemd unit names. The numeric `agent_id` is the stable join
-//! key to the GitHub API.
+//! from parsing systemd unit names. Two identities matter and must not be
+//! confused: the install `dir` is the LOCALLY-unique key (one per runner on a
+//! host), while the numeric `agent_id` is GitHub's runner id — unique only
+//! *within* an org, so it joins to the API as `(org, agent_id)`. Keying local
+//! state (CPU rate, liveness edge) by `agent_id` alone conflates two runners in
+//! different orgs that were assigned the same id; key those by `dir`.
 
 use std::path::PathBuf;
 
@@ -70,6 +74,9 @@ impl Liveness {
 pub struct RunnerSample {
     pub ts: i64,
     pub agent_id: i64,
+    /// Install directory as a string — the runner's locally-unique identity
+    /// (agentId collides across orgs). Joins to `runner_state`.
+    pub dir: String,
     pub name: String,
     pub org: String,
     pub liveness: Liveness,
@@ -81,10 +88,11 @@ pub struct RunnerSample {
 
 /// Current per-runner liveness plus the timestamp of the last liveness *change*
 /// (the "edge"). One row per runner, upserted by the writer; survives restarts,
-/// so "Idle/Active for <dur>" = `now - since_ts`.
+/// so "Idle/Active for <dur>" = `now - since_ts`. Keyed by the install `dir`
+/// (locally unique) — NOT agentId, which collides across orgs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerState {
-    pub agent_id: i64,
+    pub dir: String,
     pub liveness: Liveness,
     pub since_ts: i64,
     pub last_seen_ts: i64,

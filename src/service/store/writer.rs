@@ -16,8 +16,8 @@ pub fn write_local(
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO runner_sample \
-             (ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for r in runners {
             stmt.execute(params![
@@ -30,6 +30,7 @@ pub fn write_local(
                 r.cpu_pct.map(|v| v as f64),
                 r.mem_bytes.map(|v| v as i64),
                 r.uptime_s.map(|v| v as i64),
+                r.dir,
             ])?;
         }
     }
@@ -57,16 +58,16 @@ pub fn write_local(
     // the single-writer connection makes the read-compare-write race-free.
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO runner_state (agent_id, liveness, since_ts, last_seen_ts) \
+            "INSERT INTO runner_state (dir, liveness, since_ts, last_seen_ts) \
              VALUES (?1, ?2, ?3, ?3) \
-             ON CONFLICT(agent_id) DO UPDATE SET \
+             ON CONFLICT(dir) DO UPDATE SET \
                  since_ts = CASE WHEN runner_state.liveness = excluded.liveness \
                                  THEN runner_state.since_ts ELSE excluded.since_ts END, \
                  liveness = excluded.liveness, \
                  last_seen_ts = excluded.last_seen_ts",
         )?;
         for r in runners {
-            stmt.execute(params![r.agent_id, r.liveness.as_str(), r.ts])?;
+            stmt.execute(params![r.dir, r.liveness.as_str(), r.ts])?;
         }
     }
 
@@ -274,8 +275,8 @@ mod tests {
         crate::service::store::schema_for_test(&mut conn);
 
         // Collector tail loop: one (stream, offset) per runner log.
-        let mut offsets: std::collections::HashMap<String, u64> = reader::ingest_offsets(&conn)
-            .unwrap();
+        let mut offsets: std::collections::HashMap<String, u64> =
+            reader::ingest_offsets(&conn).unwrap();
         for log in [&log1, &log2] {
             let stream = log.to_string_lossy().into_owned();
             let start = offsets.get(&stream).copied().unwrap_or(0);
@@ -295,7 +296,10 @@ mod tests {
         // Offsets advanced per stream, independently, and are persisted.
         let persisted = reader::ingest_offsets(&conn).unwrap();
         assert_eq!(persisted.len(), 2);
-        assert_eq!(persisted[&log1.to_string_lossy().into_owned()], offsets[&log1.to_string_lossy().into_owned()]);
+        assert_eq!(
+            persisted[&log1.to_string_lossy().into_owned()],
+            offsets[&log1.to_string_lossy().into_owned()]
+        );
         assert!(persisted[&log1.to_string_lossy().into_owned()] > 0);
 
         // A second tail from the advanced offsets yields nothing new (idempotent).
@@ -407,6 +411,7 @@ mod tests {
         let sample = |ts, live| RunnerSample {
             ts,
             agent_id: 1,
+            dir: "/srv/r1".into(),
             name: "r".into(),
             org: "o".into(),
             liveness: live,
@@ -421,7 +426,7 @@ mod tests {
         write_local(&mut conn, &[sample(200, Liveness::Idle)], &host).unwrap();
         let (live, since): (String, i64) = conn
             .query_row(
-                "SELECT liveness, since_ts FROM runner_state WHERE agent_id=1",
+                "SELECT liveness, since_ts FROM runner_state WHERE dir='/srv/r1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -432,7 +437,7 @@ mod tests {
         write_local(&mut conn, &[sample(300, Liveness::Busy)], &host).unwrap();
         let (live, since, seen): (String, i64, i64) = conn
             .query_row(
-                "SELECT liveness, since_ts, last_seen_ts FROM runner_state WHERE agent_id=1",
+                "SELECT liveness, since_ts, last_seen_ts FROM runner_state WHERE dir='/srv/r1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )

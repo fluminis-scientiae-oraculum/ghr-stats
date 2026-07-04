@@ -76,11 +76,7 @@ fn uid_in_group(uid: u32, group: &str) -> bool {
 /// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
 /// Holds the [`SharedConfig`] so it can reload the collector's config in-process
 /// after an authorized mutation (making a newly added PAT live without restart).
-pub fn spawn(
-    shared: &SharedConfig,
-    term: Arc<AtomicBool>,
-    config_path: PathBuf,
-) -> JoinHandle<()> {
+pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>, config_path: PathBuf) -> JoinHandle<()> {
     // Bind the socket for the process's own scope — the same scope `systemd
     // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats). The
     // DB path is fixed for the run, so snapshot it once here.
@@ -184,7 +180,12 @@ fn serve_conn(
             // Read timed out: the client sent no complete frame within the window.
             // Drop it (freeing the accept loop) rather than hold the sole
             // connection open indefinitely — a would-be local DoS.
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -268,9 +269,9 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Resp
                 Response::BusySeries,
             )
         }),
-        Query::RunnerHistory { agent_id, limit } => with_db(conn, |c| {
+        Query::RunnerHistory { dir, limit } => with_db(conn, |c| {
             wrap(
-                reader::runner_history(c, *agent_id, clamped(*limit)),
+                reader::runner_history(c, dir, clamped(*limit)),
                 Response::RunnerHistory,
             )
         }),
@@ -287,7 +288,11 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Resp
             wrap(reader::latest_api_runners(c), |m| {
                 Response::LatestApiRunners(
                     m.into_iter()
-                        .map(|(agent_id, state)| ApiRow { agent_id, state })
+                        .map(|((org, agent_id), state)| ApiRow {
+                            agent_id,
+                            org,
+                            state,
+                        })
                         .collect(),
                 )
             })
@@ -315,7 +320,11 @@ fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
     };
     match result {
         Ok(()) => {
-            tracing::info!(peer_uid = auth.uid, action = m.action(), "ipc: config mutated");
+            tracing::info!(
+                peer_uid = auth.uid,
+                action = m.action(),
+                "ipc: config mutated"
+            );
             Response::Mutated
         }
         Err(e) => Response::Error(e.to_string()),
@@ -377,9 +386,18 @@ mod tests {
     }
 
     // Auth fixtures + a config path reads never touch.
-    const ROOT: Auth = Auth { uid: 0, in_admin_group: false };
-    const MEMBER: Auth = Auth { uid: 1000, in_admin_group: true };
-    const NOBODY: Auth = Auth { uid: 1000, in_admin_group: false };
+    const ROOT: Auth = Auth {
+        uid: 0,
+        in_admin_group: false,
+    };
+    const MEMBER: Auth = Auth {
+        uid: 1000,
+        in_admin_group: true,
+    };
+    const NOBODY: Auth = Auth {
+        uid: 1000,
+        in_admin_group: false,
+    };
     fn noconf() -> PathBuf {
         PathBuf::from("/nonexistent/ghr-stats-unused.toml")
     }
@@ -402,7 +420,12 @@ mod tests {
     #[test]
     fn data_request_without_db_is_an_error_not_a_panic() {
         assert!(matches!(
-            handle(&Request::Query(Query::HostSeries { limit: 5 }), None, ROOT, &noconf()),
+            handle(
+                &Request::Query(Query::HostSeries { limit: 5 }),
+                None,
+                ROOT,
+                &noconf()
+            ),
             Response::Error(_)
         ));
     }
@@ -430,7 +453,12 @@ mod tests {
             [],
         )
         .unwrap();
-        match handle(&Request::Query(Query::LatestApiRunners), Some(&conn), ROOT, &noconf()) {
+        match handle(
+            &Request::Query(Query::LatestApiRunners),
+            Some(&conn),
+            ROOT,
+            &noconf(),
+        ) {
             Response::LatestApiRunners(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 9);
@@ -444,15 +472,20 @@ mod tests {
     fn runner_states_returns_persisted_edges() {
         let conn = seeded();
         conn.execute(
-            "INSERT INTO runner_state (agent_id, liveness, since_ts, last_seen_ts) \
-             VALUES (7, 'busy', 500, 900)",
+            "INSERT INTO runner_state (dir, liveness, since_ts, last_seen_ts) \
+             VALUES ('/srv/r7', 'busy', 500, 900)",
             [],
         )
         .unwrap();
-        match handle(&Request::Query(Query::RunnerStates), Some(&conn), ROOT, &noconf()) {
+        match handle(
+            &Request::Query(Query::RunnerStates),
+            Some(&conn),
+            ROOT,
+            &noconf(),
+        ) {
             Response::RunnerStates(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].agent_id, 7);
+                assert_eq!(rows[0].dir, "/srv/r7");
                 assert_eq!(rows[0].since_ts, 500);
             }
             other => panic!("unexpected {other:?}"),
@@ -470,7 +503,12 @@ mod tests {
         .unwrap();
         // NOBODY (unauthorized for mutations) can still read presence — org logins
         // aren't secret. No DB needed.
-        match handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &cfg) {
+        match handle(
+            &Request::Query(Query::ConfiguredTokenOrgs),
+            None,
+            NOBODY,
+            &cfg,
+        ) {
             Response::ConfiguredTokenOrgs(orgs) => {
                 assert_eq!(orgs, vec!["acme".to_string(), "widgets".to_string()]);
             }
@@ -491,10 +529,7 @@ mod tests {
             enabled: true,
             addr: "127.0.0.1:9999".to_string(),
         });
-        assert!(matches!(
-            handle(&req, None, NOBODY, &cfg),
-            Response::Denied
-        ));
+        assert!(matches!(handle(&req, None, NOBODY, &cfg), Response::Denied));
         assert!(!cfg.exists(), "denied mutation must not write the config");
     }
 
@@ -507,9 +542,15 @@ mod tests {
             addr: "127.0.0.1:9999".to_string(),
         });
         // A group member is authorized (as is root).
-        assert!(matches!(handle(&req, None, MEMBER, &cfg), Response::Mutated));
+        assert!(matches!(
+            handle(&req, None, MEMBER, &cfg),
+            Response::Mutated
+        ));
         let text = std::fs::read_to_string(&cfg).unwrap();
-        assert!(text.contains("9999"), "persisted config should hold the new addr");
+        assert!(
+            text.contains("9999"),
+            "persisted config should hold the new addr"
+        );
     }
 
     // NB: there is deliberately NO per-mutation "is it gated?" test. The

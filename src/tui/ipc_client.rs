@@ -96,9 +96,12 @@ impl Client {
     }
 }
 
-/// Rebuild the `agent_id → ApiState` map from the wire's `Vec<ApiRow>`.
-pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<i64, ApiState> {
-    rows.into_iter().map(|r| (r.agent_id, r.state)).collect()
+/// Rebuild the `(org, agent_id) → ApiState` map from the wire's `Vec<ApiRow>`.
+/// The org is part of the key because `agent_id` is unique only within an org.
+pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), ApiState> {
+    rows.into_iter()
+        .map(|r| ((r.org, r.agent_id), r.state))
+        .collect()
 }
 
 /// Why a connect attempt did not yield a Persistent client.

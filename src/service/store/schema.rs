@@ -4,7 +4,7 @@ use crate::shared::error::Result;
 
 /// Ordered DDL migrations. Append-only: each new entry bumps the schema by one
 /// and is tracked via SQLite's `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Apply any migrations newer than the DB's recorded `user_version`.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -100,6 +100,23 @@ CREATE INDEX idx_api_runner_sample_agent ON api_runner_sample(agent_id);
 const V3: &str = r#"
 CREATE TABLE runner_state (
     agent_id     INTEGER PRIMARY KEY,
+    liveness     TEXT    NOT NULL,
+    since_ts     INTEGER NOT NULL,
+    last_seen_ts INTEGER NOT NULL
+);
+"#;
+
+/// v4 — key per-runner identity by install `dir`, not `agentId`. GitHub's
+/// `agentId` is unique only *within* an org, so two runners in different orgs
+/// can share one; keying local state by it conflated them (cross-contaminated
+/// CPU% and a shared liveness edge). Add `dir` to the sample and re-key
+/// `runner_state`. Dropping the old `runner_state` rows is safe — they are
+/// transient liveness edges that re-populate on the next sampling tick.
+const V4: &str = r#"
+ALTER TABLE runner_sample ADD COLUMN dir TEXT NOT NULL DEFAULT '';
+DROP TABLE runner_state;
+CREATE TABLE runner_state (
+    dir          TEXT PRIMARY KEY,
     liveness     TEXT    NOT NULL,
     since_ts     INTEGER NOT NULL,
     last_seen_ts INTEGER NOT NULL

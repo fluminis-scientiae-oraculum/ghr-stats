@@ -99,7 +99,7 @@ impl DataSource {
 
     // --- typed queries: IPC in Persistent mode, ring / empty fallback otherwise ---
 
-    pub(crate) fn latest_api_runners(&mut self) -> HashMap<i64, ApiState> {
+    pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), ApiState> {
         match self.query(&Request::Query(Query::LatestApiRunners)) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only
@@ -107,12 +107,12 @@ impl DataSource {
     }
 
     /// Persisted per-runner liveness edges (Persistent only) — the true, restart-
-    /// surviving `since_ts` for the "For" duration. Empty in Ephemeral mode, where
-    /// the App falls back to its in-memory edge.
-    pub(crate) fn runner_states(&mut self) -> HashMap<i64, RunnerState> {
+    /// surviving `since_ts` for the "For" duration, keyed by install `dir`. Empty
+    /// in Ephemeral mode, where the App falls back to its in-memory edge.
+    pub(crate) fn runner_states(&mut self) -> HashMap<String, RunnerState> {
         match self.query(&Request::Query(Query::RunnerStates)) {
             Some(Response::RunnerStates(rows)) => {
-                rows.into_iter().map(|st| (st.agent_id, st)).collect()
+                rows.into_iter().map(|st| (st.dir.clone(), st)).collect()
             }
             _ => HashMap::new(),
         }
@@ -135,15 +135,15 @@ impl DataSource {
     pub(crate) fn runner_history(
         &mut self,
         rings: &Rings,
-        id: i64,
+        dir: &str,
         limit: usize,
     ) -> Vec<HistPoint> {
         match self.query(&Request::Query(Query::RunnerHistory {
-            agent_id: id,
+            dir: dir.to_string(),
             limit,
         })) {
             Some(Response::RunnerHistory(v)) => v,
-            _ => rings.runner_history(id, limit),
+            _ => rings.runner_history(dir, limit),
         }
     }
 
@@ -211,7 +211,7 @@ impl DataSource {
 pub(crate) struct Rings {
     host: VecDeque<HostPoint>,
     busy: VecDeque<BusyPoint>,
-    runners: HashMap<i64, VecDeque<HistPoint>>,
+    runners: HashMap<String, VecDeque<HistPoint>>,
     trend_cap: usize,
     hist_cap: usize,
 }
@@ -235,9 +235,9 @@ impl Rings {
         push_capped(&mut self.busy, p, self.trend_cap);
     }
 
-    pub(crate) fn push_runner(&mut self, id: i64, p: HistPoint) {
+    pub(crate) fn push_runner(&mut self, dir: String, p: HistPoint) {
         let cap = self.hist_cap;
-        push_capped(self.runners.entry(id).or_default(), p, cap);
+        push_capped(self.runners.entry(dir).or_default(), p, cap);
     }
 
     /// Newest `limit` points, oldest → newest — matching `store::reader`'s order.
@@ -249,9 +249,9 @@ impl Rings {
         tail(&self.busy, limit)
     }
 
-    fn runner_history(&self, id: i64, limit: usize) -> Vec<HistPoint> {
+    fn runner_history(&self, dir: &str, limit: usize) -> Vec<HistPoint> {
         self.runners
-            .get(&id)
+            .get(dir)
             .map(|dq| tail(dq, limit))
             .unwrap_or_default()
     }
@@ -310,7 +310,7 @@ mod tests {
         let mut r = Rings::new(3, 2);
         for ts in [1, 2, 3] {
             r.push_runner(
-                7,
+                "/srv/r7".to_string(),
                 HistPoint {
                     ts,
                     cpu_pct: None,
@@ -320,13 +320,13 @@ mod tests {
         }
         // hist_cap = 2 ⇒ ts 1 evicted
         assert_eq!(
-            r.runner_history(7, 5)
+            r.runner_history("/srv/r7", 5)
                 .iter()
                 .map(|p| p.ts)
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
-        assert!(r.runner_history(999, 5).is_empty());
+        assert!(r.runner_history("/srv/none", 5).is_empty());
     }
 
     #[test]

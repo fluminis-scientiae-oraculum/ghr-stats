@@ -29,7 +29,10 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 ///     recent job (running OR last completed), not only an in-flight one.
 /// v7: added `RemoveOrgToken` (drop an org's PAT + forget the org) — the config
 ///     wizard's `[r]` action.
-pub const VERSION: u16 = 7;
+/// v8: runner identity is the install `dir`, not `agentId` (which collides across
+///     orgs). `RunnerHistory` keys by `dir`, `ApiRow` carries `org` (so the GH
+///     join is `(org, agent_id)`), and `RunnerState` is keyed by `dir`.
+pub const VERSION: u16 = 8;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -57,11 +60,22 @@ pub enum Request {
 /// The read queries the TUI issues. Unauthenticated by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Query {
-    HostSeries { limit: usize },
-    BusySeries { limit: usize },
-    RunnerHistory { agent_id: i64, limit: usize },
-    RecentJobs { limit: usize },
-    LatestJob { runner_name: String },
+    HostSeries {
+        limit: usize,
+    },
+    BusySeries {
+        limit: usize,
+    },
+    RunnerHistory {
+        dir: String,
+        limit: usize,
+    },
+    RecentJobs {
+        limit: usize,
+    },
+    LatestJob {
+        runner_name: String,
+    },
     LatestApiRunners,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
@@ -98,12 +112,14 @@ impl Mutation {
     }
 }
 
-/// One runner's GitHub state, paired with its id. A `Vec` of these — not a
-/// `HashMap<i64, _>` — crosses the wire, because JSON object keys must be
-/// strings; the client rebuilds the map (`ipc::client::api_map`).
+/// One runner's GitHub state, paired with its `(org, agent_id)` identity. A `Vec`
+/// of these — not a `HashMap` — crosses the wire, because JSON object keys must
+/// be strings; the client rebuilds the map (`ipc::client::api_map`). `org` is
+/// part of the key because `agent_id` is unique only within an org.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRow {
     pub agent_id: i64,
+    pub org: String,
     pub state: ApiState,
 }
 
@@ -111,15 +127,19 @@ pub struct ApiRow {
 /// falls back to its in-memory rings on any non-data reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    Hello { server: u16 },
-    VersionMismatch { server: u16 },
+    Hello {
+        server: u16,
+    },
+    VersionMismatch {
+        server: u16,
+    },
     HostSeries(Vec<HostPoint>),
     BusySeries(Vec<BusyPoint>),
     RunnerHistory(Vec<HistPoint>),
     RecentJobs(Vec<JobRow>),
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
-    /// Persisted liveness edges; `RunnerState.agent_id` is self-keying, so a
+    /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
     /// Configured org logins (presence only — no token values ever cross here).

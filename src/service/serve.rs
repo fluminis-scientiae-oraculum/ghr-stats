@@ -274,7 +274,12 @@ const JOB_RECONCILE_LIMIT: usize = 200;
 /// files each cycle — so it shares no mutable state with the local sampler. Each
 /// cycle also resolves finished jobs' pass/fail `conclusion` from the Actions API
 /// (opportunistic — see [`reconcile_job_conclusions`]), using its own reader.
-fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>, reader: Option<Connection>) {
+fn api_loop(
+    cfg: &SharedConfig,
+    term: &AtomicBool,
+    tx: &Sender<Sample>,
+    reader: Option<Connection>,
+) {
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {
@@ -297,9 +302,7 @@ fn api_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>, reader: 
             }
             if let Some(conn) = reader.as_ref() {
                 let updates = reconcile_job_conclusions(&c, conn, term);
-                if !updates.is_empty()
-                    && tx.send(Sample::JobConclusions { updates }).is_err()
-                {
+                if !updates.is_empty() && tx.send(Sample::JobConclusions { updates }).is_err() {
                     break; // writer gone
                 }
             }
@@ -332,8 +335,7 @@ fn hooks_loop(
                 let path = crate::shared::hooks::runner_event_log(&r.dir);
                 let stream = path.to_string_lossy().into_owned();
                 let offset = offsets.get(&stream).copied().unwrap_or(0);
-                let (events, new_offset) =
-                    crate::shared::hooks::ingest::tail_events(&path, offset);
+                let (events, new_offset) = crate::shared::hooks::ingest::tail_events(&path, offset);
                 if !events.is_empty() || new_offset != offset {
                     if tx
                         .send(Sample::Hook {
@@ -366,11 +368,15 @@ fn to_samples(
         .map(|p| RunnerSample {
             ts: now,
             agent_id: p.info.agent_id,
+            dir: p.info.dir.to_string_lossy().into_owned(),
             name: p.info.name,
             org: p.info.org,
             liveness: p.liveness,
             current_run_id: None,
-            cpu_pct: cpu.rate(p.info.agent_id, p.cpu_usage_usec, sampled_at),
+            // Key CPU rate by the install dir (locally unique), NOT agent_id —
+            // agentId is unique only within an org, so two runners in different
+            // orgs sharing one would cross-contaminate their cgroup counters.
+            cpu_pct: cpu.rate(p.info.dir.clone(), p.cpu_usage_usec, sampled_at),
             mem_bytes: p.mem_bytes,
             uptime_s: p.uptime_s,
         })
@@ -435,7 +441,9 @@ fn reconcile_job_conclusions(
         };
         match crate::shared::github::list_run_jobs(&token, &repo, run_id) {
             Ok(api_jobs) => updates.extend(match_conclusions(&jobs, &api_jobs)),
-            Err(e) => tracing::debug!(error = %e, repo = %repo, run_id, "job-conclusion reconcile skipped"),
+            Err(e) => {
+                tracing::debug!(error = %e, repo = %repo, run_id, "job-conclusion reconcile skipped")
+            }
         }
     }
     updates
@@ -518,7 +526,10 @@ mod tests {
         );
 
         // Single-job run: mapped regardless of name (a custom workflow `name:`).
-        let got = match_conclusions(&[pending("deploy")], &[api("Deploy to prod", Some("failure"))]);
+        let got = match_conclusions(
+            &[pending("deploy")],
+            &[api("Deploy to prod", Some("failure"))],
+        );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].conclusion, "failure");
 

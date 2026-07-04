@@ -16,12 +16,12 @@ use crate::shared::models::{
 
 /// The most recent `limit` samples for a runner, returned oldest → newest so
 /// they can be fed straight into a left-to-right sparkline.
-pub fn runner_history(conn: &Connection, agent_id: i64, limit: usize) -> Result<Vec<HistPoint>> {
+pub fn runner_history(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<HistPoint>> {
     let mut stmt = conn.prepare_cached(
         "SELECT ts, cpu_pct, mem_bytes FROM runner_sample \
-         WHERE agent_id = ?1 ORDER BY ts DESC LIMIT ?2",
+         WHERE dir = ?1 ORDER BY ts DESC LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![agent_id, limit as i64], |r| {
+    let rows = stmt.query_map(params![dir, limit as i64], |r| {
         Ok(HistPoint {
             ts: r.get(0)?,
             cpu_pct: r.get::<_, Option<f64>>(1)?.map(|v| v as f32),
@@ -85,22 +85,25 @@ pub fn host_series(conn: &Connection, limit: usize) -> Result<Vec<HostPoint>> {
     Ok(out)
 }
 
-/// GitHub's latest view of every runner, keyed by `agent_id`. Empty if the
-/// API reconcile has never run (e.g. no token, or daemon not running).
-pub fn latest_api_runners(conn: &Connection) -> Result<HashMap<i64, ApiState>> {
+/// GitHub's latest view of every runner, keyed by `(org, agent_id)`. GitHub's
+/// `agent_id` is unique only within an org, so the org must be part of the key —
+/// two runners in different orgs can share an id. Empty if the API reconcile has
+/// never run (e.g. no token, or daemon not running).
+pub fn latest_api_runners(conn: &Connection) -> Result<HashMap<(String, i64), ApiState>> {
     let max_ts: Option<i64> =
         conn.query_row("SELECT max(ts) FROM api_runner_sample", [], |r| r.get(0))?;
     let Some(ts) = max_ts else {
         return Ok(HashMap::new());
     };
-    let mut stmt =
-        conn.prepare_cached("SELECT agent_id, online, busy FROM api_runner_sample WHERE ts = ?1")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT org, agent_id, online, busy FROM api_runner_sample WHERE ts = ?1",
+    )?;
     let rows = stmt.query_map(params![ts], |r| {
         Ok((
-            r.get::<_, i64>(0)?,
+            (r.get::<_, String>(0)?, r.get::<_, i64>(1)?),
             ApiState {
-                online: r.get::<_, i64>(1)? != 0,
-                busy: r.get::<_, i64>(2)? != 0,
+                online: r.get::<_, i64>(2)? != 0,
+                busy: r.get::<_, i64>(3)? != 0,
             },
         ))
     })?;
@@ -136,7 +139,7 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare_cached(
-        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s \
+        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir \
          FROM runner_sample WHERE ts = ?1",
     )?;
     let rows = stmt.query_map(params![ts], |r| {
@@ -150,22 +153,23 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
             cpu_pct: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
             mem_bytes: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
             uptime_s: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+            dir: r.get(9)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Current liveness + since-edge timestamp per runner, keyed by `agent_id`.
+/// Current liveness + since-edge timestamp per runner, keyed by install `dir`.
 /// Drives the "Idle/Active for <dur>" display.
-pub fn runner_states(conn: &Connection) -> Result<HashMap<i64, RunnerState>> {
+pub fn runner_states(conn: &Connection) -> Result<HashMap<String, RunnerState>> {
     let mut stmt =
-        conn.prepare_cached("SELECT agent_id, liveness, since_ts, last_seen_ts FROM runner_state")?;
+        conn.prepare_cached("SELECT dir, liveness, since_ts, last_seen_ts FROM runner_state")?;
     let rows = stmt.query_map([], |r| {
-        let agent_id: i64 = r.get(0)?;
+        let dir: String = r.get(0)?;
         Ok((
-            agent_id,
+            dir.clone(),
             RunnerState {
-                agent_id,
+                dir,
                 liveness: Liveness::from_db(&r.get::<_, String>(1)?),
                 since_ts: r.get(2)?,
                 last_seen_ts: r.get(3)?,
@@ -255,20 +259,20 @@ mod tests {
         let conn = mem_db();
         for ts in [100, 200, 300, 400] {
             conn.execute(
-                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, cpu_pct, mem_bytes) \
-                 VALUES (?1, 7, 'r', 'o', 'idle', ?2, ?3)",
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, cpu_pct, mem_bytes, dir) \
+                 VALUES (?1, 7, 'r', 'o', 'idle', ?2, ?3, '/srv/r7')",
                 params![ts, (ts as f64) / 10.0, ts * 1000],
             )
             .unwrap();
         }
-        let h = runner_history(&conn, 7, 3).unwrap();
+        let h = runner_history(&conn, "/srv/r7", 3).unwrap();
         // newest 3, oldest → newest
         assert_eq!(
             h.iter().map(|p| p.ts).collect::<Vec<_>>(),
             vec![200, 300, 400]
         );
         assert_eq!(h.last().unwrap().mem_bytes, Some(400_000));
-        assert!(runner_history(&conn, 999, 10).unwrap().is_empty());
+        assert!(runner_history(&conn, "/srv/nobody", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -309,8 +313,8 @@ mod tests {
         }
         let m = latest_api_runners(&conn).unwrap();
         assert_eq!(m.len(), 2);
-        assert!(m[&1].busy && m[&1].online);
-        assert!(!m[&2].online);
+        assert!(m[&("o".to_string(), 1)].busy && m[&("o".to_string(), 1)].online);
+        assert!(!m[&("o".to_string(), 2)].online);
         assert!(latest_api_runners(&mem_db()).unwrap().is_empty());
     }
 
@@ -358,7 +362,10 @@ mod tests {
     fn ingest_offsets_loads_every_stream_and_is_empty_on_fresh_db() {
         let conn = mem_db();
         assert!(ingest_offsets(&conn).unwrap().is_empty());
-        for (stream, off) in [("/srv/runners/runner-01/.ghr-stats-events.ndjson", 40), ("/srv/runners/runner-02/.ghr-stats-events.ndjson", 128)] {
+        for (stream, off) in [
+            ("/srv/runners/runner-01/.ghr-stats-events.ndjson", 40),
+            ("/srv/runners/runner-02/.ghr-stats-events.ndjson", 128),
+        ] {
             conn.execute(
                 "INSERT INTO ingest_offset (stream, offset) VALUES (?1, ?2)",
                 params![stream, off],
@@ -406,7 +413,12 @@ mod tests {
         let p = jobs_awaiting_conclusion(&conn, 10).unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(
-            (p[0].run_id, p[0].job.as_str(), p[0].repo.as_str(), p[0].org.as_str()),
+            (
+                p[0].run_id,
+                p[0].job.as_str(),
+                p[0].repo.as_str(),
+                p[0].org.as_str()
+            ),
             (1, "build", "o/x", "o")
         );
     }

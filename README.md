@@ -10,7 +10,7 @@ It makes **zero host assumptions** — every fact comes from each runner's own
 `.runner` file and its processes/cgroup, so it works on any host running the
 standard self-hosted runner, not just the box it was first built for.
 
-```
+```text
  Summary  │  Jobs  │  Trends  │  Config  │  Quit
 ┌ ghr-stats ───────────────────────────────────────────────────────────────┐
 │ 8 runners    ● 1 busy    ○ 7 idle    × 0 offline                          │
@@ -143,6 +143,15 @@ unauthorized edit is refused with guidance rather than silently failing. Hooks
 (`[h]`) and the raw-file editor (`[o]`) still shell out with sudo.
 
 ### GitHub API (optional, read-only)
+
+> **Organization runners only, for the GitHub-side reconcile.** The reconcile
+> calls `GET /orgs/{org}/actions/runners`, which is gated by the **organization**
+> "Self-hosted runners" fine-grained-PAT permission — a permission that exists
+> only on an *organization* resource owner. **Personal-account (repository-level)
+> self-hosted runners have no equivalent PAT permission**, so they get no GitHub
+> online/busy reconcile and no job pass/fail conclusions. They are still **fully
+> sampled locally** — process/cgroup liveness, CPU, memory, uptime — with no PAT
+> at all; only GitHub's own view of the runner is unavailable for them.
 
 The online/busy reconcile needs a **fine-grained, read-only PAT per org** (a
 fine-grained PAT is scoped to one resource owner):
