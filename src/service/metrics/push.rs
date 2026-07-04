@@ -65,12 +65,14 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
 
 fn post(endpoint: &str, auth: Option<&str>, body: &str) {
     let mut req = ureq::post(endpoint)
-        .timeout(POST_TIMEOUT)
-        .set("Content-Type", "application/json");
+        .config()
+        .timeout_global(Some(POST_TIMEOUT))
+        .build()
+        .header("Content-Type", "application/json");
     if let Some(a) = auth {
-        req = req.set("Authorization", a);
+        req = req.header("Authorization", a);
     }
-    match req.send_string(body) {
+    match req.send(body) {
         Ok(_) => tracing::debug!("metrics pushed"),
         Err(e) => tracing::warn!(error = %e, "metrics push: POST failed"),
     }
