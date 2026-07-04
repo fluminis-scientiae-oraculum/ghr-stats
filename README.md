@@ -1,5 +1,15 @@
 # ghr-stats
 
+[![crates.io](https://img.shields.io/crates/v/ghr-stats.svg?logo=rust)](https://crates.io/crates/ghr-stats)
+[![docs.rs](https://img.shields.io/docsrs/ghr-stats?logo=docsdotrs)](https://docs.rs/ghr-stats)
+[![CI](https://github.com/fluminis-scientiae-oraculum/ghr-stats/actions/workflows/on-pr-sync.yml/badge.svg)](https://github.com/fluminis-scientiae-oraculum/ghr-stats/actions/workflows/on-pr-sync.yml)
+[![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue?logo=rust)](https://releases.rs)
+[![License: MIT](https://img.shields.io/crates/l/ghr-stats.svg)](LICENSE)
+
+> **Live TUI + Prometheus exporter for a self-hosted GitHub Actions runner fleet.**
+> Zero host assumptions, zero-setup standalone mode, and an optional collector
+> service for history, a jobs timeline, and metrics when you want them.
+
 A mouse-driven terminal dashboard **and** Prometheus exporter for a
 **self-hosted GitHub Actions runner fleet**. The TUI runs in two modes: an
 **Ephemeral** live dashboard standalone (no service, no database), or a
@@ -24,6 +34,21 @@ standard self-hosted runner, not just the box it was first built for.
 │ ...                                                                        │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Highlights
+
+- **Zero setup** — the Ephemeral TUI works the instant you run it; no service, no
+  database, no root.
+- **Two truths, side by side** — local process/cgroup liveness *and* GitHub's API
+  view, so any disagreement is visible at a glance.
+- **Optional collector** — a systemd service adds SQLite history, a Jobs timeline
+  from the runner hooks, and a Prometheus exporter (pull *and* push).
+- **Zero host assumptions** — every fact from each runner's own `.runner` file +
+  procfs/cgroup v2; no systemd-unit-name parsing, no per-host config.
+- **Fully synchronous** — no async runtime; a few producer threads feed one
+  SQLite writer over a channel.
+- **Single static binary** — a musl `x86-64-v2` build drops onto any Linux host;
+  tokens are fine-grained, read-only, and never logged.
 
 ## What it shows
 

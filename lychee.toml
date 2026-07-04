@@ -19,4 +19,9 @@ exclude = [
   "^https?://([^/]+\\.)?example\\.(com|org)",
   "^https?://127\\.0\\.0\\.1",
   "^https?://localhost",
+  # Self-referential badges — these 404 until the crate is published / the repo
+  # is pushed, then resolve. Excluded so the link check doesn't fail pre-publish.
+  "^https://crates\\.io/crates/ghr-stats",
+  "^https://docs\\.rs/ghr-stats",
+  "^https://github\\.com/fluminis-scientiae-oraculum/ghr-stats/actions",
 ]
