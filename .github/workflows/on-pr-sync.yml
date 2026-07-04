@@ -1,0 +1,84 @@
+name: pr
+
+# Scatter-gather CI on pull requests. Five independent checks fan out in
+# parallel (scatter); the `ci-success` job gathers them into ONE required status
+# check for branch protection. GitHub-hosted runners only — never self-hosted on
+# a public repo.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: "**/*.md"
+
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: "--config lychee.toml --no-progress ./**/*.md"
+          fail: true
+
+  # Gather: the single required status check. Fails unless every scatter job
+  # succeeded (a skipped/cancelled/failed dependency is not a success).
+  ci-success:
+    if: always()
+    needs: [fmt, clippy, test, markdown, links]
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify all checks passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "scatter results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required check did not succeed: $r"
+              exit 1
+            fi
+          done
+          echo "all checks passed"
