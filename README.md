@@ -1,10 +1,10 @@
 # ghr-stats
 
-[![crates.io](https://img.shields.io/crates/v/ghr-stats.svg?logo=rust)](https://crates.io/crates/ghr-stats)
-[![docs.rs](https://img.shields.io/docsrs/ghr-stats?logo=docsdotrs)](https://docs.rs/ghr-stats)
+[![crates.io](https://img.shields.io/crates/v/fso-ghr-stats.svg?logo=rust)](https://crates.io/crates/fso-ghr-stats)
+[![docs.rs](https://img.shields.io/docsrs/fso-ghr-stats?logo=docsdotrs)](https://docs.rs/fso-ghr-stats)
 [![CI](https://github.com/fluminis-scientiae-oraculum/ghr-stats/actions/workflows/on-pr-sync.yml/badge.svg)](https://github.com/fluminis-scientiae-oraculum/ghr-stats/actions/workflows/on-pr-sync.yml)
 [![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue?logo=rust)](https://releases.rs)
-[![License: MIT](https://img.shields.io/crates/l/ghr-stats.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/crates/l/fso-ghr-stats.svg)](LICENSE)
 
 > **Live TUI + Prometheus exporter for a self-hosted GitHub Actions runner fleet.**
 > Zero host assumptions, zero-setup standalone mode, and an optional collector
@@ -92,10 +92,12 @@ hand (set `GHR_STATS_ALLOW_TTY=1` only for dev/CI).
 
 ## Install
 
-**Native (glibc), via cargo** — builds for your CPU, no special toolchain:
+**Native (glibc), via cargo** — builds for your CPU, no special toolchain. The
+crate is `fso-ghr-stats`; it installs a binary named `ghr-stats`:
 
 ```bash
-cargo install --path .          # or: cargo install --git <repo-url>
+cargo install fso-ghr-stats     # from crates.io
+cargo install --path .          # or from a checkout (or: cargo install --git <repo-url>)
 ```
 
 **Static binary (musl), for distribution** — one self-contained file that drops
