@@ -1,7 +1,7 @@
 # ghr-stats
 
 [![crates.io](https://img.shields.io/crates/v/fso-ghr-stats.svg?logo=rust)](https://crates.io/crates/fso-ghr-stats)
-[![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue?logo=rust)](https://releases.rs)
+[![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](https://releases.rs)
 [![License: MIT](https://img.shields.io/crates/l/fso-ghr-stats.svg)](LICENSE)
 
 > **Live TUI + Prometheus exporter for a self-hosted GitHub Actions runner fleet.**
