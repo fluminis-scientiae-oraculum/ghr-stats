@@ -8,6 +8,7 @@ mod runner;
 mod trends;
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
@@ -58,33 +59,79 @@ pub(crate) fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, rows[2]);
 }
 
-/// Context-aware key hints (#13's bracket format, but only the keys that act
-/// where you are — so the footer changes with the view/mode instead of
-/// advertising Detail-only actions on the list tabs). `[Tab] switch · [r]
-/// refresh · [q] quit` is the common tail everywhere except the drill-down.
-fn footer_keys(app: &App) -> String {
+/// Context-aware key hints in bracket format — only the keys that act where you
+/// are, so the footer changes with the view/mode instead of advertising
+/// Detail-only actions on the list tabs. Each item pairs its display text with
+/// the key it triggers (`None` for a non-actionable hint like navigation), so
+/// the footer is rendered AND click-dispatched from one source.
+fn footer_items(app: &App) -> Vec<(Option<KeyCode>, &'static str)> {
     if app.drill.is_some() {
         // Runner detail: the per-runner actions live here, not on the lists.
-        return "[Esc] back · [R] restart · [C] recycle · [r] refresh · [?] help · [q] quit"
-            .to_string();
+        return vec![
+            (Some(KeyCode::Esc), "[Esc] back"),
+            (Some(KeyCode::Char('R')), "[R] restart"),
+            (Some(KeyCode::Char('C')), "[C] recycle"),
+            (Some(KeyCode::Char('r')), "[r] refresh"),
+            (Some(KeyCode::Char('?')), "[?] help"),
+            (Some(KeyCode::Char('q')), "[q] quit"),
+        ];
     }
     match app.tab {
-        Tab::Summary => {
-            "[↑↓/jk] move · [Enter] detail · [Tab] switch · [r] refresh · [?] help · [q] quit"
-        }
-        Tab::Config => {
-            "[a] org · [h] hooks · [m] metrics · [o] open · [Tab] switch · [?] help · [q] quit"
-        }
-        _ => "[Tab] switch · [r] refresh · [?] help · [q] quit",
+        Tab::Summary => vec![
+            (None, "[↑↓/jk] move"),
+            (Some(KeyCode::Enter), "[Enter] detail"),
+            (Some(KeyCode::Tab), "[Tab] switch"),
+            (Some(KeyCode::Char('r')), "[r] refresh"),
+            (Some(KeyCode::Char('?')), "[?] help"),
+            (Some(KeyCode::Char('q')), "[q] quit"),
+        ],
+        Tab::Config => vec![
+            (Some(KeyCode::Char('a')), "[a] org"),
+            (Some(KeyCode::Char('h')), "[h] hooks"),
+            (Some(KeyCode::Char('m')), "[m] metrics"),
+            (Some(KeyCode::Char('o')), "[o] open"),
+            (Some(KeyCode::Tab), "[Tab] switch"),
+            (Some(KeyCode::Char('?')), "[?] help"),
+            (Some(KeyCode::Char('q')), "[q] quit"),
+        ],
+        _ => vec![
+            (Some(KeyCode::Tab), "[Tab] switch"),
+            (Some(KeyCode::Char('r')), "[r] refresh"),
+            (Some(KeyCode::Char('?')), "[?] help"),
+            (Some(KeyCode::Char('q')), "[q] quit"),
+        ],
     }
-    .to_string()
 }
 
 /// The shared footer: the keymap left-aligned, plus the last action's status
 /// right-aligned (highlighted) when there is one. The keymap always wins the
 /// left edge, so it stays readable even when a status is present.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let keymap = Paragraph::new(footer_keys(app)).style(Style::new().fg(Color::DarkGray));
+    // Build the footer from its items, recording each actionable hint's column
+    // range into the hit cache so `on_mouse` can turn a click into that keystroke.
+    const SEP: &str = " · ";
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut spans = Vec::new();
+    let mut clicks: Vec<(KeyCode, u16, u16)> = Vec::new();
+    let mut x = area.x;
+    for (i, (key, label)) in footer_items(app).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(SEP, dim));
+            x += SEP.chars().count() as u16;
+        }
+        let w = label.chars().count() as u16;
+        if let Some(k) = key {
+            clicks.push((k, x, x + w));
+        }
+        spans.push(Span::styled(label, dim));
+        x += w;
+    }
+    {
+        let mut hits = app.hits.borrow_mut();
+        hits.footer = clicks;
+        hits.footer_row = area.y;
+    }
+    let keymap = Paragraph::new(Line::from(spans));
     match app.status.as_deref() {
         Some(s) => {
             let sw = (s.chars().count() as u16).saturating_add(3).min(area.width);
@@ -136,6 +183,7 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         tabs,
         tab_row: area.y,
         table_rows: None,
+        ..Default::default()
     };
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -301,7 +349,7 @@ pub(crate) fn liveness_label(l: Liveness) -> (&'static str, Color) {
 /// those timestamps (so gaps plot at true wall-clock positions), while the
 /// caller supplies the Y bounds + labels because value formatting is
 /// metric-specific (count vs percent vs bytes). At most three labels per axis —
-/// ratatui mis-positions a fourth (issue 334). Fewer than two points ⇒ a
+/// ratatui mis-positions a fourth (ratatui issue 334). Fewer than two points ⇒ a
 /// "collecting" note, since a line needs two ends.
 ///
 /// `now` (the reference for the relative-time X labels) is a parameter, not read

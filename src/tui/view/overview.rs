@@ -103,7 +103,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     // Responsive: the metric columns are fixed; the Runner/Org text columns
     // share the remaining width and middle-ellipsize to fit. `For` = time in the
-    // current liveness (#16); `Hook` = job-hook status (#27).
+    // current liveness; `Hook` = job-hook status.
     let inner_w = area.width.saturating_sub(2) as usize;
     let fixed = 9 + 7 + 6 + 8 + 8 + 10 + 6 + 8; // Local,For,Hook,GH,CPU,Mem,Up + spacing
     let flex = inner_w.saturating_sub(fixed).max(18);

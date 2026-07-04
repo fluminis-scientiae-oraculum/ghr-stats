@@ -172,7 +172,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         Style::new().fg(Color::DarkGray),
     )));
 
-    // First-run invite (#4): if nothing is discoverable/configured, point at the
+    // First-run invite: if nothing is discoverable/configured, point at the
     // actions rather than leaving a dead end. Otherwise the footer's [a]/[h]/[m]/
     // [o] hints suffice.
     if cfg.runner_roots.is_empty() || app.configured_orgs().is_empty() {

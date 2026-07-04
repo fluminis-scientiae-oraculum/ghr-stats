@@ -143,7 +143,7 @@ enum OrgNext {
 }
 
 /// The two next-states from PAT validation: a validated `Confirmed`, or back to
-/// `PatInput` for the SAME org with the rejection reason (feedback #6).
+/// `PatInput` for the SAME org with the rejection reason.
 enum PatNext {
     Confirm(Wizard<Confirmed>),
     Reject(Wizard<PatInput>),
