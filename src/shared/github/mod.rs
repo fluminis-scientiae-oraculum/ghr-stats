@@ -95,9 +95,9 @@ pub fn list_run_jobs(token: &str, repo: &str, run_id: i64) -> Result<Vec<RunJob>
         Err(ureq::Error::Status(code, _)) => {
             Err(Error::Github(format!("{repo} run {run_id}: HTTP {code}")))
         }
-        Err(ureq::Error::Transport(t)) => {
-            Err(Error::Github(format!("{repo} run {run_id}: transport error: {t}")))
-        }
+        Err(ureq::Error::Transport(t)) => Err(Error::Github(format!(
+            "{repo} run {run_id}: transport error: {t}"
+        ))),
     }
 }
 

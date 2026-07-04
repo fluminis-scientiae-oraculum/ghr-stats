@@ -78,7 +78,9 @@ fn provision_admin_group() {
     if let Err(e) = run_tool("groupadd", &["-f", ADMIN_GROUP]) {
         println!("  note: could not create the `{ADMIN_GROUP}` group ({e}).");
         println!("        create it + add operators to allow non-root config edits:");
-        println!("          sudo groupadd -f {ADMIN_GROUP} && sudo usermod -aG {ADMIN_GROUP} <user>");
+        println!(
+            "          sudo groupadd -f {ADMIN_GROUP} && sudo usermod -aG {ADMIN_GROUP} <user>"
+        );
         return;
     }
     // Add the human who ran `sudo` (never root itself) to the group.

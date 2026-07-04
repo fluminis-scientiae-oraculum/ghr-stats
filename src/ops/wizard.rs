@@ -15,13 +15,13 @@ use anyhow::Result;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Password, Select};
 
-use crate::shared::privileged;
 use crate::shared::collectors::runners;
 use crate::shared::config::persist;
 use crate::shared::github::validate::{self, Verdict};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::Scope;
+use crate::shared::privileged;
 
 pub fn run(config_override: Option<&Path>) -> Result<()> {
     let theme = ColorfulTheme::default();
@@ -517,7 +517,12 @@ fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: 
     }
 
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
-    let new = install::rewrite_env(&existing, &started_target, &completed_target, Some(&event_log));
+    let new = install::rewrite_env(
+        &existing,
+        &started_target,
+        &completed_target,
+        Some(&event_log),
+    );
     let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
     if out.is_ok() {
         restart_runner(r);
@@ -587,8 +592,14 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let cfg: crate::shared::config::Config = toml::from_str(&text).unwrap();
         // Per-org tokens take precedence over env/fallback, so these are deterministic.
-        assert_eq!(cfg.github_token_for("acme").as_deref(), Some("github_pat_NEW"));
-        assert_eq!(cfg.github_token_for("beta").as_deref(), Some("github_pat_B"));
+        assert_eq!(
+            cfg.github_token_for("acme").as_deref(),
+            Some("github_pat_NEW")
+        );
+        assert_eq!(
+            cfg.github_token_for("beta").as_deref(),
+            Some("github_pat_B")
+        );
         // widgets removed (presence check is env-independent).
         assert!(!cfg.github.tokens.contains_key("widgets"));
         assert!(!text.contains("github_pat_W"));

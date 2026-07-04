@@ -16,11 +16,11 @@ use anyhow::{Result, bail};
 
 use crate::cli::{UninstallArgs, UninstallDomain};
 use crate::ops::systemd;
-use crate::shared::privileged;
 use crate::shared::collectors::{procscan, runners};
 use crate::shared::hooks::install;
 use crate::shared::hooks::uninstall::{self as hook_revert, RevertAction, RunnerHookPlan};
 use crate::shared::paths::{self, Scope};
+use crate::shared::privileged;
 
 pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
     let scope = systemd::resolve_scope(args.system, args.user);

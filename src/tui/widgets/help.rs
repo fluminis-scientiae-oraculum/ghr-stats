@@ -35,7 +35,10 @@ pub(crate) fn draw_help(f: &mut Frame) {
         ),
         blank(),
         section("Config actions"),
-        key("a", "manage org PATs — add / replace / remove (native wizard)"),
+        key(
+            "a",
+            "manage org PATs — add / replace / remove (native wizard)",
+        ),
         Line::from(Span::styled(
             "       PAT needs Self-hosted runners: Read  (+ Actions: Read for job results)",
             Style::new().fg(Color::DarkGray),

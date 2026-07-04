@@ -291,9 +291,7 @@ impl WizardMode {
                 }
             },
             WizardMode::Confirmed(w) => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    Step::Stay(WizardMode::Done(w.write(apply)))
-                }
+                KeyCode::Char('y') | KeyCode::Enter => Step::Stay(WizardMode::Done(w.write(apply))),
                 KeyCode::Esc | KeyCode::Char('n') => Step::Close(false),
                 _ => Step::Stay(WizardMode::Confirmed(w)),
             },

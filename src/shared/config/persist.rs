@@ -93,7 +93,10 @@ fn stage_err(target: &Path, e: &std::io::Error) -> Error {
             target.display()
         ))
     } else {
-        Error::Config(format!("staging config write for {}: {e}", target.display()))
+        Error::Config(format!(
+            "staging config write for {}: {e}",
+            target.display()
+        ))
     }
 }
 
@@ -248,8 +251,14 @@ mod tests {
         remove_org_token(&path, "acme").unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("github_pat_A"), "acme PAT still present:\n{text}");
-        assert!(text.contains("github_pat_W"), "widgets PAT was dropped:\n{text}");
+        assert!(
+            !text.contains("github_pat_A"),
+            "acme PAT still present:\n{text}"
+        );
+        assert!(
+            text.contains("github_pat_W"),
+            "widgets PAT was dropped:\n{text}"
+        );
         let cfg: Config = toml::from_str(&text).unwrap();
         assert!(!cfg.github.tokens.contains_key("acme"));
         assert!(cfg.github.tokens.contains_key("widgets"));
@@ -270,7 +279,10 @@ mod tests {
 
         remove_org_token(&path, "acme").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("github"), "empty github table should be gone:\n{text}");
+        assert!(
+            !text.contains("github"),
+            "empty github table should be gone:\n{text}"
+        );
         // Removing an already-absent org is a harmless no-op.
         remove_org_token(&path, "acme").unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

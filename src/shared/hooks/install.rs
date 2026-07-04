@@ -378,7 +378,9 @@ mod tests {
             existing,
             Path::new("/h/job-started.sh"),
             Path::new("/h/job-completed.sh"),
-            Some(Path::new("/srv/actions-runner/runner-01/.ghr-stats-events.ndjson")),
+            Some(Path::new(
+                "/srv/actions-runner/runner-01/.ghr-stats-events.ndjson",
+            )),
         );
         assert!(out.contains("TMPDIR=/var/tmp/runner"));
         assert!(out.contains("KEEP=1"));
@@ -435,7 +437,10 @@ mod tests {
         // wrapper (the bug was pointing the var at a wrapper never written).
         let (target, w) = plan_chain_slot(None, our, wrapper);
         assert_eq!(target, our);
-        assert!(w.is_none(), "must not fabricate a wrapper with nothing to chain");
+        assert!(
+            w.is_none(),
+            "must not fabricate a wrapper with nothing to chain"
+        );
     }
 
     #[test]
@@ -507,7 +512,9 @@ mod tests {
             original,
             Path::new("/var/lib/ghr-stats/hooks/job-started.sh"),
             Path::new("/var/lib/ghr-stats/hooks/job-completed.sh"),
-            Some(Path::new("/srv/actions-runner/runner-01/.ghr-stats-events.ndjson")),
+            Some(Path::new(
+                "/srv/actions-runner/runner-01/.ghr-stats-events.ndjson",
+            )),
         );
         assert_eq!(classify(&installed, &our()), HookStatus::Ours);
         assert!(installed.contains("GHR_STATS_EVENT_LOG="));
