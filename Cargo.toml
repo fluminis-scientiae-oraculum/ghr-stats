@@ -1,7 +1,7 @@
 [package]
 # crates.io crate name; the installed binary stays `ghr-stats` (see [[bin]]).
 name = "fso-ghr-stats"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 # MSRV: our code needs 1.88 (edition 2024 + stable `let`-chains), but the
 # `sysinfo` dependency raises the effective floor to 1.95.
