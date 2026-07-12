@@ -6,4 +6,4 @@ slug = "fso-ghr-stats"
 server = "https://amem.flusci.org"
 
 [client]
-manifest_version = 18
+manifest_version = 19

@@ -378,6 +378,7 @@ fn to_samples(
             // orgs sharing one would cross-contaminate their cgroup counters.
             cpu_pct: cpu.rate(p.info.dir.clone(), p.cpu_usage_usec, sampled_at),
             mem_bytes: p.mem_bytes,
+            mem_current_bytes: p.mem_current_bytes,
             uptime_s: p.uptime_s,
         })
         .collect()

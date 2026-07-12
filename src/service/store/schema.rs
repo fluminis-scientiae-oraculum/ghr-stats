@@ -4,7 +4,7 @@ use crate::shared::error::Result;
 
 /// Ordered DDL migrations. Append-only: each new entry bumps the schema by one
 /// and is tracked via SQLite's `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// Apply any migrations newer than the DB's recorded `user_version`.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -121,6 +121,15 @@ CREATE TABLE runner_state (
     since_ts     INTEGER NOT NULL,
     last_seen_ts INTEGER NOT NULL
 );
+"#;
+
+/// v5 — `mem_bytes` now holds the working set (anon+shmem); this records the raw
+/// cache-inclusive `memory.current` alongside it so the
+/// `ghr_runner_mem_current_bytes` gauge keeps cache-vs-working-set pressure
+/// observable. Pre-existing rows backfill `NULL` (unknown), which the exporter
+/// simply omits.
+const V5: &str = r#"
+ALTER TABLE runner_sample ADD COLUMN mem_current_bytes INTEGER;
 "#;
 
 #[cfg(test)]

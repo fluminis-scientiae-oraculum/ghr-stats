@@ -139,7 +139,7 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare_cached(
-        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir \
+        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes \
          FROM runner_sample WHERE ts = ?1",
     )?;
     let rows = stmt.query_map(params![ts], |r| {
@@ -154,6 +154,7 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
             mem_bytes: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
             uptime_s: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
             dir: r.get(9)?,
+            mem_current_bytes: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
