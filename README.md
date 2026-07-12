@@ -20,17 +20,17 @@ standard self-hosted runner, not just the box it was first built for.
 
 ```text
  Summary  │  Jobs  │  Trends  │  Config  │  Quit
-┌ ghr-stats ───────────────────────────────────────────────────────────────┐
-│ 8 runners    ● 1 busy    ○ 7 idle    × 0 offline                         │
-│ load 0.42    mem 9.7/31.3 GiB (31%)    /tmp 2.1 GiB    free 612.4 GiB    │
-│ github: 8 known · 8 online · 1 busy                                      │
-└──────────────────────────────────────────────────────────────────────────┘
-┌ runners (8) ─────────────────────────────────────────────────────────────┐
-│ Runner        Org           Local    For    Hook   GH      CPU    Mem    │
-│▌runner-01     example-org   ● busy   4m2s   ✓      ● busy  38.4%  1.2 GiB│
-│ runner-02     example-org   ○ idle   1h3m   ✓      ○ idle  0.0%   172 MiB│
-│ ...                                                                      │
-└──────────────────────────────────────────────────────────────────────────┘
+┌ ghr-stats ─────────────────────────────────────────────────────────────────┐
+│ 8 runners    ● 1 busy    ○ 7 idle    × 0 offline                           │
+│ load 0.42    mem 9.7/31.3 GiB (31%)    /tmp 2.1 GiB    free 612.4 GiB      │
+│ github: 8 known · 8 online · 1 busy                                        │
+└────────────────────────────────────────────────────────────────────────────┘
+┌ runners (8) ───────────────────────────────────────────────────────────────┐
+│ Runner        Org           Local    For    Hook   GH      CPU    Mem      │
+│ runner-01     example-org   ● busy   4m2s   v      ● busy  38.4%  1.2 GiB  │
+│ runner-02     example-org   ○ idle   1h3m   v      ○ idle  0.0%   172 MiB  │
+│ ...                                                                        │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Highlights
