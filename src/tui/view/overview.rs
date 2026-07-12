@@ -105,13 +105,13 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     // share the remaining width and middle-ellipsize to fit. `For` = time in the
     // current liveness; `Hook` = job-hook status.
     let inner_w = area.width.saturating_sub(2) as usize;
-    let fixed = 9 + 7 + 6 + 8 + 8 + 10 + 6 + 8; // Local,For,Hook,GH,CPU,Mem,Up + spacing
+    let fixed = 9 + 7 + 6 + 8 + 8 + 10 + 6 + 8; // Local,For,Hook,GH,CPU,Mem(ws),Up + spacing
     let flex = inner_w.saturating_sub(fixed).max(18);
     let name_w = (flex * 42 / 100).clamp(9, 28);
     let org_w = flex.saturating_sub(name_w).clamp(8, 30);
 
     let header = Row::new([
-        "Runner", "Org", "Local", "For", "Hook", "GH", "CPU", "Mem", "Up",
+        "Runner", "Org", "Local", "For", "Hook", "GH", "CPU", "Mem(ws)", "Up",
     ])
     .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD));
 

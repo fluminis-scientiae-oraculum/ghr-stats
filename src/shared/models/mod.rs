@@ -82,7 +82,10 @@ pub struct RunnerSample {
     pub liveness: Liveness,
     pub current_run_id: Option<i64>,
     pub cpu_pct: Option<f32>,
+    /// Working-set memory (anon+shmem).
     pub mem_bytes: Option<u64>,
+    /// Raw cgroup `memory.current` (working set + reclaimable page cache).
+    pub mem_current_bytes: Option<u64>,
     pub uptime_s: Option<u64>,
 }
 

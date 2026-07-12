@@ -161,7 +161,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Memory (raw bytes; labels in binary units).
+    // Memory working set (anon+shmem; labels in binary units).
     let mem_pts: Vec<(f64, f64)> = app
         .detail_history
         .iter()

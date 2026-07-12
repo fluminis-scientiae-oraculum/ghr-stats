@@ -17,6 +17,7 @@ struct RunnerMetric {
     liveness: Liveness,
     cpu_pct: Option<f32>,
     mem_bytes: Option<u64>,
+    mem_current_bytes: Option<u64>,
     /// Seconds in the current liveness state (`now - since_ts`).
     state_seconds: i64,
     gh_online: Option<bool>,
@@ -82,6 +83,7 @@ impl Snapshot {
                     liveness: r.liveness,
                     cpu_pct: r.cpu_pct,
                     mem_bytes: r.mem_bytes,
+                    mem_current_bytes: r.mem_current_bytes,
                     state_seconds,
                     gh_online: gh.map(|s| s.online),
                     gh_busy: gh.map(|s| s.busy),
@@ -178,6 +180,12 @@ impl Snapshot {
                 let _ = writeln!(s, "ghr_runner_mem_bytes{{{}}} {m}", r.labels());
             }
         }
+        let _ = writeln!(s, "# TYPE ghr_runner_mem_current_bytes gauge");
+        for r in &self.runners {
+            if let Some(m) = r.mem_current_bytes {
+                let _ = writeln!(s, "ghr_runner_mem_current_bytes{{{}}} {m}", r.labels());
+            }
+        }
         let _ = writeln!(s, "# TYPE ghr_runner_state_seconds gauge");
         for r in &self.runners {
             let _ = writeln!(
@@ -246,6 +254,7 @@ impl Snapshot {
                 "busy": i32::from(r.liveness == Liveness::Busy),
                 "cpu_percent": r.cpu_pct,
                 "mem_bytes": r.mem_bytes,
+                "mem_current_bytes": r.mem_current_bytes,
                 "state_seconds": r.state_seconds,
                 "github_online": r.gh_online,
                 "github_busy": r.gh_busy,
@@ -272,8 +281,8 @@ mod tests {
         crate::service::store::schema_for_test(&mut c);
         for (id, name, live) in [(1, "r1", "busy"), (2, "r2", "idle")] {
             c.execute(
-                "INSERT INTO runner_sample (ts,agent_id,name,org,liveness,cpu_pct,mem_bytes,dir) \
-                 VALUES (1000,?1,?2,'acme',?3,12.5,1048576,?4)",
+                "INSERT INTO runner_sample (ts,agent_id,name,org,liveness,cpu_pct,mem_bytes,dir,mem_current_bytes) \
+                 VALUES (1000,?1,?2,'acme',?3,12.5,1048576,?4,2097152)",
                 params![id, name, live, format!("/srv/{name}")],
             )
             .unwrap();
@@ -311,6 +320,13 @@ mod tests {
             "ghr_runner_state_seconds{agent_id=\"1\",name=\"r1\",org=\"acme\",state=\"busy\"} 200"
         ));
         assert!(p.contains("ghr_runner_cpu_percent{agent_id=\"1\",name=\"r1\",org=\"acme\"} 12.5"));
+        // Working-set headline gauge and the raw cache-inclusive sibling.
+        assert!(
+            p.contains("ghr_runner_mem_bytes{agent_id=\"1\",name=\"r1\",org=\"acme\"} 1048576")
+        );
+        assert!(p.contains(
+            "ghr_runner_mem_current_bytes{agent_id=\"1\",name=\"r1\",org=\"acme\"} 2097152"
+        ));
     }
 
     #[test]
@@ -323,10 +339,11 @@ mod tests {
             arr.iter()
                 .any(|o| o["kind"] == "fleet" && o["runners"] == 2)
         );
-        assert!(
-            arr.iter()
-                .any(|o| o["kind"] == "runner" && o["name"] == "r1" && o["busy"] == 1)
-        );
+        assert!(arr.iter().any(|o| o["kind"] == "runner"
+            && o["name"] == "r1"
+            && o["busy"] == 1
+            && o["mem_bytes"] == 1048576
+            && o["mem_current_bytes"] == 2097152));
     }
 
     #[test]

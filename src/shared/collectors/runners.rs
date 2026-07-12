@@ -42,7 +42,11 @@ struct DotRunner {
 pub struct RunnerProbe {
     pub info: RunnerInfo,
     pub liveness: Liveness,
+    /// Working-set memory (anon+shmem) — the runner's true resident footprint.
     pub mem_bytes: Option<u64>,
+    /// Raw cgroup `memory.current` (working set + reclaimable page cache), kept
+    /// for the `ghr_runner_mem_current_bytes` gauge / cache-vs-working-set view.
+    pub mem_current_bytes: Option<u64>,
     /// Cumulative cgroup CPU usage (µs); the daemon turns deltas into a percent.
     pub cpu_usage_usec: Option<u64>,
     pub uptime_s: Option<u64>,
@@ -221,10 +225,15 @@ fn probe_one(
     let liveness = liveness_of(&mine);
     let listener = mine.iter().find(|p| p.comm == LISTENER_COMM);
 
-    let (mem_bytes, cpu_usage_usec) = match listener.and_then(|p| cgroup::dir_for_pid(p.pid)) {
-        Some(cg) => (cgroup::memory_current(&cg), cgroup::cpu_usage_usec(&cg)),
-        None => (None, None),
-    };
+    let (mem_bytes, mem_current_bytes, cpu_usage_usec) =
+        match listener.and_then(|p| cgroup::dir_for_pid(p.pid)) {
+            Some(cg) => (
+                cgroup::memory_working_set(&cg),
+                cgroup::memory_current(&cg),
+                cgroup::cpu_usage_usec(&cg),
+            ),
+            None => (None, None, None),
+        };
     let uptime_s = listener
         .and_then(|p| super::procscan::uptime_secs(now_epoch, boot, clk_tck, p.starttime_ticks));
 
@@ -232,6 +241,7 @@ fn probe_one(
         info,
         liveness,
         mem_bytes,
+        mem_current_bytes,
         cpu_usage_usec,
         uptime_s,
     }
