@@ -223,7 +223,12 @@ fn restart_note(plan: &RunnerHookPlan, idle: bool) -> String {
     }
     match runners::unit_name(plan.env_path.parent().unwrap_or(Path::new("/"))) {
         Some(unit) => {
-            let o = crate::shared::privileged::run(&["systemctl", "restart", &unit]);
+            let o = crate::shared::privileged::run(
+                &crate::shared::privileged::PrivilegedCall::Systemctl {
+                    verb: crate::shared::privileged::UnitVerb::Restart,
+                    unit: unit.clone(),
+                },
+            );
             if o.is_ok() {
                 format!(" (restarted {unit})")
             } else {

@@ -150,6 +150,9 @@ same file.
 - **[Metrics](docs/metrics.md)** — the Prometheus pull endpoint and the JSON push.
 - **[CLI & operations](docs/cli.md)** — every command, uninstall, and the
   per-runner Restart/Recycle actions.
+- **[Privileged operations](docs/privileged.md)** — the complete list of what
+  runs as root, when `sudo` is enough versus a root process, and the `sudo`
+  PATH gotcha.
 - **[Design & internals](docs/design.md)** — architecture, the sync (no-async)
   model, and platform support.
 
@@ -158,7 +161,9 @@ same file.
 - Config is written `0600`; tokens are redacted in logs and previews.
 - The GitHub PAT is fine-grained, read-only, one org per token.
 - The metrics pull endpoint binds loopback only.
-- Privileged actions are explicit, confirmed, and scoped per runner.
+- Privileged actions are explicit, confirmed, and scoped per runner. Every
+  command that can run elevated is one closed enum — see
+  [Privileged operations](docs/privileged.md).
 
 ## Platform
 

@@ -544,7 +544,10 @@ fn write_script(path: &Path, content: &str) -> std::io::Result<()> {
 fn restart_runner(r: &RunnerInfo) {
     match runners::unit_name(&r.dir) {
         Some(unit) => {
-            let o = privileged::run(&["systemctl", "restart", &unit]);
+            let o = privileged::run(&privileged::PrivilegedCall::Systemctl {
+                verb: privileged::UnitVerb::Restart,
+                unit: unit.clone(),
+            });
             println!("    {}", o.describe(&format!("restart {unit}")));
         }
         None => println!(

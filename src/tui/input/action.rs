@@ -3,13 +3,17 @@
 //! Each action owns the data it will act on — an *owned snapshot*, not a borrow
 //! of `App` (the 2 s refresh reshuffles `app.runners` while a confirm popup is
 //! open, so a borrow would be a correctness bug). `execute` runs while the TUI
-//! is suspended; privileged actions implement [`privileged::PrivilegedExecution`]
-//! and run via its `do_execute` template, which clears the gate before any
-//! shell-out (sudo when not root, prompting on /dev/tty).
+//! is suspended; privileged actions shell out via [`privileged::run`], which
+//! escalates per command (sudo when not root, prompting on /dev/tty). These
+//! actions need no root *process* — see the two-tier model in `privileged`.
+//!
+//! Each privileged action builds its [`PrivilegedCall`] once and feeds it to
+//! BOTH `prompt` and `execute`, so a confirm popup always names the command that
+//! will actually run.
 
 use std::path::PathBuf;
 
-use crate::shared::privileged::{self, Outcome, PrivilegedExecution};
+use crate::shared::privileged::{self, Outcome, PrivilegedCall, UnitVerb};
 use crate::tui::input::screen::Tty;
 
 /// What the confirm popup shows for a pending action.
@@ -49,6 +53,17 @@ pub(crate) struct RestartRunner {
     pub agent_id: i64,
 }
 
+impl RestartRunner {
+    /// The one command this action runs. Both `prompt` and `execute` go through
+    /// it, so the popup cannot advertise a command other than the one that runs.
+    fn call(&self) -> PrivilegedCall {
+        PrivilegedCall::Systemctl {
+            verb: UnitVerb::Restart,
+            unit: self.unit.clone(),
+        }
+    }
+}
+
 /// Restart + purge the runner's OWN `_work/_temp` + trim `_diag` — idle-only,
 /// scoped to its install dir from `.runner`, NEVER global `/tmp` or docker.
 pub(crate) struct RecycleRunner {
@@ -68,12 +83,29 @@ impl RecycleRunner {
         let diag = self.install_dir.join("_diag");
         (temp, diag)
     }
-}
 
-impl PrivilegedExecution for RestartRunner {
-    // `ensure` defaults: a restart only needs sudo, not a root process.
-    fn contract(&self) -> Outcome {
-        privileged::run(&["systemctl", "restart", &self.unit])
+    /// stop → purge → start. Separate from `execute` so the abort-on-stop path
+    /// stays a single `Outcome` return rather than being duplicated into the
+    /// `ActionOutcome` rendering.
+    fn recycle(&self) -> Outcome {
+        let (temp, diag) = self.scoped_paths();
+
+        // Stop first; abort before touching anything if that fails.
+        let stop = privileged::run(&self.unit_call(UnitVerb::Stop));
+        if !stop.is_ok() {
+            return stop;
+        }
+        // Scoped purge — ONLY this runner's own dirs under its install dir.
+        let _ = privileged::run(&PrivilegedCall::PurgeDir { dir: temp });
+        let _ = privileged::run(&PrivilegedCall::TrimFilesIn { dir: diag });
+        privileged::run(&self.unit_call(UnitVerb::Start))
+    }
+
+    fn unit_call(&self, verb: UnitVerb) -> PrivilegedCall {
+        PrivilegedCall::Systemctl {
+            verb,
+            unit: self.unit.clone(),
+        }
     }
 }
 
@@ -81,35 +113,15 @@ impl Action for RestartRunner {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: format!("Restart {} (#{})", self.unit, self.agent_id),
-            body: format!(
-                "sudo systemctl restart {}\nReclaims the runner agent's GC RAM.",
-                self.unit
-            ),
+            body: format!("sudo {}\nReclaims the runner agent's GC RAM.", self.call()),
             danger: false,
         }
     }
     fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-        match self.do_execute() {
+        match privileged::run(&self.call()) {
             Outcome::Ok => ActionOutcome::Ok(format!("restarted {}", self.unit)),
             other => ActionOutcome::Failed(other.describe("restart")),
         }
-    }
-}
-
-impl PrivilegedExecution for RecycleRunner {
-    fn contract(&self) -> Outcome {
-        let (temp, diag) = self.scoped_paths();
-        let (temp_s, diag_s) = (temp.to_string_lossy(), diag.to_string_lossy());
-
-        // Stop first; abort before touching anything if that fails.
-        let stop = privileged::run(&["systemctl", "stop", &self.unit]);
-        if !stop.is_ok() {
-            return stop;
-        }
-        // Scoped purge — ONLY this runner's own dirs under its install dir.
-        let _ = privileged::run(&["rm", "-rf", "--", &temp_s]);
-        let _ = privileged::run(&["find", &diag_s, "-type", "f", "-delete"]);
-        privileged::run(&["systemctl", "start", &self.unit])
     }
 }
 
@@ -128,7 +140,7 @@ impl Action for RecycleRunner {
         }
     }
     fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-        match self.do_execute() {
+        match self.recycle() {
             Outcome::Ok => ActionOutcome::Ok(format!("recycled {}", self.unit)),
             other => ActionOutcome::Failed(other.describe("recycle")),
         }
