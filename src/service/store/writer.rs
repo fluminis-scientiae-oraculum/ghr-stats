@@ -80,11 +80,12 @@ pub fn write_local(
 /// volume, high value). Returns the number of rows removed. Safe to run while
 /// the collector writes — WAL handles the concurrency.
 pub fn prune(conn: &mut Connection, cutoff_ts: i64) -> Result<usize> {
-    const SAMPLE_TABLES: [&str; 4] = [
+    const SAMPLE_TABLES: [&str; 5] = [
         "runner_sample",
         "host_sample",
         "api_runner_sample",
         "queue_sample",
+        "api_reconcile_sample",
     ];
     let tx = conn.transaction()?;
     let mut removed = 0;

@@ -4,7 +4,7 @@ use crate::shared::error::Result;
 
 /// Ordered DDL migrations. Append-only: each new entry bumps the schema by one
 /// and is tracked via SQLite's `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// Apply any migrations newer than the DB's recorded `user_version`.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
@@ -132,6 +132,55 @@ const V5: &str = r#"
 ALTER TABLE runner_sample ADD COLUMN mem_current_bytes INTEGER;
 "#;
 
+/// v6 — make the GitHub view *answerable*, not merely recorded.
+///
+/// `api_runner_sample` already held what GitHub reported at each tick, but three
+/// questions an operator asks during an outage had no answer: how long has this
+/// runner been offline to GitHub (no edge ⇒ no duration, and the instantaneous
+/// bit flaps too much to alert on), did we actually reach GitHub this tick or are
+/// we serving a stale read (no reconcile health ⇒ a dead reconcile presents as a
+/// calm fleet), and what happened over the last hour (no per-tick outcome).
+///
+/// `api_runner_state` mirrors `runner_state` on the GitHub side, keyed by
+/// `(org, agent_id)` — the API join key. Note the deliberate asymmetry with v4,
+/// which re-keyed the LOCAL state to `dir`: `agentId` is unique only *within* an
+/// org, so it is a valid key here precisely because `org` is part of it.
+/// `since_ts` stays monotonic across a flap, which is what makes a debounced
+/// ">15m offline" alert possible at all.
+const V6: &str = r#"
+CREATE TABLE api_runner_state (
+    org          TEXT    NOT NULL,
+    agent_id     INTEGER NOT NULL,
+    online       INTEGER NOT NULL,
+    since_ts     INTEGER NOT NULL,
+    last_seen_ts INTEGER NOT NULL,
+    PRIMARY KEY (org, agent_id)
+);
+
+CREATE TABLE api_reconcile_state (
+    org         TEXT PRIMARY KEY,
+    last_ok_ts  INTEGER,
+    last_try_ts INTEGER NOT NULL,
+    ok          INTEGER NOT NULL,
+    http_status INTEGER,
+    error_kind  TEXT,
+    configured  INTEGER NOT NULL
+);
+
+CREATE TABLE api_reconcile_sample (
+    ts          INTEGER NOT NULL,
+    org         TEXT    NOT NULL,
+    ok          INTEGER NOT NULL,
+    http_status INTEGER,
+    error_kind  TEXT,
+    runners     INTEGER NOT NULL
+);
+CREATE INDEX idx_api_reconcile_sample_ts ON api_reconcile_sample(ts);
+
+CREATE INDEX idx_api_runner_sample_org_agent_ts
+    ON api_runner_sample(org, agent_id, ts);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,11 +201,12 @@ mod tests {
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('runner_sample','host_sample','job_event','queue_sample','ingest_offset',\
-                  'api_runner_sample','runner_state')",
+                  'api_runner_sample','runner_state','api_runner_state',\
+                  'api_reconcile_state','api_reconcile_sample')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 10);
     }
 }
