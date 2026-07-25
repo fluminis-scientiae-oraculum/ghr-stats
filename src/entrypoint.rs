@@ -3,6 +3,14 @@
 //! `tui` / `service` / `ops` over the `shared` kernel — and holds no domain logic
 //! of its own.
 
+// Zero `unsafe` is already true of this tree; `forbid` (not `deny`) makes it a
+// property of the crate rather than a habit — an inner `#[allow]` cannot buy it
+// back, so re-introducing `unsafe` is a build failure that has to be argued at
+// this line. Host integration stays safe by construction: procfs/cgroup reads go
+// through `std::fs`, `sysconf` through `nix`, and the allocator through
+// `mimalloc`'s own `GlobalAlloc` impl.
+#![forbid(unsafe_code)]
+
 mod cli;
 mod ops;
 mod service;
