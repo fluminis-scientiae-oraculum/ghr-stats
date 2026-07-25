@@ -34,6 +34,7 @@ use crate::shared::paths::Scope;
 use crate::shared::util::now_epoch;
 use crate::tui::history::{DataSource, Mode, MutateOutcome, Rings};
 use crate::tui::input::action::{ActionKind, RecycleRunner, RestartRunner};
+use crate::tui::ipc_client::EphemeralReason;
 use crate::tui::widgets::wizard::{self, WizardMode};
 
 const HISTORY_POINTS: usize = 120;
@@ -213,6 +214,19 @@ impl App {
 
     pub(crate) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The connected collector's build version — `None` in Ephemeral mode, or
+    /// when talking to a collector too old to report one.
+    pub(crate) fn collector_version(&self) -> Option<&str> {
+        self.source.collector_version()
+    }
+
+    /// Why the dashboard is Ephemeral, when it is. Surfaced on the Config tab so
+    /// "the service is an older build" is not silently indistinguishable from
+    /// "there is no service".
+    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+        self.source.ephemeral_reason()
     }
 
     /// The current data plane (Ephemeral / Persistent) — for the header badge

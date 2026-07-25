@@ -345,6 +345,31 @@ impl GhView {
     }
 }
 
+/// Local process healthy, but GitHub says this runner cannot take work.
+///
+/// Derived — deliberately NOT a fourth [`Liveness`] variant. `Liveness` is a
+/// pure local-process fact and must stay one; folding GitHub's opinion into it
+/// would conflate two independently useful signals and make this incident class
+/// *less* diagnosable, not more. The whole point is to show both halves and
+/// their disagreement.
+///
+/// `None` when the GitHub view is stale or unknown: not knowing is not the same
+/// as diverging, and neither an alert nor a header may fire on ignorance.
+///
+/// Lives here, in the domain, rather than in the exporter, because the metrics
+/// encoder AND the TUI header both need the same verdict — and two copies of
+/// this reasoning would be exactly the "fix here, forgot there" bug class this
+/// codebase already guards against.
+pub fn divergent(liveness: Liveness, gh: GhView) -> Option<bool> {
+    match (liveness, gh) {
+        // Locally down is already visible in every other signal; calling it
+        // "divergent" too would double-count the same outage.
+        (Liveness::Offline, _) => Some(false),
+        (_, GhView::Fresh { state, .. }) => Some(!state.online),
+        (_, GhView::Stale { .. } | GhView::Unknown) => None,
+    }
+}
+
 /// GitHub-side liveness edge for one runner: mirrors [`RunnerState`], but keyed
 /// by the API join key `(org, agent_id)`. `since_ts` is the last time `online`
 /// actually CHANGED, which is what makes "offline to GitHub for >15m" an

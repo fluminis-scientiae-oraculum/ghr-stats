@@ -9,7 +9,7 @@ use rusqlite::Connection;
 
 use crate::service::store::reader;
 use crate::shared::error::Result;
-use crate::shared::models::{ApiReconcileState, GhView, Liveness};
+use crate::shared::models::{self, ApiReconcileState, GhView, Liveness};
 
 /// One runner's metric row.
 struct RunnerMetric {
@@ -43,24 +43,10 @@ impl RunnerMetric {
         )
     }
 
-    /// Local process healthy, but GitHub says this runner cannot take work.
-    ///
-    /// Derived — deliberately NOT a fourth [`Liveness`] variant. `Liveness` is a
-    /// pure local-process fact and must stay one; folding GitHub's opinion into
-    /// it would conflate two independently useful signals and make exactly this
-    /// incident class *less* diagnosable, not more. The whole point is to show
-    /// both halves and their disagreement.
-    ///
-    /// `None` when the GitHub view is stale or unknown: not knowing is not the
-    /// same as diverging, and an alert must never fire on ignorance.
+    /// See [`models::divergent`] — the one place this verdict is derived, shared
+    /// with the TUI header so the exporter and the dashboard cannot disagree.
     fn divergent(&self) -> Option<bool> {
-        match (self.liveness, self.gh) {
-            // Locally down is already visible in every other signal; calling it
-            // "divergent" too would double-count the same outage.
-            (Liveness::Offline, _) => Some(false),
-            (_, GhView::Fresh { state, .. }) => Some(!state.online),
-            (_, GhView::Stale { .. } | GhView::Unknown) => None,
-        }
+        models::divergent(self.liveness, self.gh)
     }
 }
 

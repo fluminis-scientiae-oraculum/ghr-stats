@@ -225,7 +225,13 @@ fn handle(
     max_age: u64,
 ) -> Response {
     match req {
-        Request::Hello { .. } => Response::Hello { server: VERSION },
+        Request::Hello { .. } => Response::Hello {
+            server: VERSION,
+            // Report our BUILD version too, so a TUI can tell "the service is
+            // an older binary" from "no service" — the upgrade-without-restart
+            // case, which otherwise looks identical to an absent collector.
+            version: crate::shared::util::BUILD_VERSION.to_string(),
+        },
         // Reads: never authorized (derived stats + config presence, no secrets).
         Request::Query(q) => serve_query(q, conn, config_path, max_age),
         // Writes: the ONE authz gate. `apply_mutation` is reachable only past it,
@@ -429,7 +435,7 @@ mod tests {
     fn hello_replies_with_server_version_without_a_db() {
         assert!(matches!(
             handle(&Request::Hello { client: VERSION }, None, NOBODY, &noconf(), MAX_AGE),
-            Response::Hello { server } if server == VERSION
+            Response::Hello { server, .. } if server == VERSION
         ));
     }
 

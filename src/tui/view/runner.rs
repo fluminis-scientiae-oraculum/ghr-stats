@@ -166,6 +166,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, cpu_max as f64],
             y_labels: vec!["0".to_string(), format!("{cpu_max:.0}%")],
             color: Color::Cyan,
+            overlay: None,
         },
     );
 
@@ -197,6 +198,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, mem_max as f64],
             y_labels: vec!["0".to_string(), fmt_bytes(mem_max)],
             color: Color::Green,
+            overlay: None,
         },
     );
 }

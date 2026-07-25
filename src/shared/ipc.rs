@@ -136,6 +136,16 @@ pub struct ApiRow {
 pub enum Response {
     Hello {
         server: u16,
+        /// The COLLECTOR's build version (not the wire version). Lets the TUI
+        /// show "you upgraded the binary but did not restart the service",
+        /// which is otherwise invisible.
+        ///
+        /// `serde(default)` is load-bearing for cross-version handshakes: a
+        /// pre-v9 collector sends no such field, and without the default the
+        /// reply would fail to deserialize and surface as "unexpected handshake
+        /// reply" instead of the clean version mismatch we want to report.
+        #[serde(default)]
+        version: String,
     },
     VersionMismatch {
         server: u16,

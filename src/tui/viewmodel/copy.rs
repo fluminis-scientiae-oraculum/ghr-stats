@@ -79,3 +79,35 @@ pub(crate) fn collecting_sparkline() -> String {
 pub(crate) fn work_persistent_only() -> &'static str {
     "  Persistent only — install the collector to trend _work size"
 }
+
+/// The Config tab's version advisory, when there is something worth saying.
+///
+/// The version-drift and IPC-drift cases are the same underlying mistake seen
+/// from two sides: the binary was upgraded and the service was not restarted.
+/// One says the builds differ; the other says the wire versions differ badly
+/// enough that the dashboard fell back to Ephemeral entirely.
+pub(crate) fn version_warning(
+    state: super::status::VersionState,
+    ephemeral: Option<crate::tui::ipc_client::EphemeralReason>,
+) -> Option<String> {
+    use super::status::VersionState;
+    use crate::tui::ipc_client::EphemeralReason;
+
+    // A wire mismatch is the more actionable report: it explains not just a
+    // version difference but why there is no collector data at all.
+    if let Some(EphemeralReason::VersionDrift { server }) = ephemeral {
+        return Some(format!(
+            "A collector IS running but speaks IPC v{server} (this build speaks v{}). \
+             Restart the service after upgrading:  sudo systemctl restart ghr-stats",
+            crate::shared::ipc::VERSION
+        ));
+    }
+    match state {
+        VersionState::Drift | VersionState::CollectorUnknown => Some(
+            "The running service is a different build than this binary — \
+             restart it to pick up the upgrade:  sudo systemctl restart ghr-stats"
+                .to_string(),
+        ),
+        VersionState::Match | VersionState::NoCollector => None,
+    }
+}

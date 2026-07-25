@@ -12,7 +12,7 @@ use super::{
     ellipsize_middle, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime, liveness_label,
 };
 use crate::shared::hooks::install::HookStatus;
-use crate::shared::models::{GhView, Liveness};
+use crate::shared::models::{self, GhView, Liveness};
 use crate::tui::app::App;
 use crate::tui::viewmodel;
 
@@ -53,6 +53,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             }),
         ),
     ]);
+
+    // All-green must be reachable only when GitHub agrees. During the
+    // 2026-07-25 outage this header read "21 runners · 21 idle · 0 offline"
+    // while 8 of them could not take work — every local signal was healthy and
+    // nothing surfaced the disagreement.
+    let divergent = app
+        .runners
+        .iter()
+        .filter(|r| models::divergent(r.liveness, r.gh) == Some(true))
+        .count();
+    let counts = if divergent > 0 {
+        let mut spans = counts.spans;
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!("⚠ {divergent} GH-offline"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        Line::from(spans)
+    } else {
+        counts
+    };
 
     let host = match &app.host {
         Some(h) => {
@@ -106,8 +127,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         )),
     };
 
-    let para =
-        Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(" ghr-stats "));
+    // The build version rides the panel title: always visible, costs no rows,
+    // and answers "what am I actually running" without a keypress.
+    let para = Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(format!(
+        " ghr-stats v{} ",
+        crate::shared::util::BUILD_VERSION
+    )));
     f.render_widget(para, area);
 }
 

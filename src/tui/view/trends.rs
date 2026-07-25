@@ -63,16 +63,32 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         .max()
         .unwrap_or(0)
         .max(1);
+    // GitHub's own count of online runners, overlaid. Ticks with no reconcile
+    // data are simply absent from this series, so the line breaks rather than
+    // dropping to zero. Without it the occupancy chart drew a flat healthy trace
+    // straight through a four-hour outage, because local liveness never moved.
+    let gh_pts: Vec<(f64, f64)> = app
+        .trend_busy
+        .iter()
+        .filter_map(|b| b.github_online.map(|g| (b.ts as f64, g as f64)))
+        .collect();
+    let gh_now = app
+        .trend_busy
+        .last()
+        .and_then(|b| b.github_online)
+        .map(|g| format!("   GH {g}"))
+        .unwrap_or_default();
     draw_time_chart(
         f,
         rows[0],
         now,
         ChartSpec {
-            title: &format!(" busy runners   now {busy_now} / {online_now} online "),
+            title: &format!(" busy runners   now {busy_now} / {online_now} online{gh_now} "),
             points: &busy_pts,
             y_bounds: [0.0, busy_max as f64],
             y_labels: vec!["0".to_string(), busy_max.to_string()],
             color: Color::Yellow,
+            overlay: Some((&gh_pts, Color::Magenta)),
         },
     );
 
@@ -99,6 +115,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, load_max],
             y_labels: vec!["0".to_string(), format!("{load_max:.1}")],
             color: Color::Magenta,
+            overlay: None,
         },
     );
 
@@ -127,6 +144,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, 100.0],
             y_labels: vec!["0".to_string(), "100%".to_string()],
             color: Color::Blue,
+            overlay: None,
         },
     );
 
@@ -154,6 +172,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, tmp_max as f64],
             y_labels: vec!["0".to_string(), fmt_bytes(tmp_max)],
             color: Color::Red,
+            overlay: None,
         },
     );
 
@@ -191,6 +210,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
                 y_bounds: [0.0, work_max as f64],
                 y_labels: vec!["0".to_string(), fmt_bytes(work_max)],
                 color: Color::Green,
+                overlay: None,
             },
         );
     }

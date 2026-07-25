@@ -136,6 +136,34 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::raw(""));
 
+    // Version: this binary vs the running service vs the wire protocol. The
+    // interesting fact is not the strings but their DISAGREEMENT — an upgraded
+    // binary with an un-restarted service is otherwise invisible, and used to
+    // present as "no collector at all".
+    lines.push(heading("Version"));
+    lines.push(kv("binary", crate::shared::util::BUILD_VERSION));
+    let vstate = viewmodel::status::version_state(
+        crate::shared::util::BUILD_VERSION,
+        app.collector_version(),
+        app.mode(),
+    );
+    let collector = match (app.collector_version(), vstate) {
+        (Some(v), _) => v.to_string(),
+        (None, viewmodel::status::VersionState::CollectorUnknown) => {
+            "connected, version not reported (older build)".to_string()
+        }
+        (None, _) => "—  (no collector)".to_string(),
+    };
+    lines.push(kv("collector", &collector));
+    lines.push(kv("ipc wire", &format!("v{}", crate::shared::ipc::VERSION)));
+    if let Some(warning) = viewmodel::copy::version_warning(vstate, app.ephemeral_reason()) {
+        lines.push(Line::from(Span::styled(
+            format!("  {warning}"),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::raw(""));
+
     // Install & teardown (#uninstall): what's on this host + how to remove it.
     // Read-only — the removal itself is the CLI verb `ghr-stats uninstall`.
     lines.push(heading("Install & teardown"));
