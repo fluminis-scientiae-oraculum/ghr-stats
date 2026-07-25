@@ -136,6 +136,116 @@ pub struct ApiRunnerRow {
     pub busy: bool,
 }
 
+/// Why a per-org GitHub reconcile produced no data.
+///
+/// The SINGLE taxonomy: the Prometheus `kind` label, the stored `error_kind`,
+/// and the operator-facing hint all derive from this one enum, so a metric and
+/// a log line can never describe the same failure differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// 401 — the token is invalid or expired.
+    Unauthorized,
+    /// 403 — the token lacks "Self-hosted runners: read", or org approval is
+    /// still pending.
+    Forbidden,
+    /// 404 — org not found, or invisible to this token.
+    NotFound,
+    /// Any other HTTP status.
+    Http(u16),
+    /// Never reached GitHub: connection refused, TLS failure, timeout.
+    Transport,
+    /// A response arrived but did not decode.
+    Decode,
+}
+
+impl ApiErrorKind {
+    pub fn from_status(code: u16) -> Self {
+        match code {
+            401 => ApiErrorKind::Unauthorized,
+            403 => ApiErrorKind::Forbidden,
+            404 => ApiErrorKind::NotFound,
+            other => ApiErrorKind::Http(other),
+        }
+    }
+
+    /// Low-cardinality label for the `kind` dimension of
+    /// `ghr_api_reconcile_errors_total`, and the stored `error_kind`.
+    pub fn label(&self) -> String {
+        match self {
+            ApiErrorKind::Unauthorized => "http_401".to_string(),
+            ApiErrorKind::Forbidden => "http_403".to_string(),
+            ApiErrorKind::NotFound => "http_404".to_string(),
+            ApiErrorKind::Http(code) => format!("http_{code}"),
+            ApiErrorKind::Transport => "transport".to_string(),
+            ApiErrorKind::Decode => "decode".to_string(),
+        }
+    }
+
+    /// The actionable operator-facing explanation.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            ApiErrorKind::Unauthorized => "token is invalid or expired",
+            ApiErrorKind::Forbidden => {
+                "token lacks 'Self-hosted runners: read', or org approval is pending"
+            }
+            ApiErrorKind::NotFound => {
+                "org not found, or this token cannot see it (wrong resource owner?)"
+            }
+            ApiErrorKind::Http(_) => "unexpected status",
+            ApiErrorKind::Transport => "could not reach GitHub",
+            ApiErrorKind::Decode => "response did not decode",
+        }
+    }
+
+    /// The HTTP status, when the failure had one.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            ApiErrorKind::Unauthorized => Some(401),
+            ApiErrorKind::Forbidden => Some(403),
+            ApiErrorKind::NotFound => Some(404),
+            ApiErrorKind::Http(code) => Some(*code),
+            ApiErrorKind::Transport | ApiErrorKind::Decode => None,
+        }
+    }
+}
+
+/// One org's outcome for a single reconcile tick.
+///
+/// An enum rather than a struct carrying an `ok` flag beside the rows: runner
+/// rows exist ONLY in the success arm, so "a failed fetch moved the GitHub
+/// liveness edge" is *unrepresentable* rather than merely forbidden. That
+/// guard matters because the mistake it prevents is silent — treating an
+/// unreachable org as "every one of its runners went offline" would invent an
+/// outage out of a network blip.
+///
+/// `Unconfigured` is deliberately distinct from `Failed`: an org with no PAT
+/// must report as "not configured" — not as an error, and not by vanishing —
+/// so an operator can tell "I never set this up" from "my token broke".
+#[derive(Debug, Clone)]
+pub enum ApiOrgOutcome {
+    Ok {
+        org: String,
+        rows: Vec<ApiRunnerRow>,
+    },
+    Failed {
+        org: String,
+        kind: ApiErrorKind,
+    },
+    Unconfigured {
+        org: String,
+    },
+}
+
+impl ApiOrgOutcome {
+    pub fn org(&self) -> &str {
+        match self {
+            ApiOrgOutcome::Ok { org, .. }
+            | ApiOrgOutcome::Failed { org, .. }
+            | ApiOrgOutcome::Unconfigured { org } => org,
+        }
+    }
+}
+
 // --- read/query projections ---
 //
 // The shapes the store's read queries return. They double as the IPC wire

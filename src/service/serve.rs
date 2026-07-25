@@ -42,7 +42,7 @@ use crate::shared::collectors::{self};
 use crate::shared::config::{Config, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
 use crate::shared::models::{
-    ApiRunnerRow, HostSample, JobConclusion, PendingConclusion, RunnerSample,
+    ApiOrgOutcome, ApiRunnerRow, HostSample, JobConclusion, PendingConclusion, RunnerSample,
 };
 use crate::shared::util::now_epoch;
 
@@ -84,7 +84,7 @@ enum Sample {
     },
     Api {
         ts: i64,
-        rows: Vec<ApiRunnerRow>,
+        outcomes: Vec<ApiOrgOutcome>,
     },
     Hook {
         /// The tailed log's stream id (the per-runner event-log path).
@@ -198,9 +198,11 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
                     Err(e) => tracing::error!(error = %e, "local write failed"),
                 }
             }
-            Sample::Api { ts, rows } => {
-                match writer::write_api_runners(store.conn_mut(), ts, &rows) {
-                    Ok(()) => tracing::debug!(api_runners = rows.len(), "api reconcile persisted"),
+            Sample::Api { ts, outcomes } => {
+                match writer::write_api_runners(store.conn_mut(), ts, &outcomes) {
+                    Ok(()) => {
+                        tracing::debug!(orgs = outcomes.len(), "api reconcile persisted")
+                    }
                     Err(e) => tracing::error!(error = %e, "api write failed"),
                 }
             }
@@ -296,8 +298,13 @@ fn api_loop(
                 c.orgs.iter().cloned().collect()
             };
             let now = now_epoch();
-            let rows = gather_api(&c, &orgs, term);
-            if !rows.is_empty() && tx.send(Sample::Api { ts: now, rows }).is_err() {
+            let outcomes = gather_api(&c, &orgs, term);
+            // Send whenever an org was attempted, even if every one failed.
+            // Gating on "produced rows" (the old behaviour) meant a total
+            // reconcile failure left NO trace at all: no health row, no audit
+            // row, and the previous tick's values kept being served as current.
+            // A fleet-wide outage is exactly when the record matters most.
+            if !outcomes.is_empty() && tx.send(Sample::Api { ts: now, outcomes }).is_err() {
                 break; // writer gone
             }
             if let Some(conn) = reader.as_ref() {
@@ -387,24 +394,43 @@ fn to_samples(
 /// Query each org's runners (best-effort, per-org). A missing token, permission
 /// error, or network failure degrades that org, never the cycle. Bails between
 /// orgs if shutdown was signalled, so a SIGTERM mid-cycle exits promptly.
-fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<ApiRunnerRow> {
+///
+/// Returns one [`ApiOrgOutcome`] per org rather than a flat row list. The
+/// distinction is load-bearing downstream: "GitHub says this runner is offline",
+/// "we could not ask GitHub", and "no PAT is configured for this org" are three
+/// different facts that a flat `Vec<ApiRunnerRow>` collapsed into one — the org
+/// simply had no rows, so its series vanished instead of reporting a value.
+fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<ApiOrgOutcome> {
     let mut out = Vec::new();
     for org in orgs {
         if term.load(Ordering::SeqCst) {
             break;
         }
         let Some(token) = cfg.github_token_for(org) else {
+            out.push(ApiOrgOutcome::Unconfigured { org: org.clone() });
             continue;
         };
-        match crate::shared::github::list_org_runners(&token, org) {
-            Ok(runners) => out.extend(runners.into_iter().map(|r| ApiRunnerRow {
-                agent_id: r.id,
+        match crate::shared::github::list_org_runners_classified(&token, org) {
+            Ok(runners) => out.push(ApiOrgOutcome::Ok {
                 org: org.clone(),
-                name: r.name,
-                online: r.status == "online",
-                busy: r.busy,
-            })),
-            Err(e) => tracing::warn!(error = %e, org = %org, "api reconcile failed"),
+                rows: runners
+                    .into_iter()
+                    .map(|r| ApiRunnerRow {
+                        agent_id: r.id,
+                        org: org.clone(),
+                        name: r.name,
+                        online: r.status == "online",
+                        busy: r.busy,
+                    })
+                    .collect(),
+            }),
+            Err(kind) => {
+                tracing::warn!(org = %org, kind = %kind.label(), hint = kind.hint(), "api reconcile failed");
+                out.push(ApiOrgOutcome::Failed {
+                    org: org.clone(),
+                    kind,
+                });
+            }
         }
     }
     out
