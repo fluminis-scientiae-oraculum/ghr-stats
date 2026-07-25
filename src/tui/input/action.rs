@@ -6,10 +6,14 @@
 //! is suspended; privileged actions shell out via [`privileged::run`], which
 //! escalates per command (sudo when not root, prompting on /dev/tty). These
 //! actions need no root *process* — see the two-tier model in `privileged`.
+//!
+//! Each privileged action builds its [`PrivilegedCall`] once and feeds it to
+//! BOTH `prompt` and `execute`, so a confirm popup always names the command that
+//! will actually run.
 
 use std::path::PathBuf;
 
-use crate::shared::privileged::{self, Outcome};
+use crate::shared::privileged::{self, Outcome, PrivilegedCall, UnitVerb};
 use crate::tui::input::screen::Tty;
 
 /// What the confirm popup shows for a pending action.
@@ -49,6 +53,17 @@ pub(crate) struct RestartRunner {
     pub agent_id: i64,
 }
 
+impl RestartRunner {
+    /// The one command this action runs. Both `prompt` and `execute` go through
+    /// it, so the popup cannot advertise a command other than the one that runs.
+    fn call(&self) -> PrivilegedCall {
+        PrivilegedCall::Systemctl {
+            verb: UnitVerb::Restart,
+            unit: self.unit.clone(),
+        }
+    }
+}
+
 /// Restart + purge the runner's OWN `_work/_temp` + trim `_diag` — idle-only,
 /// scoped to its install dir from `.runner`, NEVER global `/tmp` or docker.
 pub(crate) struct RecycleRunner {
@@ -74,17 +89,23 @@ impl RecycleRunner {
     /// `ActionOutcome` rendering.
     fn recycle(&self) -> Outcome {
         let (temp, diag) = self.scoped_paths();
-        let (temp_s, diag_s) = (temp.to_string_lossy(), diag.to_string_lossy());
 
         // Stop first; abort before touching anything if that fails.
-        let stop = privileged::run(&["systemctl", "stop", &self.unit]);
+        let stop = privileged::run(&self.unit_call(UnitVerb::Stop));
         if !stop.is_ok() {
             return stop;
         }
         // Scoped purge — ONLY this runner's own dirs under its install dir.
-        let _ = privileged::run(&["rm", "-rf", "--", &temp_s]);
-        let _ = privileged::run(&["find", &diag_s, "-type", "f", "-delete"]);
-        privileged::run(&["systemctl", "start", &self.unit])
+        let _ = privileged::run(&PrivilegedCall::PurgeDir { dir: temp });
+        let _ = privileged::run(&PrivilegedCall::TrimFilesIn { dir: diag });
+        privileged::run(&self.unit_call(UnitVerb::Start))
+    }
+
+    fn unit_call(&self, verb: UnitVerb) -> PrivilegedCall {
+        PrivilegedCall::Systemctl {
+            verb,
+            unit: self.unit.clone(),
+        }
     }
 }
 
@@ -92,15 +113,12 @@ impl Action for RestartRunner {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: format!("Restart {} (#{})", self.unit, self.agent_id),
-            body: format!(
-                "sudo systemctl restart {}\nReclaims the runner agent's GC RAM.",
-                self.unit
-            ),
+            body: format!("sudo {}\nReclaims the runner agent's GC RAM.", self.call()),
             danger: false,
         }
     }
     fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-        match privileged::run(&["systemctl", "restart", &self.unit]) {
+        match privileged::run(&self.call()) {
             Outcome::Ok => ActionOutcome::Ok(format!("restarted {}", self.unit)),
             other => ActionOutcome::Failed(other.describe("restart")),
         }

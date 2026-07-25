@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::shared::privileged::{self, Outcome};
+use crate::shared::privileged::{self, Outcome, PrivilegedCall};
 
 /// Install `content` as `env_path`, owned by `user`, mode `0644` — via the
 /// privileged path (direct when root, else `sudo`). Returns the [`Outcome`] so
@@ -28,10 +28,11 @@ pub(crate) fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> O
     if tmp.write_all(content.as_bytes()).is_err() {
         return stage_failed();
     }
-    let (tmp_s, env_s) = (tmp.path().to_string_lossy(), env_path.to_string_lossy());
-    privileged::run(&[
-        "install", "-o", user, "-g", user, "-m", "0644", &tmp_s, &env_s,
-    ])
+    privileged::run(&PrivilegedCall::InstallEnvFile {
+        owner: user.to_string(),
+        src: tmp.path().to_path_buf(),
+        dst: env_path.to_path_buf(),
+    })
     // `tmp` drops here, unlinking the staging file.
 }
 
