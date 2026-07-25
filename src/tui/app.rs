@@ -27,6 +27,7 @@ use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::{self, runners};
 use crate::shared::config::Config;
 use crate::shared::hooks::install::{self, HookStatus};
+use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{
     BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, RunnerState,
 };
@@ -34,7 +35,6 @@ use crate::shared::paths::Scope;
 use crate::shared::util::now_epoch;
 use crate::tui::history::{DataSource, Mode, MutateOutcome, Rings};
 use crate::tui::input::action::{ActionKind, RecycleRunner, RestartRunner};
-use crate::tui::ipc_client::EphemeralReason;
 use crate::tui::widgets::wizard::{self, WizardMode};
 
 const HISTORY_POINTS: usize = 120;

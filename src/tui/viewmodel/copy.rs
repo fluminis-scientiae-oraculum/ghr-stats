@@ -88,10 +88,10 @@ pub(crate) fn work_persistent_only() -> &'static str {
 /// enough that the dashboard fell back to Ephemeral entirely.
 pub(crate) fn version_warning(
     state: super::status::VersionState,
-    ephemeral: Option<crate::tui::ipc_client::EphemeralReason>,
+    ephemeral: Option<crate::shared::ipc::client::EphemeralReason>,
 ) -> Option<String> {
     use super::status::VersionState;
-    use crate::tui::ipc_client::EphemeralReason;
+    use crate::shared::ipc::client::EphemeralReason;
 
     // A wire mismatch is the more actionable report: it explains not just a
     // version difference but why there is no collector data at all.

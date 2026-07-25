@@ -316,6 +316,21 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                 },
             )
         }),
+        // The verdict is computed collector-side, from the same Snapshot the
+        // exporter uses — so `status`, /metrics and the push sink can never
+        // disagree about whether the fleet is healthy.
+        Query::FleetStatus => with_db(conn, |c| {
+            wrap(
+                crate::service::metrics::Snapshot::gather(
+                    c,
+                    crate::shared::util::now_epoch(),
+                    crate::shared::util::BUILD_VERSION,
+                    max_age,
+                )
+                .map(|s| Box::new(s.to_status("persistent"))),
+                Response::FleetStatus,
+            )
+        }),
         Query::RunnerStates => with_db(conn, |c| {
             wrap(reader::runner_states(c), |m| {
                 Response::RunnerStates(m.into_values().collect())

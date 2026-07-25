@@ -30,6 +30,20 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+/// Filters + output shape for `ghr-stats status`.
+#[derive(clap::Args, Debug)]
+pub struct StatusArgs {
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+    /// Only this org.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+    /// Only this runner (by name).
+    #[arg(long, value_name = "NAME")]
+    pub runner: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Launch the interactive TUI dashboard (this is the default).
@@ -47,6 +61,12 @@ pub enum Command {
         endpoint. Install it with `ghr-stats systemd install`."
     )]
     Serve,
+
+    /// One-shot fleet status for scripts and agents (exit code = verdict).
+    #[command(
+        long_about = "Print the fleet's current state and an overall verdict, then exit with a         code that encodes it: 0 healthy, 1 degraded (a runner is offline, diverging from         GitHub's view, or its GitHub reading is stale), 2 cannot determine (no collector and no         readable runner root), 3 usage error. With --json the payload is machine-stable: no         colour, no localised time, both ISO-8601 and epoch, and a schema_version. Reads the         collector over its socket when one is running; otherwise falls back to a live local         scan, in which case the github_* fields are null rather than invented."
+    )]
+    Status(StatusArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

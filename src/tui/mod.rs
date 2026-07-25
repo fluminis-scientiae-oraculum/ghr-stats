@@ -10,7 +10,6 @@
 mod app;
 mod history;
 mod input;
-mod ipc_client;
 mod view;
 mod viewmodel;
 mod widgets;

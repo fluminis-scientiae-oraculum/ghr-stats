@@ -15,10 +15,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::shared::ipc::client::{self as ipc_client, Client, EphemeralReason};
 use crate::shared::ipc::{Mutation, Query, Request, Response};
 use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
 use crate::shared::paths::Scope;
-use crate::tui::ipc_client::{self, Client, EphemeralReason};
 
 /// Which data plane the TUI is on. Drives the header badge + Config tab. A pure
 /// data enum — how it is rendered (label, colour) lives in `viewmodel::style`.

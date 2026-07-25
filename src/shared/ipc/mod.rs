@@ -10,11 +10,15 @@
 //! store's read queries return), so the wire types and the query types can never
 //! drift apart.
 
+pub mod client;
+
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{
+    BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
+};
 
 /// Wire protocol version. Bump on any breaking change to `Request`/`Response`.
 /// The same binary ships both halves, so a mismatch means the installed service
@@ -32,7 +36,8 @@ use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Run
 /// v8: runner identity is the install `dir`, not `agentId` (which collides across
 ///     orgs). `RunnerHistory` keys by `dir`, `ApiRow` carries `org` (so the GH
 ///     join is `(org, agent_id)`), and `RunnerState` is keyed by `dir`.
-/// v9: the GitHub view carries its own freshness verdict. `ApiRow.view` is a
+/// v9: the GitHub view carries its own freshness verdict, and `FleetStatus`
+///     joins `Query` (the machine-facing snapshot behind `ghr-stats status`). `ApiRow.view` is a
 ///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
 ///     read can no longer be rendered as live, and `BusyPoint` carries
 ///     `github_online` so the occupancy chart can plot a gap instead of a zero.
@@ -81,6 +86,11 @@ pub enum Query {
         runner_name: String,
     },
     LatestApiRunners,
+    /// The whole machine-facing fleet snapshot, verdict included. Backs
+    /// `ghr-stats status`: one round-trip instead of six, and the health call is
+    /// made by the collector rather than reassembled (and mis-derived) by each
+    /// client.
+    FleetStatus,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
@@ -156,6 +166,7 @@ pub enum Response {
     RecentJobs(Vec<JobRow>),
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
+    FleetStatus(Box<FleetStatus>),
     /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),

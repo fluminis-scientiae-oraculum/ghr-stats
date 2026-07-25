@@ -128,7 +128,7 @@ mod tests {
     /// A version-drifted collector must not be reported as "no collector".
     #[test]
     fn version_warning_names_the_wire_mismatch_over_the_build_mismatch() {
-        use crate::tui::ipc_client::EphemeralReason;
+        use crate::shared::ipc::client::EphemeralReason;
         use crate::tui::viewmodel::copy::version_warning;
 
         // Wire drift: the actionable one — it also explains the empty dashboard.
