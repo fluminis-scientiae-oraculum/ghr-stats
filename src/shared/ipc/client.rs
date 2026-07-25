@@ -65,7 +65,15 @@ impl Client {
                     reason = EphemeralReason::VersionDrift { server };
                 }
                 Err(ConnectErr::Io(e)) => {
-                    tracing::debug!(?scope, error = %e, "collector IPC connect failed")
+                    tracing::warn!(?scope, error = %e, "collector IPC handshake failed");
+                    // The socket accepted us, so something IS listening — this
+                    // arm setting no reason at all is what let a live collector
+                    // report as absent. Only fill the default in: a `Denied` or
+                    // `VersionDrift` found in the other scope is more specific
+                    // and must not be downgraded.
+                    if reason == EphemeralReason::NoCollector {
+                        reason = EphemeralReason::Unusable;
+                    }
                 }
             }
         }
@@ -146,6 +154,15 @@ pub(crate) enum EphemeralReason {
     VersionDrift { server: u16 },
     /// The socket exists but this user may not connect to it.
     Denied,
+    /// The socket accepted the connection but the handshake never completed —
+    /// an I/O error, or a reply we could not make sense of. Something IS
+    /// listening, so "install a collector" is the wrong advice.
+    Unusable,
+    /// The collector completed the handshake but did not answer the query — so
+    /// it is running AND speaks our wire version, and the fault is its own
+    /// (usually a database error). Distinct from [`Self::NoCollector`] because
+    /// the remedy is the opposite: read its journal, do not install anything.
+    QueryFailed,
 }
 
 /// Why a connect attempt did not yield a Persistent client.

@@ -44,6 +44,14 @@ pub struct StatusArgs {
     pub runner: Option<String>,
 }
 
+/// Output shape for `ghr-stats explain`.
+#[derive(clap::Args, Debug)]
+pub struct ExplainArgs {
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Launch the interactive TUI dashboard (this is the default).
@@ -67,6 +75,18 @@ pub enum Command {
         long_about = "Print the fleet's current state and an overall verdict, then exit with a         code that encodes it: 0 healthy, 1 degraded (a runner is offline, diverging from         GitHub's view, or its GitHub reading is stale), 2 cannot determine (no collector and no         readable runner root), 3 usage error. With --json the payload is machine-stable: no         colour, no localised time, both ISO-8601 and epoch, and a schema_version. Reads the         collector over its socket when one is running; otherwise falls back to a live local         scan, in which case the github_* fields are null rather than invented."
     )]
     Status(StatusArgs),
+
+    /// Why the fleet is degraded — findings with the boundary to investigate.
+    #[command(
+        long_about = "Turn the fleet's current state into findings rather than numbers. Each \
+        finding carries a claim and a `boundary` — local, github, network or config — naming which \
+        side to investigate, which is the expensive half of diagnosing a fleet fault and the half \
+        this tool is uniquely placed to shortcut: it holds the local process truth and GitHub's \
+        opinion at the same instant. Exits with the same code as `status`: 0 healthy, 1 degraded, \
+        2 cannot determine, 3 usage error. Without a collector the GitHub-side findings cannot be \
+        assessed, and that limit is reported as a finding rather than left as silence."
+    )]
+    Explain(ExplainArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

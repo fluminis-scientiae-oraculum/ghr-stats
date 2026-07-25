@@ -78,7 +78,7 @@ fn run() -> Result<std::process::ExitCode> {
     // load lazy and per-arm — so there is no unreachable arm to assert away.
     let load =
         || crate::shared::config::Config::load(config_path.as_deref()).context("loading config");
-    // `status` is the only verb whose exit code carries meaning beyond
+    // `status` and `explain` are the verbs whose exit code carries meaning beyond
     // success/failure — it IS the verdict, so a caller can branch without
     // parsing the payload. Every other verb exits 0 on success.
     let ok = std::process::ExitCode::SUCCESS;
@@ -88,6 +88,9 @@ fn run() -> Result<std::process::ExitCode> {
         None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()).map(|()| ok),
         Some(Command::Status(a)) => {
             crate::ops::status::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        Some(Command::Explain(a)) => {
+            crate::ops::explain::run(&a, &load()?).map(std::process::ExitCode::from)
         }
         Some(Command::Serve) => {
             crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
@@ -147,7 +150,7 @@ fn logs_to_stderr(command: &Option<Command>) -> bool {
         // The dashboard owns the terminal; any log line bleeds onto it.
         None | Some(Command::Tui) => false,
         // Machine-facing stdout — a log line would corrupt the payload.
-        Some(Command::Status(_)) => false,
+        Some(Command::Status(_)) | Some(Command::Explain(_)) => false,
         // Runs under systemd, so its output lands in the journal.
         Some(Command::Serve) => true,
         Some(Command::Config) | Some(Command::Systemd { .. }) | Some(Command::Db { .. }) => true,

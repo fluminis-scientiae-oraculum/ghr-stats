@@ -327,7 +327,7 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                     crate::shared::util::BUILD_VERSION,
                     max_age,
                 )
-                .map(|s| Box::new(s.to_status("persistent"))),
+                .map(|s| Box::new(s.to_status(crate::shared::models::Mode::Persistent))),
                 Response::FleetStatus,
             )
         }),

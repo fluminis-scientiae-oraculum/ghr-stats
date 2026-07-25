@@ -458,6 +458,33 @@ impl From<Verdict> for std::process::ExitCode {
     }
 }
 
+/// Which data plane an answer came from.
+///
+/// Lives here, not in the TUI that first needed it, because it is now part of a
+/// machine-facing payload: `mode` was a `String` on [`FleetStatus`], so every
+/// consumer that wanted to branch on it — the dashboard badge, `status`,
+/// `explain` — had to compare a magic literal, and a rename in one place would
+/// have silently changed nobody's mind but its own. One enum, one spelling, and
+/// the serialized form is still exactly `"ephemeral"` / `"persistent"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// No collector: a live local scan only, so nothing GitHub-side is knowable.
+    Ephemeral,
+    /// The collector answered, so history and the GitHub view are available.
+    Persistent,
+}
+
+impl Mode {
+    /// The wire spelling, for plain-text renderings that must match the JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Ephemeral => "ephemeral",
+            Mode::Persistent => "persistent",
+        }
+    }
+}
+
 /// Machine-facing fleet snapshot — the payload of `ghr-stats status --json` and
 /// of `Query::FleetStatus`.
 ///
@@ -469,8 +496,7 @@ pub struct FleetStatus {
     pub schema_version: u32,
     pub generated_at: String,
     pub generated_at_epoch: i64,
-    /// "persistent" (collector answered) or "ephemeral" (live local scan only).
-    pub mode: String,
+    pub mode: Mode,
     pub verdict: Verdict,
     pub fleet: FleetCounts,
     pub orgs: Vec<OrgStatus>,

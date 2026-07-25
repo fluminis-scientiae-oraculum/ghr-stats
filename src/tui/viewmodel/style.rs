@@ -3,7 +3,7 @@
 
 use ratatui::style::Color;
 
-use crate::tui::history::Mode;
+use crate::shared::models::Mode;
 
 /// The header-badge label (uppercase) + colour.
 pub(crate) fn mode_badge(mode: Mode) -> (&'static str, Color) {

@@ -1,3 +1,4 @@
+pub mod explain;
 pub mod status;
 pub mod systemd;
 pub mod uninstall;

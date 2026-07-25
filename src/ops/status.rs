@@ -15,23 +15,15 @@ use anyhow::Result;
 
 use crate::cli::StatusArgs;
 use crate::shared::config::Config;
+use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::ipc::{Query, Request, Response};
-use crate::shared::models::{FleetCounts, FleetStatus, Liveness, RunnerStatus, Verdict};
+use crate::shared::models::{FleetCounts, FleetStatus, Liveness, Mode, RunnerStatus, Verdict};
 use crate::shared::util::{BUILD_VERSION, now_epoch, to_rfc3339_utc};
 
 /// Run the verb. Returns the verdict so the caller can turn it into an exit
 /// code — the payload and the exit status therefore come from one value.
 pub fn run(args: &StatusArgs, cfg: &Config) -> Result<Verdict> {
-    let mut status = match crate::shared::ipc::client::Client::connect_any() {
-        Ok(mut client) => match client.request(&Request::Query(Query::FleetStatus)) {
-            Ok(Response::FleetStatus(s)) => *s,
-            // A collector answered the handshake but not the query (older build,
-            // or a DB error its side). Fall back rather than fail: a local scan
-            // still answers the liveness half of the question.
-            _ => ephemeral_status(cfg),
-        },
-        Err(_) => ephemeral_status(cfg),
-    };
+    let mut status = snapshot(cfg).status;
 
     filter(&mut status, args);
     // Filtering changes what the verdict is ABOUT, so recompute it over the
@@ -45,6 +37,57 @@ pub fn run(args: &StatusArgs, cfg: &Config) -> Result<Verdict> {
         print!("{}", human(&status));
     }
     Ok(status.verdict)
+}
+
+/// Where an answer came from — and, when it is the fallback, why.
+///
+/// `FleetStatus::mode` says *that* we fell back; only this says *why*, and the
+/// difference is the difference between "install the collector" and "restart the
+/// one you have". `connect_any` already computes the reason and the dashboard
+/// already shows it; dropping it here is what let a verb advise installing a
+/// collector that had been running the whole time.
+pub(crate) enum Source {
+    /// The collector answered — [`FleetStatus::mode`] is [`Mode::Persistent`].
+    Collector,
+    /// A live local scan, and what stopped us reaching a collector —
+    /// [`FleetStatus::mode`] is [`Mode::Ephemeral`]. Pairing the reason with the
+    /// fallback in one variant is what keeps "ephemeral for no stated reason"
+    /// off the table.
+    LocalScan(EphemeralReason),
+}
+
+/// A snapshot together with its provenance.
+pub(crate) struct Snapshot {
+    pub status: FleetStatus,
+    pub source: Source,
+}
+
+/// The fleet snapshot every machine-facing verb reasons over: the collector's if
+/// one answers on its socket, otherwise a live local scan.
+///
+/// Shared with [`crate::ops::explain`] on purpose, and the only constructor of a
+/// [`Snapshot`]. Two verbs each opening their own connection with their own
+/// fallback rule is how `status` and `explain` would come to disagree about the
+/// mode, or about the numbers — and a disagreement between "is it healthy" and
+/// "why isn't it" is worse than either being wrong.
+pub(crate) fn snapshot(cfg: &Config) -> Snapshot {
+    let local = |reason| Snapshot {
+        status: ephemeral_status(cfg),
+        source: Source::LocalScan(reason),
+    };
+    match crate::shared::ipc::client::Client::connect_any() {
+        Ok(mut client) => match client.request(&Request::Query(Query::FleetStatus)) {
+            Ok(Response::FleetStatus(s)) => Snapshot {
+                status: *s,
+                source: Source::Collector,
+            },
+            // It handshook but did not answer. Fall back rather than fail — a
+            // local scan still answers the liveness half of the question — but
+            // say so precisely: this collector is up, not absent.
+            _ => local(EphemeralReason::QueryFailed),
+        },
+        Err(reason) => local(reason),
+    }
 }
 
 /// Restrict the payload to the requested org / runner.
@@ -124,7 +167,7 @@ fn ephemeral_status(cfg: &Config) -> FleetStatus {
         schema_version: 1,
         generated_at: to_rfc3339_utc(now),
         generated_at_epoch: now,
-        mode: "ephemeral".to_string(),
+        mode: Mode::Ephemeral,
         verdict: Verdict::Unknown,
         fleet: counts(&runners),
         orgs: Vec::new(),
@@ -147,7 +190,8 @@ fn human(s: &FleetStatus) -> String {
     let _ = writeln!(
         out,
         "ghr-stats {BUILD_VERSION}  ·  {}  ·  {}  ·  {verdict}",
-        s.mode, s.generated_at
+        s.mode.as_str(),
+        s.generated_at
     );
     let f = &s.fleet;
     let _ = writeln!(
@@ -208,7 +252,7 @@ mod tests {
             schema_version: 1,
             generated_at: to_rfc3339_utc(0),
             generated_at_epoch: 0,
-            mode: "persistent".into(),
+            mode: Mode::Persistent,
             verdict: Verdict::Unknown,
             fleet: counts(&runners),
             orgs: Vec::new(),

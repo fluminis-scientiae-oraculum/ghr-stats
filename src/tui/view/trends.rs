@@ -10,9 +10,9 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::{ChartSpec, draw_time_chart, fmt_bytes, fmt_opt_bytes};
+use crate::shared::models::Mode;
 use crate::shared::util::now_epoch;
 use crate::tui::app::App;
-use crate::tui::history::Mode;
 use crate::tui::viewmodel;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {

@@ -29,11 +29,11 @@ use crate::shared::config::Config;
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{
-    BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, RunnerState,
+    BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, Mode, RunnerState,
 };
 use crate::shared::paths::Scope;
 use crate::shared::util::now_epoch;
-use crate::tui::history::{DataSource, Mode, MutateOutcome, Rings};
+use crate::tui::history::{DataSource, MutateOutcome, Rings};
 use crate::tui::input::action::{ActionKind, RecycleRunner, RestartRunner};
 use crate::tui::widgets::wizard::{self, WizardMode};
 

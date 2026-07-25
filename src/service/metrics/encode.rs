@@ -10,8 +10,8 @@ use rusqlite::Connection;
 use crate::service::store::reader;
 use crate::shared::error::Result;
 use crate::shared::models::{
-    self, ApiReconcileState, FleetCounts, FleetStatus, GhView, Liveness, OrgStatus, RunnerStatus,
-    Verdict,
+    self, ApiReconcileState, FleetCounts, FleetStatus, GhView, Liveness, Mode, OrgStatus,
+    RunnerStatus, Verdict,
 };
 
 /// One runner's metric row.
@@ -191,7 +191,7 @@ impl Snapshot {
     /// consumer: an agent re-deriving "is this healthy?" from six gauges gets it
     /// wrong the same way a human does — which is the whole lesson of the
     /// incident this release addresses. One verdict, one place.
-    pub fn to_status(&self, mode: &str) -> FleetStatus {
+    pub fn to_status(&self, mode: Mode) -> FleetStatus {
         let reconcile_age = |org: &str| -> Option<i64> {
             self.reconcile
                 .iter()
@@ -254,7 +254,7 @@ impl Snapshot {
             schema_version: 1,
             generated_at: crate::shared::util::to_rfc3339_utc(self.now),
             generated_at_epoch: self.now,
-            mode: mode.to_string(),
+            mode,
             verdict,
             fleet: FleetCounts {
                 runners: self.runners.len() as u32,
