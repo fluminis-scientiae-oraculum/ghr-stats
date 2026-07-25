@@ -20,7 +20,7 @@ use crate::ops::status::{Snapshot, Source};
 use crate::shared::config::Config;
 use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{FleetStatus, Liveness, Mode, RunnerStatus, Verdict};
-use crate::shared::util::BUILD_VERSION;
+use crate::shared::util::{BUILD_VERSION, to_rfc3339_utc};
 
 /// Which side of the fence to investigate — the load-bearing field of a finding.
 ///
@@ -59,12 +59,26 @@ pub(crate) enum Severity {
 /// `id` is `&'static str` rather than `String` because the set of findings is
 /// closed at compile time: an id is a name in this file's vocabulary, not data
 /// read from anywhere, so it cannot be typo'd into existence at runtime.
+///
+/// `claim` is the assertion, `evidence` is what it rests on, and
+/// `suggested_checks` is what to do about it. Keeping them separate is the point:
+/// an agent can act on the claim, a human can audit the evidence, and neither has
+/// to parse a paragraph to find the other.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Finding {
     pub id: &'static str,
     pub severity: Severity,
     pub boundary: Boundary,
     pub claim: String,
+    /// The observations the claim rests on — always concrete counts, names or
+    /// timestamps, never a restatement of the claim.
+    pub evidence: Vec<String>,
+    /// When the condition began, ISO-8601 UTC. `None` when the snapshot carries
+    /// no duration to work back from; never guessed.
+    pub first_seen: Option<String>,
+    /// What to look at, in the order worth looking. Ordered by the `boundary`,
+    /// since that is the whole reason the field exists.
+    pub suggested_checks: Vec<String>,
 }
 
 /// The `explain` payload. Carries `mode` and `verdict` from the snapshot it was
@@ -107,12 +121,15 @@ fn explain(snap: &Snapshot) -> Explanation {
     }
 }
 
-/// Every finding this build can make, in severity order. Pure.
+/// Every finding this build can make, worst first — so a caller that reads only
+/// the head of the list still reads the thing that matters most. Pure.
 fn findings(snap: &Snapshot) -> Vec<Finding> {
     [
         divergence(&snap.status),
         offline_locally(&snap.status),
+        github_view_stale(snap),
         github_view_unavailable(&snap.source),
+        org_never_reconciled(snap),
     ]
     .into_iter()
     .flatten()
@@ -156,12 +173,72 @@ fn divergence(s: &FleetStatus) -> Option<Finding> {
         ),
     };
 
+    // Work back from the LONGEST outage, not the newest: the earliest onset is
+    // when the condition started, and the later ones are it spreading.
+    let longest = divergent
+        .iter()
+        .filter_map(|r| r.github_offline_seconds)
+        .max();
+    let healthy: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|o| !affected.contains(o))
+        .collect();
+
+    let mut evidence = vec![format!(
+        "{}/{} runners in {orgs} have a live local listener",
+        divergent.len(),
+        s.runners
+            .iter()
+            .filter(|r| affected.contains(&r.org.as_str()))
+            .count()
+    )];
+    evidence.push(match longest {
+        Some(secs) => format!(
+            "github_online=false for {} runners, longest {secs}s",
+            divergent.len()
+        ),
+        None => format!("github_online=false for {} runners", divergent.len()),
+    });
+    evidence.push(if healthy.is_empty() {
+        "no peer org on this host is online to GitHub".to_string()
+    } else {
+        format!(
+            "peer orgs on this host still online: {}",
+            healthy.join(", ")
+        )
+    });
+
     Some(Finding {
         id: "github-divergence",
         severity: Severity::High,
         boundary,
         claim,
+        evidence,
+        first_seen: longest.map(|secs| to_rfc3339_utc(s.generated_at_epoch - secs)),
+        suggested_checks: checks_for(boundary),
     })
+}
+
+/// What to look at, chosen by the boundary. The `network` list leads with this
+/// host because that is what the boundary derivation just ruled *in*; the
+/// `github` list leads with the provider for the same reason. Ordering the checks
+/// by anything else would waste the one inference this verb exists to make.
+fn checks_for(boundary: Boundary) -> Vec<String> {
+    let checks: &[&str] = match boundary {
+        Boundary::Network => &[
+            "this host's egress to api.github.com (DNS, proxy, firewall, NAT)",
+            "whether every org's PAT expired at the same time",
+            "the provider status page, Actions component",
+        ],
+        _ => &[
+            "the provider status page, Actions component",
+            "compare the `serverUrl` shard in each runner's .runner across orgs",
+            "confirm the org's Actions permissions and runner-group membership are unchanged",
+            "confirm this org's PAT is unexpired and still has Self-hosted runners: Read",
+        ],
+    };
+    checks.iter().map(|c| (*c).to_string()).collect()
 }
 
 /// Which side to investigate, from the *spread* of divergence across the orgs on
@@ -191,6 +268,13 @@ fn offline_locally(s: &FleetStatus) -> Option<Finding> {
     if names.is_empty() {
         return None;
     }
+    let longest = s
+        .runners
+        .iter()
+        .filter(|r| r.liveness == Liveness::Offline)
+        .map(|r| r.state_seconds)
+        .max()
+        .filter(|secs| *secs > 0);
     Some(Finding {
         id: "runners-offline-locally",
         severity: Severity::Medium,
@@ -200,6 +284,145 @@ fn offline_locally(s: &FleetStatus) -> Option<Finding> {
             names.len(),
             names.join(", ")
         ),
+        evidence: vec![
+            format!("liveness=offline for {}/{}", names.len(), s.runners.len()),
+            match longest {
+                Some(secs) => format!("longest offline for {secs}s"),
+                // Ephemeral has no persisted edge to measure from, so it reports
+                // 0 — say nothing rather than report "offline for 0s".
+                None => "no state duration available (no collector history)".to_string(),
+            },
+        ],
+        first_seen: longest.map(|secs| to_rfc3339_utc(s.generated_at_epoch - secs)),
+        suggested_checks: vec![
+            "systemctl status for each runner's unit".to_string(),
+            "the runner's own _diag logs under its install dir".to_string(),
+            "disk space on the runner's work folder".to_string(),
+        ],
+    })
+}
+
+/// Runners the collector holds no CURRENT GitHub reading for, in an org that has
+/// reconciled successfully at some point. It worked and stopped, which is a
+/// different problem from never having been configured — see
+/// [`org_never_reconciled`], which is the standing-condition half of this split.
+///
+/// Freshness is not re-adjudicated here: the reader already decided it once and
+/// hands out `github_online: None` for a view that is stale or unknown. Re-testing
+/// an age against a threshold in a second place is how the two would disagree.
+fn github_view_stale(snap: &Snapshot) -> Option<Finding> {
+    // Only the collector has a GitHub view at all; in a local scan every reading
+    // is absent for one reason, already reported once by `github_view_unavailable`.
+    if !matches!(snap.source, Source::Collector) {
+        return None;
+    }
+    let s = &snap.status;
+    let reconciled = |org: &str| {
+        s.orgs
+            .iter()
+            .find(|o| o.org == org)
+            .is_some_and(|o| o.reconcile_age_s.is_some())
+    };
+    let names: Vec<&str> = s
+        .runners
+        .iter()
+        .filter(|r| r.github_online.is_none() && reconciled(&r.org))
+        .map(|r| r.name.as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let oldest = s
+        .orgs
+        .iter()
+        .filter(|o| {
+            s.runners
+                .iter()
+                .any(|r| r.org == o.org && r.github_online.is_none())
+        })
+        .filter_map(|o| o.reconcile_age_s)
+        .max();
+    Some(Finding {
+        id: "github-view-stale",
+        severity: Severity::Medium,
+        boundary: Boundary::Github,
+        claim: format!(
+            "{} runners have no current GitHub reading even though their org has reconciled \
+             before: {}. Their local state is known; GitHub's opinion of them is not.",
+            names.len(),
+            names.join(", ")
+        ),
+        evidence: vec![
+            format!(
+                "github_online=null for {}/{} runners",
+                names.len(),
+                s.runners.len()
+            ),
+            match oldest {
+                Some(age) => format!("last successful reconcile for the affected orgs: {age}s ago"),
+                None => "no successful reconcile timestamp for the affected orgs".to_string(),
+            },
+        ],
+        first_seen: oldest.map(|age| to_rfc3339_utc(s.generated_at_epoch - age)),
+        suggested_checks: vec![
+            "ghr_api_reconcile_ok and ghr_api_reconcile_errors_total on the metrics endpoint"
+                .to_string(),
+            "whether the org's PAT expired or lost Self-hosted runners: Read".to_string(),
+            "whether these runners were removed from the org on GitHub's side".to_string(),
+        ],
+    })
+}
+
+/// Orgs that have NEVER reconciled successfully. Deliberately `Info`: a host can
+/// legitimately carry an org it holds no token for — a personal account, say —
+/// and that is a standing configuration fact, not an incident. Ranking it with
+/// the failures would make `explain` cry wolf on every single run, which is how
+/// a findings list stops being read.
+fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
+    if !matches!(snap.source, Source::Collector) {
+        return None;
+    }
+    let s = &snap.status;
+    let orgs: Vec<&str> = s
+        .orgs
+        .iter()
+        .filter(|o| o.reconcile_age_s.is_none())
+        .map(|o| o.org.as_str())
+        .collect();
+    if orgs.is_empty() {
+        return None;
+    }
+    let runners: usize = s
+        .runners
+        .iter()
+        .filter(|r| orgs.contains(&r.org.as_str()))
+        .count();
+    Some(Finding {
+        id: "org-never-reconciled",
+        severity: Severity::Info,
+        boundary: Boundary::Config,
+        claim: format!(
+            "{} orgs have never reconciled with GitHub: {}. Their {runners} runners are reported \
+             from local state only, and can never be found divergent.",
+            orgs.len(),
+            orgs.join(", ")
+        ),
+        evidence: vec![
+            format!(
+                "reconcile_age_s=null for {}/{} orgs",
+                orgs.len(),
+                s.orgs.len()
+            ),
+            format!("{runners} runners have no GitHub side to compare against"),
+        ],
+        // "Never" has no onset to report, and inventing the collector's start
+        // time here would be a guess dressed as a measurement.
+        first_seen: None,
+        suggested_checks: vec![
+            "whether a read-only PAT is configured for each of these orgs".to_string(),
+            "ghr_api_org_configured on the metrics endpoint".to_string(),
+            "that this is expected — a personal account cannot expose org runners".to_string(),
+        ],
     })
 }
 
@@ -213,6 +436,27 @@ fn offline_locally(s: &FleetStatus) -> Option<Finding> {
 /// ways to end up without a collector have four different remedies, and three of
 /// them are actively worsened by being told to install one that is already there.
 fn github_view_unavailable(source: &Source) -> Option<Finding> {
+    let checks: Vec<String> = match source {
+        Source::Collector => Vec::new(),
+        Source::LocalScan(EphemeralReason::NoCollector) => vec![
+            "`ghr-stats systemd install --system` (or `--user`)".to_string(),
+            "`systemctl status ghr-stats` in case it is installed but stopped".to_string(),
+        ],
+        Source::LocalScan(EphemeralReason::VersionDrift { .. }) => vec![
+            "`systemctl restart ghr-stats` — the binary was upgraded, the service was not"
+                .to_string(),
+            "`ghr-stats --version` against the version the unit's ExecStart points at".to_string(),
+        ],
+        Source::LocalScan(EphemeralReason::Denied) => vec![
+            "the socket's permissions and the unit's RuntimeDirectoryMode".to_string(),
+            "re-running as root, or as a member of the `ghr-stats` group".to_string(),
+        ],
+        Source::LocalScan(EphemeralReason::Unusable | EphemeralReason::QueryFailed) => vec![
+            "`journalctl -u ghr-stats` for the collector's own errors".to_string(),
+            "whether another client is holding the collector's only connection".to_string(),
+            "that the socket belongs to a live collector and is not stale".to_string(),
+        ],
+    };
     let (boundary, claim) = match source {
         Source::Collector => return None,
         Source::LocalScan(EphemeralReason::NoCollector) => (
@@ -258,7 +502,25 @@ fn github_view_unavailable(source: &Source) -> Option<Finding> {
         severity: Severity::Info,
         boundary,
         claim,
+        evidence: vec![format!("ipc: {}", reason_word(source))],
+        // The fallback is observed now; how long it has been true is not knowable
+        // from a snapshot that could not reach the thing that would know.
+        first_seen: None,
+        suggested_checks: checks,
     })
+}
+
+/// A stable machine-readable token for why we fell back, so an agent can branch
+/// on the cause without matching on prose that may be reworded.
+fn reason_word(source: &Source) -> &'static str {
+    match source {
+        Source::Collector => "connected",
+        Source::LocalScan(EphemeralReason::NoCollector) => "no-collector",
+        Source::LocalScan(EphemeralReason::VersionDrift { .. }) => "version-drift",
+        Source::LocalScan(EphemeralReason::Denied) => "denied",
+        Source::LocalScan(EphemeralReason::Unusable) => "handshake-failed",
+        Source::LocalScan(EphemeralReason::QueryFailed) => "query-failed",
+    }
 }
 
 /// The orgs represented by a set of runners, deduplicated and ordered, so the
@@ -288,14 +550,25 @@ fn human(e: &Explanation) -> String {
         return out;
     }
     for f in &e.findings {
+        let since = f
+            .first_seen
+            .as_deref()
+            .map(|t| format!(" · since {t}"))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "[{}] {} · investigate: {}",
+            "[{}] {} · investigate: {}{since}",
             severity_word(f.severity),
             f.id,
             boundary_word(f.boundary)
         );
         let _ = writeln!(out, "  {}", f.claim);
+        for e in &f.evidence {
+            let _ = writeln!(out, "    - {e}");
+        }
+        for (i, c) in f.suggested_checks.iter().enumerate() {
+            let _ = writeln!(out, "    {}. {c}", i + 1);
+        }
     }
     out
 }
@@ -328,7 +601,7 @@ fn boundary_word(b: Boundary) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::models::FleetCounts;
+    use crate::shared::models::{FleetCounts, OrgStatus};
 
     fn runner(name: &str, org: &str, liveness: Liveness, divergent: Option<bool>) -> RunnerStatus {
         RunnerStatus {
@@ -559,6 +832,128 @@ mod tests {
                 "github-view-unavailable"
             ]
         );
+    }
+
+    fn org(name: &str, reconcile_age_s: Option<i64>) -> OrgStatus {
+        OrgStatus {
+            org: name.into(),
+            runners: 1,
+            github_online: 0,
+            reconcile_age_s,
+            verdict: Verdict::Ok,
+        }
+    }
+
+    fn with_orgs(runners: Vec<RunnerStatus>, orgs: Vec<OrgStatus>) -> Snapshot {
+        let mut snap = status(Mode::Persistent, runners);
+        snap.status.orgs = orgs;
+        snap
+    }
+
+    /// The claim asserts; the evidence has to be checkable independently of it.
+    /// Naming the healthy peers is the whole basis of the github-vs-network call,
+    /// so a reader must be able to audit that call without rerunning the tool.
+    #[test]
+    fn the_divergence_finding_evidences_the_peer_comparison_it_relied_on() {
+        let s = status(
+            Mode::Persistent,
+            vec![
+                runner("a0", "org-a", Liveness::Idle, Some(false)),
+                runner("b0", "org-b", Liveness::Idle, Some(true)),
+            ],
+        );
+        let f = &findings(&s)[0];
+        assert!(
+            f.evidence.iter().any(|e| e.contains("org-a")),
+            "evidence must name the healthy peer: {:?}",
+            f.evidence
+        );
+        // github_offline_seconds is 600 in the fixture, generated_at_epoch is 0.
+        assert_eq!(f.first_seen.as_deref(), Some("1969-12-31T23:50:00Z"));
+        assert!(f.suggested_checks.iter().any(|c| c.contains("status page")));
+    }
+
+    /// The onset is the EARLIEST, so it must come from the longest outage. Taking
+    /// the newest would report the moment the fault spread, not when it began.
+    #[test]
+    fn first_seen_comes_from_the_longest_outage_not_the_latest() {
+        let mut recent = runner("b0", "org-b", Liveness::Idle, Some(true));
+        recent.github_offline_seconds = Some(60);
+        let mut old = runner("b1", "org-b", Liveness::Idle, Some(true));
+        old.github_offline_seconds = Some(3600);
+        let mut s = status(Mode::Persistent, vec![recent, old]);
+        s.status.generated_at_epoch = 10_000;
+
+        assert_eq!(
+            findings(&s)[0].first_seen.as_deref(),
+            Some(to_rfc3339_utc(10_000 - 3600).as_str())
+        );
+    }
+
+    /// Never-configured is a standing fact, not an incident. This host carries an
+    /// org it can never reconcile, so ranking it above Info would make `explain`
+    /// cry wolf on every single run — which is how a findings list stops being read.
+    #[test]
+    fn a_never_reconciled_org_is_info_and_carries_no_onset() {
+        let s = with_orgs(
+            vec![runner("p0", "personal", Liveness::Idle, None)],
+            vec![org("personal", None)],
+        );
+        let f = findings(&s)
+            .into_iter()
+            .find(|f| f.id == "org-never-reconciled")
+            .expect("finding");
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.boundary, Boundary::Config);
+        // "Never" has no onset; inventing the collector's start time would be a
+        // guess dressed as a measurement.
+        assert_eq!(f.first_seen, None);
+        assert!(f.claim.contains("personal"));
+    }
+
+    /// "Worked and stopped" is a different problem from "never worked", and only
+    /// the first is a change worth chasing. The split is what keeps the standing
+    /// config gap out of the Medium band.
+    #[test]
+    fn a_stale_view_is_reported_only_for_an_org_that_has_reconciled_before() {
+        let s = with_orgs(
+            vec![
+                runner("w0", "worked", Liveness::Idle, None),
+                runner("n0", "never", Liveness::Idle, None),
+            ],
+            vec![org("worked", Some(900)), org("never", None)],
+        );
+        let ids: Vec<&str> = findings(&s).iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["github-view-stale", "org-never-reconciled"]);
+
+        let stale = &findings(&s)[0];
+        assert_eq!(stale.severity, Severity::Medium);
+        assert_eq!(stale.boundary, Boundary::Github);
+        assert!(stale.claim.contains("w0"), "{}", stale.claim);
+        assert!(!stale.claim.contains("n0"), "{}", stale.claim);
+        assert_eq!(stale.first_seen.as_deref(), Some("1969-12-31T23:45:00Z"));
+    }
+
+    /// Neither collector-only finding may fire from a local scan: without a
+    /// collector there are no orgs and no adjudicated freshness, so both would be
+    /// asserting things about data that was never fetched.
+    #[test]
+    fn collector_only_findings_stay_silent_in_a_local_scan() {
+        let s = fell_back(
+            EphemeralReason::NoCollector,
+            vec![runner("a0", "org-a", Liveness::Idle, None)],
+        );
+        let ids: Vec<&str> = findings(&s).iter().map(|f| f.id).collect();
+        assert_eq!(ids, ["github-view-unavailable"]);
+    }
+
+    /// The checks are ordered BY the boundary — that ordering is the payload, not
+    /// decoration. A network verdict that opened with "check the provider status
+    /// page" would discard the inference that produced the verdict.
+    #[test]
+    fn suggested_checks_lead_with_the_side_the_boundary_named() {
+        assert!(checks_for(Boundary::Network)[0].contains("this host's egress"));
+        assert!(checks_for(Boundary::Github)[0].contains("provider status page"));
     }
 
     /// Machine-stable output: the org list in a claim must not depend on hash
