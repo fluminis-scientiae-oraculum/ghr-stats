@@ -1,15 +1,21 @@
 //! The collector half of the IPC: a `UnixListener` on the scope's socket path,
-//! answering the TUI's read-only queries from a WAL reader connection. Modeled
-//! on `metrics::pull::spawn` — a named thread, its own reader connection, a
-//! non-fatal bind, and a `term`-polled (non-blocking) accept loop so a SIGTERM
-//! exits promptly. The handlers are thin adapters over `store::reader`.
+//! answering read-only queries from a WAL reader connection. Modeled on
+//! `metrics::pull::spawn` — a named thread, a non-fatal bind, and a
+//! `term`-polled (non-blocking) accept loop so a SIGTERM exits promptly. The
+//! handlers are thin adapters over `store::reader`.
+//!
+//! Each accepted connection is served on **its own thread**, with its own reader
+//! connection. Serving inline instead is what made a live dashboard lock every
+//! other client out: `serve_conn` loops until its read times out, and a TUI that
+//! refreshes inside `CONN_TIMEOUT` — which is the healthy case, by design —
+//! never times out, so `accept` was never reached again.
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -23,8 +29,16 @@ use crate::shared::paths::{ADMIN_GROUP, Scope};
 
 /// How often the non-blocking accept loop wakes to re-check the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
-/// Per-connection I/O timeout — a wedged client can't stall the accept loop.
+/// Per-connection I/O timeout. Bounds how long a *silent* client holds a slot;
+/// it is NOT what keeps the accept loop free — a healthy client never reaches it.
 const CONN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many connections may be served at once.
+///
+/// The socket is `0666`, so this doubles as the bound on what a local user can
+/// pin. Past it a connection is accepted and dropped immediately: refusing
+/// visibly beats queueing behind an accept loop that will not come back, which
+/// is the failure this cap replaces.
+const MAX_CONNS: usize = 8;
 
 /// The authenticated peer of a connection, from `SO_PEERCRED` (kernel-provided,
 /// unspoofable). Resolved once per connection.
@@ -89,7 +103,7 @@ pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>, config_path: PathBuf)
         .expect("spawn ipc-server")
 }
 
-fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool, config_path: &Path) {
+fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &Arc<AtomicBool>, config_path: &Path) {
     let listener = match bind(sock) {
         Ok(l) => l,
         Err(e) => {
@@ -104,16 +118,32 @@ fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool, config_
     }
     tracing::info!(sock = %sock.display(), "ipc listening");
 
-    let conn = store::open_reader(db);
+    let live = Arc::new(AtomicUsize::new(0));
+    let mut workers: Vec<JoinHandle<()>> = Vec::new();
     while !term.load(Ordering::SeqCst) {
+        // Reap finished workers so the vector stays bounded by MAX_CONNS rather
+        // than by the number of clients this collector has ever served.
+        workers.retain(|w| !w.is_finished());
         match listener.accept() {
             Ok((stream, _addr)) => {
-                // One local client at a low rate — serve inline. `serve_conn`
-                // polls `term` and drops a stalled/idle connection at the read
-                // timeout, so neither a slow client nor a pending SIGTERM can
-                // wedge the accept loop.
-                if let Err(e) = serve_conn(stream, conn.as_ref(), config_path, shared, term) {
-                    tracing::debug!(error = %e, "ipc: connection ended");
+                // A thread per connection, NOT inline. `serve_conn` runs until
+                // its client hangs up, and a dashboard holds its connection open
+                // for as long as it is on screen — inline, that one client owned
+                // the accept loop and every other client queued behind it
+                // forever.
+                // Check-then-increment is sound without a CAS because this is the
+                // only thread that ever increments; workers only ever decrement.
+                if live.load(Ordering::SeqCst) >= MAX_CONNS {
+                    tracing::warn!(max = MAX_CONNS, "ipc: at capacity, dropping connection");
+                    continue; // `stream` closes here — the client sees a clean hang-up
+                }
+                live.fetch_add(1, Ordering::SeqCst);
+                let slot = Slot(Arc::clone(&live));
+                match spawn_conn(stream, db, shared, term, config_path, slot) {
+                    Ok(w) => workers.push(w),
+                    // The closure — and with it `slot` — is dropped here, so a
+                    // failed spawn releases its slot without a manual decrement.
+                    Err(e) => tracing::warn!(error = %e, "ipc: spawn connection thread"),
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
@@ -123,9 +153,56 @@ fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool, config_
             }
         }
     }
+    // `term` is set, and every worker polls it between requests, so each returns
+    // within one read timeout at worst. Join before removing the socket so no
+    // worker is still answering on a path we have already unlinked.
+    for w in workers {
+        let _ = w.join();
+    }
     // Best-effort: systemd's RuntimeDirectory= also removes this on stop.
     let _ = std::fs::remove_file(sock);
     tracing::debug!("ipc stopped");
+}
+
+/// Holds one of the [`MAX_CONNS`] connection slots, releasing it on drop.
+///
+/// A slot released by an explicit decrement at the end of the worker would leak
+/// on any early return or panic, and a leaked slot is permanent — it shrinks the
+/// server's capacity for the life of the process. Drop cannot be skipped.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Serve one connection on its own thread, with its own reader connection.
+///
+/// Per-thread rather than shared because `rusqlite::Connection` is not `Sync`,
+/// and opening a WAL reader is cheap — the alternative, one connection behind a
+/// mutex, would re-serialize exactly what this split exists to unserialize.
+fn spawn_conn(
+    stream: UnixStream,
+    db: &Path,
+    shared: &SharedConfig,
+    term: &Arc<AtomicBool>,
+    config_path: &Path,
+    slot: Slot,
+) -> io::Result<JoinHandle<()>> {
+    let db = db.to_path_buf();
+    let shared = shared.clone();
+    let term = Arc::clone(term);
+    let config_path = config_path.to_path_buf();
+    thread::Builder::new()
+        .name("ipc-conn".into())
+        .spawn(move || {
+            let _slot = slot; // released when this thread ends, however it ends
+            let conn = store::open_reader(&db);
+            if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path, &shared, &term) {
+                tracing::debug!(error = %e, "ipc: connection ended");
+            }
+        })
 }
 
 /// Create the runtime dir, clear any stale socket, bind, and widen perms so a
@@ -396,6 +473,79 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+
+    fn handshake(stream: &mut UnixStream) -> io::Result<Response> {
+        ipc::write_frame(stream, &Request::Hello { client: VERSION })?;
+        ipc::read_frame(stream)
+    }
+
+    /// A client that holds its connection open must not lock every other client
+    /// out.
+    ///
+    /// The production failure this guards, found on the live fleet host: served
+    /// inline, `serve_conn` runs until its client hangs up, and the dashboard
+    /// holds its connection open for as long as it is on screen. One open TUI
+    /// therefore owned the accept loop, every other client sat unaccepted in the
+    /// kernel backlog, and `status` / `explain` timed out during the handshake
+    /// and reported "no collector" — while the collector was healthy, listening,
+    /// and answering the dashboard the whole time.
+    ///
+    /// The 2 s budget is deliberately well inside `CONN_TIMEOUT` (5 s). Served
+    /// inline, the second client could not be accepted until the FIRST client's
+    /// read timed out, so "is it served promptly" is exactly what separates the
+    /// two designs — "is it served eventually" does not.
+    #[test]
+    fn a_held_connection_does_not_lock_out_a_second_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("serve.sock");
+        let db = dir.path().join("history.db");
+        let config_path = dir.path().join("config.toml");
+        let term = Arc::new(AtomicBool::new(false));
+
+        let server = {
+            let (sock, db, config_path, term) = (
+                sock.clone(),
+                db.clone(),
+                config_path.clone(),
+                Arc::clone(&term),
+            );
+            thread::spawn(move || {
+                let shared = SharedConfig::new(Config::default());
+                run(&sock, &db, &shared, &term, &config_path);
+            })
+        };
+
+        let mut first = (0..100)
+            .find_map(|_| {
+                UnixStream::connect(&sock).ok().or_else(|| {
+                    thread::sleep(Duration::from_millis(20));
+                    None
+                })
+            })
+            .expect("collector never bound its socket");
+        assert!(matches!(
+            handshake(&mut first).expect("first handshake"),
+            Response::Hello { .. }
+        ));
+
+        // `first` stays open and idle from here — precisely what an on-screen
+        // dashboard does between refreshes, and precisely what used to wedge us.
+        let mut second = UnixStream::connect(&sock).expect("second client could not connect");
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        match handshake(&mut second) {
+            Ok(Response::Hello { .. }) => {}
+            other => panic!(
+                "a second client was not served while the first held its connection: {other:?}"
+            ),
+        }
+
+        term.store(true, Ordering::SeqCst);
+        drop(first);
+        drop(second);
+        server.join().unwrap();
+    }
 
     #[test]
     fn query_limit_is_clamped() {
