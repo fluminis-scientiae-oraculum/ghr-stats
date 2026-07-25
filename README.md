@@ -38,7 +38,12 @@ standard self-hosted runner, not just the box it was first built for.
 - **Zero setup** — the Ephemeral TUI works the instant you run it; no service, no
   database, no root.
 - **Two truths, side by side** — local process/cgroup liveness *and* GitHub's API
-  view, so any disagreement is visible at a glance.
+  view, so any disagreement is visible at a glance. A runner that is healthy
+  locally but which GitHub will not dispatch to is called out as **divergent**,
+  in the dashboard and in the metrics.
+- **Scriptable** — `ghr-stats status --json` gives one machine-stable payload and
+  an exit code that encodes the verdict, so a script or an agent can ask "is the
+  fleet healthy?" without parsing a dashboard.
 - **Optional collector** — a systemd service adds SQLite history, a Jobs timeline
   from the runner hooks, and a Prometheus exporter (pull *and* push).
 - **Zero host assumptions** — every fact from each runner's own `.runner` file +
@@ -118,6 +123,7 @@ anyone on a different CPU. Needs a musl C compiler (`musl-gcc`, e.g. Arch
 ghr-stats                              # Ephemeral dashboard — works immediately, no setup
 ghr-stats config                       # interactive: discover runners, add PAT(s), set up hooks
 ghr-stats systemd install --user       # install the collector → Persistent mode
+ghr-stats status --json                # one-shot state for scripts; exit code = verdict
 ```
 
 Installing the collector as a **user** service runs it as the operator that owns

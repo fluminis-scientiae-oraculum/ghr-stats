@@ -34,6 +34,27 @@ Membership is resolved fresh by the collector on every request, so
 unauthorized edit is refused with guidance rather than silently failing. Hooks
 (`[h]`) and the raw-file editor (`[o]`) still shell out with sudo.
 
+## Intervals
+
+```toml
+[intervals]
+local_secs = 5          # local sampling cadence (processes / cgroup / host)
+api_secs   = 60         # GitHub API reconcile cadence (floored at 10)
+# api_max_age_secs = 180
+```
+
+`api_max_age_secs` bounds how old a GitHub reconcile reading may be and still be
+reported as current. Leave it unset and it is **derived** from `api_secs` —
+three polls' grace with a 180 s floor — so raising the poll interval widens the
+window automatically instead of marking the whole fleet stale. Three polls, not
+one, so a single slow or rate-limited cycle does not flap everything.
+
+Past the window a runner's GitHub view reads `stale` in the dashboard and its
+`ghr_runner_github_online` series drops out rather than serving an aged value as
+live. The effective value is exported as `ghr_api_max_age_seconds`, so a scrape
+is self-describing and an alert can reference your setting rather than hardcode
+one.
+
 ## GitHub API (optional, read-only)
 
 > **Organization runners only, for the GitHub-side reconcile.** The reconcile

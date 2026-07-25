@@ -6,6 +6,8 @@
 
 ```bash
 ghr-stats                       # the dashboard (default; `tui` is a hidden alias)
+ghr-stats status                # one-shot fleet state; exit code is the verdict
+ghr-stats status --json         # the same, machine-readable
 ghr-stats serve                 # the collector — systemd-managed; refuses to run on a terminal
 ghr-stats config                # the configuration wizard (orgs / PATs / hooks)
 ghr-stats systemd install --user | --system   # install/enable the collector service
@@ -19,6 +21,41 @@ You don't run `serve` yourself — `systemd install` does. Opening the store
 migrates it, so there is no `db init`. `db prune` keeps `job_event` and is safe
 while the collector writes (SQLite WAL); `VACUUM` separately to reclaim file
 space after a large prune.
+
+## status — for scripts and agents
+
+`ghr-stats status` answers "is the fleet healthy right now" in one call, and
+encodes the answer in its **exit code** so a caller can branch without parsing:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Every runner healthy, and GitHub agrees |
+| 1 | Degraded — a runner is offline, divergent, or its GitHub reading is stale |
+| 2 | Cannot determine — no collector and no readable runner root |
+| 3 | Usage or config error |
+
+```bash
+ghr-stats status --json | jq .            # full payload
+ghr-stats status --org my-org             # narrow to one org
+ghr-stats status --runner runner-01       # narrow to one runner
+ghr-stats status --json >/dev/null || echo "fleet is not healthy"
+```
+
+Narrowing recomputes the verdict over the rows that remain, so a healthy org is
+not reported as degraded because a *different* org is.
+
+The `--json` payload carries `schema_version`, both `generated_at` (ISO-8601 UTC)
+and `generated_at_epoch`, per-runner state including `divergent` and
+`github_offline_seconds`, and a per-org rollup. It is plain stdout — no colour,
+no localised time — and stays clean even under `RUST_LOG=debug`.
+
+When the collector is running, the verdict comes from it (the same snapshot
+`/metrics` renders, so the two cannot disagree). With no collector, `status`
+falls back to a live local scan, reports `"mode": "ephemeral"`, and leaves every
+`github_*` field `null` rather than guessing.
+
+> The SQLite schema is **not** a public interface — it changes without notice.
+> Use this verb (or `/metrics`), not ad-hoc SQL.
 
 ## Uninstall
 
