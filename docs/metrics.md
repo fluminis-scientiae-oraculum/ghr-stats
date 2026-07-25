@@ -58,6 +58,16 @@ Past `ghr_api_max_age_seconds` a reading is treated as stale and its
 `ghr_runner_github_online` series drops out rather than reporting an aged value
 as current. Tune with `intervals.api_max_age_secs`.
 
+> **Personal-account runners never reconcile, by design.** The reconcile calls
+> `/orgs/{org}/actions/runners`, which is gated by an *organization*-scoped
+> fine-grained PAT permission. A repository-level runner under a personal
+> account has no equivalent permission to grant, so it reports
+> `ghr_api_org_configured 0` permanently and has **no** `github_*` series at
+> all. That is "we cannot ask", not "it is down" — which is why the
+> `configured == 1` clause in the org alert below is required, and why the
+> per-runner alerts are safe: a runner with no GitHub reading emits no
+> `ghr_runner_github_offline_seconds`, so nothing can fire on it.
+
 ## Alert recipes
 
 Sized against the measured flap. The third rule is what makes the first two
@@ -71,7 +81,15 @@ trustworthy — without it a dead reconcile presents as a calm fleet.
     summary: "{{ $labels.name }} ({{ $labels.org }}) offline to GitHub for >15m while running locally"
 
 - alert: GhrOrgAllRunnersOffline       # the org-wide pattern
-  expr: ghr_org_runners{state="github_online"} == 0 and ghr_org_runners{state="total"} > 0
+  # The `configured == 1` clause is required, not optional. An org with no PAT
+  # reports github_online = 0 forever, because we never asked — not because its
+  # runners are down. Personal-account (repository-level) runners are the common
+  # case: they have no org-scoped "Self-hosted runners" permission to grant, so
+  # they can never be reconciled and would otherwise alert permanently.
+  expr: |
+    ghr_org_runners{state="github_online"} == 0
+      and ghr_org_runners{state="total"} > 0
+      and on(org) ghr_api_org_configured == 1
   for: 15m
 
 - alert: GhrApiReconcileStale          # do not trust the two above without this
