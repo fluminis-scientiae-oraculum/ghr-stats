@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::shared::error::Result;
 use crate::shared::models::{
-    ApiState, BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, PendingConclusion,
-    RunnerSample, RunnerState,
+    ApiReconcileState, ApiRunnerState, ApiState, BusyPoint, GhView, HistPoint, HostPoint, JobRow,
+    Liveness, PendingConclusion, RunnerSample, RunnerState,
 };
 
 /// The most recent `limit` samples for a runner, returned oldest → newest so
@@ -129,6 +129,50 @@ pub fn latest_api_runners(
             GhView::Stale { age_s }
         };
         Ok(((r.get::<_, String>(0)?, r.get::<_, i64>(1)?), view))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The persisted GitHub-side liveness edges, keyed by `(org, agent_id)`. Feeds
+/// `ghr_runner_github_offline_seconds` — the duration an alert debounces on.
+pub fn api_runner_states(conn: &Connection) -> Result<HashMap<(String, i64), ApiRunnerState>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT org, agent_id, online, since_ts, last_seen_ts FROM api_runner_state",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let org: String = r.get(0)?;
+        let agent_id: i64 = r.get(1)?;
+        Ok((
+            (org.clone(), agent_id),
+            ApiRunnerState {
+                org,
+                agent_id,
+                online: r.get::<_, i64>(2)? != 0,
+                since_ts: r.get(3)?,
+                last_seen_ts: r.get(4)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Per-org reconcile health, newest state per org. Empty before the first
+/// reconcile tick.
+pub fn api_reconcile_states(conn: &Connection) -> Result<Vec<ApiReconcileState>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT org, last_ok_ts, last_try_ts, ok, http_status, error_kind, configured \
+         FROM api_reconcile_state ORDER BY org",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ApiReconcileState {
+            org: r.get(0)?,
+            last_ok_ts: r.get(1)?,
+            last_try_ts: r.get(2)?,
+            ok: r.get::<_, i64>(3)? != 0,
+            http_status: r.get::<_, Option<i64>>(4)?.map(|v| v as u16),
+            error_kind: r.get(5)?,
+            configured: r.get::<_, i64>(6)? != 0,
+        })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }

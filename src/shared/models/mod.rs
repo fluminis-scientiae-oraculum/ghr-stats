@@ -333,6 +333,48 @@ impl GhView {
             GhView::Stale { .. } | GhView::Unknown => None,
         }
     }
+
+    /// Age of the underlying reading, fresh or stale. `None` when there has
+    /// never been one — exported as `ghr_runner_github_sample_age_seconds` so a
+    /// scrape can see staleness building rather than only its aftermath.
+    pub fn age_s(&self) -> Option<i64> {
+        match self {
+            GhView::Fresh { age_s, .. } | GhView::Stale { age_s } => Some(*age_s),
+            GhView::Unknown => None,
+        }
+    }
+}
+
+/// GitHub-side liveness edge for one runner: mirrors [`RunnerState`], but keyed
+/// by the API join key `(org, agent_id)`. `since_ts` is the last time `online`
+/// actually CHANGED, which is what makes "offline to GitHub for >15m" an
+/// alertable quantity instead of a bit that flaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRunnerState {
+    pub org: String,
+    pub agent_id: i64,
+    pub online: bool,
+    pub since_ts: i64,
+    pub last_seen_ts: i64,
+}
+
+/// Current health of one org's GitHub reconcile. Exists so that "GitHub says
+/// offline" and "we could not ask GitHub" are separately observable — without
+/// it, a dead reconcile presents as a calm fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiReconcileState {
+    pub org: String,
+    /// Last tick that SUCCEEDED. `None` if this org has never succeeded.
+    pub last_ok_ts: Option<i64>,
+    pub last_try_ts: i64,
+    /// Outcome of the most recent attempt.
+    pub ok: bool,
+    pub http_status: Option<u16>,
+    /// [`ApiErrorKind::label`] of the last failure, if any.
+    pub error_kind: Option<String>,
+    /// Whether a PAT is configured for this org at all. `false` reports as
+    /// "not configured" rather than as an error or an absence.
+    pub configured: bool,
 }
 
 /// One historical runner sample, for sparklines.
