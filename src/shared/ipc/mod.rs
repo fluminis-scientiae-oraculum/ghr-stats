@@ -10,11 +10,15 @@
 //! store's read queries return), so the wire types and the query types can never
 //! drift apart.
 
+pub mod client;
+
 use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{
+    BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
+};
 
 /// Wire protocol version. Bump on any breaking change to `Request`/`Response`.
 /// The same binary ships both halves, so a mismatch means the installed service
@@ -32,7 +36,12 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 /// v8: runner identity is the install `dir`, not `agentId` (which collides across
 ///     orgs). `RunnerHistory` keys by `dir`, `ApiRow` carries `org` (so the GH
 ///     join is `(org, agent_id)`), and `RunnerState` is keyed by `dir`.
-pub const VERSION: u16 = 8;
+/// v9: the GitHub view carries its own freshness verdict, and `FleetStatus`
+///     joins `Query` (the machine-facing snapshot behind `ghr-stats status`). `ApiRow.view` is a
+///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
+///     read can no longer be rendered as live, and `BusyPoint` carries
+///     `github_online` so the occupancy chart can plot a gap instead of a zero.
+pub const VERSION: u16 = 9;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -77,6 +86,11 @@ pub enum Query {
         runner_name: String,
     },
     LatestApiRunners,
+    /// The whole machine-facing fleet snapshot, verdict included. Backs
+    /// `ghr-stats status`: one round-trip instead of six, and the health call is
+    /// made by the collector rather than reassembled (and mis-derived) by each
+    /// client.
+    FleetStatus,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
@@ -120,7 +134,10 @@ impl Mutation {
 pub struct ApiRow {
     pub agent_id: i64,
     pub org: String,
-    pub state: ApiState,
+    /// GitHub's view WITH its freshness already decided by the collector, which
+    /// is the side that knows when the reading was taken. The TUI renders the
+    /// verdict; it never re-derives it from a timestamp.
+    pub view: GhView,
 }
 
 /// A collector → TUI reply. `Error` carries a human string for logging; the TUI
@@ -129,6 +146,16 @@ pub struct ApiRow {
 pub enum Response {
     Hello {
         server: u16,
+        /// The COLLECTOR's build version (not the wire version). Lets the TUI
+        /// show "you upgraded the binary but did not restart the service",
+        /// which is otherwise invisible.
+        ///
+        /// `serde(default)` is load-bearing for cross-version handshakes: a
+        /// pre-v9 collector sends no such field, and without the default the
+        /// reply would fail to deserialize and surface as "unexpected handshake
+        /// reply" instead of the clean version mismatch we want to report.
+        #[serde(default)]
+        version: String,
     },
     VersionMismatch {
         server: u16,
@@ -139,6 +166,7 @@ pub enum Response {
     RecentJobs(Vec<JobRow>),
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
+    FleetStatus(Box<FleetStatus>),
     /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
@@ -189,6 +217,7 @@ mod tests {
             ts: 42,
             busy: 3,
             online: 7,
+            github_online: Some(5),
         }]);
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();

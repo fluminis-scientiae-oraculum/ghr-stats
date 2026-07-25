@@ -54,6 +54,28 @@ pub struct Intervals {
     /// GitHub API polling cadence (rate-limit aware).
     #[serde(default = "defaults::api_secs")]
     pub api_secs: u64,
+    /// Optional override for how old a GitHub reconcile row may be and still be
+    /// served as current. Left unset (the default) it is DERIVED from
+    /// `api_secs` — see [`Intervals::api_max_age`] — so raising the poll
+    /// interval widens the window automatically instead of silently making
+    /// every runner's GitHub view read as stale.
+    #[serde(default)]
+    pub api_max_age_secs: Option<u64>,
+}
+
+impl Intervals {
+    /// How old a GitHub reconcile row may be and still count as current.
+    ///
+    /// The explicit override when set, else three polls' grace with a 180 s
+    /// floor. Three, not one: a single slow or rate-limited cycle would
+    /// otherwise flap the whole fleet to "stale". This is the ONE place the
+    /// window is decided — the reader's freshness cutoff, the TUI's
+    /// `stale (Nm)` label and the exported `ghr_api_max_age_seconds` all read
+    /// it here rather than each deriving their own.
+    pub fn api_max_age(&self) -> u64 {
+        self.api_max_age_secs
+            .unwrap_or_else(|| self.api_secs.saturating_mul(3).max(180))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -254,6 +276,7 @@ impl Default for Intervals {
         Self {
             local_secs: defaults::local_secs(),
             api_secs: defaults::api_secs(),
+            api_max_age_secs: None,
         }
     }
 }
@@ -293,6 +316,24 @@ mod defaults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_max_age_tracks_api_secs_unless_overridden() {
+        let mut i = Intervals::default();
+        // Default 60s poll: 3x = 180, which is also the floor.
+        assert_eq!(i.api_max_age(), 180);
+        // A slower poll widens the window automatically — the reason this is
+        // derived rather than a fixed literal that would silently go stale.
+        i.api_secs = 300;
+        assert_eq!(i.api_max_age(), 900);
+        // A fast poll does not shrink it below the floor; one slow cycle must
+        // not flap the whole fleet to "stale".
+        i.api_secs = 10;
+        assert_eq!(i.api_max_age(), 180);
+        // An explicit override wins over both.
+        i.api_max_age_secs = Some(45);
+        assert_eq!(i.api_max_age(), 45);
+    }
 
     #[test]
     fn defaults_are_populated() {

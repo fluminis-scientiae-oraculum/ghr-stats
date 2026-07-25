@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::shared::error::{Error, Result};
+use crate::shared::models::ApiErrorKind;
 
 /// Global timeout for every GitHub call. ureq leaves the timeout unset
 /// (infinite) by default, so a peer that accepts the connection then stalls
@@ -33,9 +34,16 @@ struct RunnersResponse {
     runners: Vec<ApiRunner>,
 }
 
-/// List an org's self-hosted runners. Requires only the fine-grained
-/// "Self-hosted runners: read" organization permission.
-pub fn list_org_runners(token: &str, org: &str) -> Result<Vec<ApiRunner>> {
+/// List an org's self-hosted runners, classifying any failure.
+///
+/// The reconcile needs the failure *kind*, not a formatted message: it records
+/// per-org health and labels `ghr_api_reconcile_errors_total{kind=…}`. The
+/// message-returning [`list_org_runners`] is a thin wrapper over this, so both
+/// paths share one taxonomy ([`ApiErrorKind`]) instead of classifying twice.
+pub fn list_org_runners_classified(
+    token: &str,
+    org: &str,
+) -> std::result::Result<Vec<ApiRunner>, ApiErrorKind> {
     let url = format!("https://api.github.com/orgs/{org}/actions/runners?per_page=100");
     let resp = ureq::get(&url)
         .config()
@@ -52,10 +60,17 @@ pub fn list_org_runners(token: &str, org: &str) -> Result<Vec<ApiRunner>> {
             .body_mut()
             .read_json::<RunnersResponse>()
             .map(|body| body.runners)
-            .map_err(|e| Error::Github(format!("{org}: decoding response: {e}"))),
-        Err(ureq::Error::StatusCode(code)) => Err(Error::Github(describe_status(org, code))),
-        Err(e) => Err(Error::Github(format!("{org}: transport error: {e}"))),
+            .map_err(|_| ApiErrorKind::Decode),
+        Err(ureq::Error::StatusCode(code)) => Err(ApiErrorKind::from_status(code)),
+        Err(_) => Err(ApiErrorKind::Transport),
     }
+}
+
+/// List an org's self-hosted runners. Requires only the fine-grained
+/// "Self-hosted runners: read" organization permission.
+pub fn list_org_runners(token: &str, org: &str) -> Result<Vec<ApiRunner>> {
+    list_org_runners_classified(token, org)
+        .map_err(|kind| Error::Github(describe_failure(org, kind)))
 }
 
 /// One job of a workflow run, as the Actions API reports it. `conclusion` is
@@ -105,14 +120,12 @@ pub fn list_run_jobs(token: &str, repo: &str, run_id: i64) -> Result<Vec<RunJob>
     }
 }
 
-/// Map an HTTP status to an actionable message for the common fine-grained-PAT
-/// failures.
-fn describe_status(org: &str, code: u16) -> String {
-    let hint = match code {
-        401 => "token is invalid or expired",
-        403 => "token lacks 'Self-hosted runners: read', or org approval is pending",
-        404 => "org not found, or this token cannot see it (wrong resource owner?)",
-        _ => "unexpected status",
-    };
-    format!("{org}: HTTP {code} — {hint}")
+/// Render a classified failure as an actionable operator message. The hint text
+/// lives on [`ApiErrorKind`], not here — this only chooses the wording around
+/// it, so the wizard's message and the metric's `kind` label can never drift.
+fn describe_failure(org: &str, kind: ApiErrorKind) -> String {
+    match kind.http_status() {
+        Some(code) => format!("{org}: HTTP {code} — {}", kind.hint()),
+        None => format!("{org}: {}", kind.hint()),
+    }
 }

@@ -365,6 +365,11 @@ pub(crate) struct ChartSpec<'a> {
     pub y_bounds: [f64; 2],
     pub y_labels: Vec<String>,
     pub color: Color,
+    /// An optional second series drawn over the first, for comparing two views
+    /// of the same quantity. Its points are supplied independently, so ticks
+    /// missing from it simply are not plotted — a GAP, not a zero, which is the
+    /// difference between "we did not ask" and "the answer was none".
+    pub overlay: Option<(&'a [(f64, f64)], Color)>,
 }
 
 pub(crate) fn draw_time_chart(f: &mut Frame, area: Rect, now: i64, spec: ChartSpec) {
@@ -384,13 +389,24 @@ pub(crate) fn draw_time_chart(f: &mut Frame, area: Rect, now: i64, spec: ChartSp
         rel_label(((t0 + tn) / 2.0) as i64, now),
         "now".to_string(),
     ];
-    let datasets = vec![
+    let mut datasets = vec![
         Dataset::default()
             .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::new().fg(spec.color))
             .data(spec.points),
     ];
+    if let Some((pts, color)) = spec.overlay
+        && pts.len() >= 2
+    {
+        datasets.push(
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(color))
+                .data(pts),
+        );
+    }
     let axis_style = Style::new().fg(Color::DarkGray);
     let chart = Chart::new(datasets)
         .block(Block::bordered().title(spec.title.to_string()))
@@ -521,6 +537,7 @@ mod tests {
                     y_bounds: [0.0, 40.0],
                     y_labels: vec!["0".to_string(), "40%".to_string()],
                     color: Color::Cyan,
+                    overlay: None,
                 },
             );
         })

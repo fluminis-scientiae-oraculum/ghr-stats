@@ -49,7 +49,12 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                 }
                 if on && Instant::now() >= next {
                     if let Some(conn) = conn.as_ref() {
-                        match Snapshot::gather(conn, now_epoch(), version) {
+                        match Snapshot::gather(
+                            conn,
+                            now_epoch(),
+                            version,
+                            cfg.intervals.api_max_age(),
+                        ) {
                             Ok(s) => post(&push.endpoint, push.auth.as_ref().map(|a| a.expose()), &s.to_json()),
                             Err(e) => tracing::warn!(error = %e, "metrics push: gather"),
                         }

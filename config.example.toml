@@ -25,6 +25,11 @@
 local_secs = 5
 # GitHub API reconcile cadence, seconds (floored at 10).
 api_secs = 60
+# How old a GitHub reconcile row may be and still be reported as current.
+# Unset => three polls' grace with a 180s floor, so raising `api_secs` widens
+# this automatically. Past it a runner's GitHub view reads `stale` rather than
+# being served as if it were live. Exported as `ghr_api_max_age_seconds`.
+# api_max_age_secs = 180
 
 # ── GitHub API (optional, read-only) ───────────────────────────────────────
 # Runner online/busy reconcile; `ghr-stats config` validates each token.

@@ -10,23 +10,31 @@ use super::{
     ChartSpec, draw_time_chart, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime,
     liveness_label,
 };
-use crate::shared::models::{ApiState, JobRow};
+use crate::shared::models::{GhView, JobRow};
 use crate::shared::util::now_epoch;
 use crate::tui::app::App;
 use crate::tui::viewmodel;
 
 /// GitHub's view of a runner for the detail panel. When there's no data, the
 /// viewmodel decides the actual cause (mode / missing PAT / reconcile / not-seen).
-fn gh_text(gh: Option<ApiState>, app: &App) -> String {
+fn gh_text(gh: GhView, app: &App) -> String {
     match gh {
-        Some(s) if s.busy => "online, busy".to_string(),
-        Some(s) if s.online => "online, idle".to_string(),
-        Some(_) => "offline".to_string(),
-        None => viewmodel::copy::runner_github_cell(viewmodel::status::runner_github_absent(
-            app.mode(),
-            app.has_tokens(),
-            app.reconcile_populated(),
-        )),
+        GhView::Fresh { state, .. } if state.busy => "online, busy".to_string(),
+        GhView::Fresh { state, .. } if state.online => "online, idle".to_string(),
+        GhView::Fresh { .. } => "offline".to_string(),
+        // Name the staleness rather than reporting the last known value as if it
+        // were current, or falling through to the "why is this absent" copy —
+        // neither of which is true here: we have data, it is just too old.
+        GhView::Stale { age_s } => {
+            format!("stale — last read {} ago", fmt_dur(age_s.max(0) as u64))
+        }
+        GhView::Unknown => {
+            viewmodel::copy::runner_github_cell(viewmodel::status::runner_github_absent(
+                app.mode(),
+                app.has_tokens(),
+                app.reconcile_populated(),
+            ))
+        }
     }
 }
 
@@ -158,6 +166,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, cpu_max as f64],
             y_labels: vec!["0".to_string(), format!("{cpu_max:.0}%")],
             color: Color::Cyan,
+            overlay: None,
         },
     );
 
@@ -189,6 +198,7 @@ fn draw_charts(f: &mut Frame, app: &App, area: Rect) {
             y_bounds: [0.0, mem_max as f64],
             y_labels: vec!["0".to_string(), fmt_bytes(mem_max)],
             color: Color::Green,
+            overlay: None,
         },
     );
 }

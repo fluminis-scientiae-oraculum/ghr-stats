@@ -62,8 +62,12 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                     Some(s) => match s.recv_timeout(TICK) {
                         Ok(Some(req)) => {
                             let resp = if req.url().starts_with("/metrics") {
-                                Response::from_string(body(conn.as_ref(), version))
-                                    .with_header(text_header())
+                                Response::from_string(body(
+                                    conn.as_ref(),
+                                    version,
+                                    cfg.intervals.api_max_age(),
+                                ))
+                                .with_header(text_header())
                             } else {
                                 Response::from_string("see /metrics\n")
                             };
@@ -80,11 +84,11 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .expect("spawn metrics-pull")
 }
 
-fn body(conn: Option<&Connection>, version: &str) -> String {
+fn body(conn: Option<&Connection>, version: &str, max_age: u64) -> String {
     let Some(conn) = conn else {
         return "# db unavailable\n".to_string();
     };
-    match Snapshot::gather(conn, now_epoch(), version) {
+    match Snapshot::gather(conn, now_epoch(), version, max_age) {
         Ok(s) => s.to_prometheus(),
         Err(e) => format!("# gather error: {e}\n"),
     }

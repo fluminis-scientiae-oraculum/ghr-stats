@@ -12,7 +12,7 @@ use super::{
     ellipsize_middle, fmt_bytes, fmt_cpu, fmt_dur, fmt_opt_bytes, fmt_uptime, liveness_label,
 };
 use crate::shared::hooks::install::HookStatus;
-use crate::shared::models::{ApiState, Liveness};
+use crate::shared::models::{self, GhView, Liveness};
 use crate::tui::app::App;
 use crate::tui::viewmodel;
 
@@ -54,6 +54,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
 
+    // All-green must be reachable only when GitHub agrees. During the
+    // 2026-07-25 outage this header read "21 runners · 21 idle · 0 offline"
+    // while 8 of them could not take work — every local signal was healthy and
+    // nothing surfaced the disagreement.
+    let divergent = app
+        .runners
+        .iter()
+        .filter(|r| models::divergent(r.liveness, r.gh) == Some(true))
+        .count();
+    let counts = if divergent > 0 {
+        let mut spans = counts.spans;
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!("⚠ {divergent} GH-offline"),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        Line::from(spans)
+    } else {
+        counts
+    };
+
     let host = match &app.host {
         Some(h) => {
             let mem_pct = if h.mem_total > 0 {
@@ -82,8 +103,19 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         app.reconcile_populated(),
     ) {
         None => {
-            let online = app.api_state.values().filter(|s| s.online).count();
-            let gbusy = app.api_state.values().filter(|s| s.busy).count();
+            // Only FRESH readings count. A stale row must not be tallied as
+            // "online" — that is how the header stayed reassuring while the
+            // reconcile was dead.
+            let online = app
+                .api_state
+                .values()
+                .filter(|v| v.online() == Some(true))
+                .count();
+            let gbusy = app
+                .api_state
+                .values()
+                .filter(|v| v.busy() == Some(true))
+                .count();
             Line::from(format!(
                 " github: {} known · {online} online · {gbusy} busy",
                 app.api_state.len()
@@ -95,8 +127,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         )),
     };
 
-    let para =
-        Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(" ghr-stats "));
+    // The build version rides the panel title: always visible, costs no rows,
+    // and answers "what am I actually running" without a keypress.
+    let para = Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(format!(
+        " ghr-stats v{} ",
+        crate::shared::util::BUILD_VERSION
+    )));
     f.render_widget(para, area);
 }
 
@@ -172,12 +208,23 @@ fn state_for(secs: Option<i64>) -> String {
 }
 
 /// Compact GitHub-state glyph for the table's "GH" column.
-fn gh_span(gh: Option<ApiState>) -> Span<'static> {
+fn gh_span(gh: GhView) -> Span<'static> {
     match gh {
-        Some(s) if s.busy => Span::styled("● busy", Style::new().fg(Color::Green)),
-        Some(s) if s.online => Span::styled("○ idle", Style::new().fg(Color::Cyan)),
-        Some(_) => Span::styled("× off", Style::new().fg(Color::Red)),
-        None => Span::styled("–", Style::new().fg(Color::DarkGray)),
+        GhView::Fresh { state, .. } if state.busy => {
+            Span::styled("● busy", Style::new().fg(Color::Green))
+        }
+        GhView::Fresh { state, .. } if state.online => {
+            Span::styled("○ idle", Style::new().fg(Color::Cyan))
+        }
+        GhView::Fresh { .. } => Span::styled("× off", Style::new().fg(Color::Red)),
+        // We HAD a reading and it has aged out — distinct from "–" (never had
+        // one). Collapsing the two is what let a dead reconcile keep serving
+        // confident stale values as though they were live.
+        GhView::Stale { age_s } => Span::styled(
+            format!("stale {}", fmt_dur(age_s.max(0) as u64)),
+            Style::new().fg(Color::Yellow),
+        ),
+        GhView::Unknown => Span::styled("–", Style::new().fg(Color::DarkGray)),
     }
 }
 

@@ -3,7 +3,9 @@
 //! endpoint (loopback by default) and a JSON push to an ingestion sink. Both
 //! read the DB on their own connections (WAL) — never the writer thread.
 
-mod encode;
+pub mod encode;
+
+pub use encode::Snapshot;
 mod pull;
 mod push;
 

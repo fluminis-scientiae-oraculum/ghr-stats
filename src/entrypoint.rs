@@ -32,8 +32,36 @@ use crate::cli::{Cli, Command, DbAction};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() -> Result<()> {
-    let args = Cli::parse();
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            // 3 = usage/config error, per the `status` exit-code contract. Every
+            // verb shares it so a caller sees one meaning for "the invocation
+            // itself failed" regardless of which verb it ran.
+            std::process::ExitCode::from(3)
+        }
+    }
+}
+
+fn run() -> Result<std::process::ExitCode> {
+    // `try_parse`, not `parse`: clap's default is to print and exit(2) itself,
+    // and 2 already means "cannot determine" in the `status` verdict table. A
+    // caller branching on the exit code must never confuse "you typed the flag
+    // wrong" with "the fleet's state is unknowable", so usage errors are routed
+    // to the dedicated 3. `--help`/`--version` are NOT errors and keep exiting 0.
+    let args = match Cli::try_parse() {
+        Ok(a) => a,
+        Err(e) if e.use_stderr() => {
+            let _ = e.print();
+            return Ok(std::process::ExitCode::from(3));
+        }
+        Err(e) => {
+            let _ = e.print();
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+    };
     let config_path = args.config;
     init_tracing(&args.command);
 
@@ -42,16 +70,29 @@ fn main() -> Result<()> {
     // load lazy and per-arm — so there is no unreachable arm to assert away.
     let load =
         || crate::shared::config::Config::load(config_path.as_deref()).context("loading config");
+    // `status` is the only verb whose exit code carries meaning beyond
+    // success/failure — it IS the verdict, so a caller can branch without
+    // parsing the payload. Every other verb exits 0 on success.
+    let ok = std::process::ExitCode::SUCCESS;
     match args.command {
-        Some(Command::Config) => crate::ops::wizard::run(config_path.as_deref()),
+        Some(Command::Config) => crate::ops::wizard::run(config_path.as_deref()).map(|()| ok),
         // Default (no subcommand) launches the TUI.
-        None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()),
-        Some(Command::Serve) => crate::service::serve::run(&load()?, config_path.as_deref()),
-        Some(Command::Systemd { action }) => crate::ops::systemd::run(action, &load()?),
-        Some(Command::Db { action }) => run_db(action, &load()?),
+        None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()).map(|()| ok),
+        Some(Command::Status(a)) => {
+            crate::ops::status::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        Some(Command::Serve) => {
+            crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
+        }
+        Some(Command::Systemd { action }) => {
+            crate::ops::systemd::run(action, &load()?).map(|()| ok)
+        }
+        Some(Command::Db { action }) => run_db(action, &load()?).map(|()| ok),
         // Uninstall must work when the config is absent or being removed, so it
         // resolves paths itself rather than going through the lazy `load`.
-        Some(Command::Uninstall(a)) => crate::ops::uninstall::run(&a, config_path.as_deref()),
+        Some(Command::Uninstall(a)) => {
+            crate::ops::uninstall::run(&a, config_path.as_deref()).map(|()| ok)
+        }
     }
 }
 
@@ -77,9 +118,31 @@ fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
 /// `RUST_LOG`; `serve` runs under systemd, so its output lands in the journal.
 fn init_tracing(command: &Option<Command>) {
     use tracing_subscriber::{EnvFilter, fmt};
-    if matches!(command, None | Some(Command::Tui)) {
+    if !logs_to_stderr(command) {
         return;
     }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).with_target(false).init();
+}
+
+/// Whether this verb may write log lines to the terminal.
+///
+/// An EXHAUSTIVE match with no `_` arm, deliberately: adding a verb must force a
+/// decision here rather than inheriting a default. Two verbs already own their
+/// output and would be corrupted by a stray log line — the TUI owns the
+/// alternate screen, and `status --json` writes a payload something is parsing —
+/// and the way that bug arrives is by omission, which is exactly what an
+/// exhaustive match prevents. (Same class as the root gate `serve --system`
+/// remembered and hook install forgot.)
+fn logs_to_stderr(command: &Option<Command>) -> bool {
+    match command {
+        // The dashboard owns the terminal; any log line bleeds onto it.
+        None | Some(Command::Tui) => false,
+        // Machine-facing stdout — a log line would corrupt the payload.
+        Some(Command::Status(_)) => false,
+        // Runs under systemd, so its output lands in the journal.
+        Some(Command::Serve) => true,
+        Some(Command::Config) | Some(Command::Systemd { .. }) | Some(Command::Db { .. }) => true,
+        Some(Command::Uninstall(_)) => true,
+    }
 }

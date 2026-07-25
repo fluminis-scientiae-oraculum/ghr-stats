@@ -27,8 +27,9 @@ use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::{self, runners};
 use crate::shared::config::Config;
 use crate::shared::hooks::install::{self, HookStatus};
+use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{
-    ApiState, BusyPoint, HistPoint, HostPoint, JobRow, Liveness, RunnerState,
+    BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, RunnerState,
 };
 use crate::shared::paths::Scope;
 use crate::shared::util::now_epoch;
@@ -90,7 +91,7 @@ pub(crate) struct LiveRunner {
     pub mem_bytes: Option<u64>,
     pub uptime_s: Option<u64>,
     /// GitHub's view of this runner (from the latest API reconcile), if any.
-    pub gh: Option<ApiState>,
+    pub gh: GhView,
     pub work_folder: String,
     /// Seconds in the current liveness state (`now - since_ts`), if known.
     pub state_seconds: Option<i64>,
@@ -162,7 +163,7 @@ pub(crate) struct App {
     pub(crate) trend_host: Vec<HostPoint>,
     pub(crate) trend_busy: Vec<BusyPoint>,
     pub(crate) jobs: Vec<JobRow>,
-    pub(crate) api_state: HashMap<(String, i64), ApiState>,
+    pub(crate) api_state: HashMap<(String, i64), GhView>,
     /// Org logins with a configured read-only PAT. In Persistent mode this is the
     /// collector's authoritative view of the root-owned /etc config (presence
     /// only, no tokens); in Ephemeral mode it falls back to this run's loaded cfg.
@@ -213,6 +214,19 @@ impl App {
 
     pub(crate) fn cfg(&self) -> &Config {
         &self.cfg
+    }
+
+    /// The connected collector's build version — `None` in Ephemeral mode, or
+    /// when talking to a collector too old to report one.
+    pub(crate) fn collector_version(&self) -> Option<&str> {
+        self.source.collector_version()
+    }
+
+    /// Why the dashboard is Ephemeral, when it is. Surfaced on the Config tab so
+    /// "the service is an older build" is not silently indistinguishable from
+    /// "there is no service".
+    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+        self.source.ephemeral_reason()
     }
 
     /// The current data plane (Ephemeral / Persistent) — for the header badge
@@ -492,7 +506,10 @@ impl App {
                 cpu_pct,
                 mem_bytes: p.mem_bytes,
                 uptime_s: p.uptime_s,
-                gh: api.get(&(p.info.org.clone(), id)).copied(),
+                gh: api
+                    .get(&(p.info.org.clone(), id))
+                    .copied()
+                    .unwrap_or(GhView::Unknown),
                 state_seconds: Some((now - since).max(0)),
                 hook: install::detect_in(&p.info.dir, &our_dirs),
                 work_folder: p.info.work_folder,
@@ -509,6 +526,10 @@ impl App {
             ts: now,
             busy,
             online,
+            // Ephemeral mode has no collector and therefore no GitHub reconcile.
+            // `None` plots a gap; emitting 0 would draw "GitHub says nothing is
+            // online" for a fleet nobody has asked GitHub about.
+            github_online: None,
         });
         self.edges = edges;
         self.runners = runners;

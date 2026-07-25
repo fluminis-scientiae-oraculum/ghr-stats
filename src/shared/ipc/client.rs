@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crate::shared::ipc::{self, ApiRow, Request, Response, VERSION};
-use crate::shared::models::ApiState;
+use crate::shared::models::GhView;
 use crate::shared::paths::Scope;
 
 /// The server is local and answers immediately; this only bounds a wedged or
@@ -25,33 +25,51 @@ const IO_TIMEOUT: Duration = Duration::from_millis(750);
 pub(crate) struct Client {
     stream: UnixStream,
     scope: Scope,
+    /// The COLLECTOR's build version, from the handshake. Empty when talking to
+    /// a pre-v9 collector that did not report one.
+    version: String,
 }
 
 impl Client {
     /// Try System then User sockets; return the first that connects AND completes
     /// the version handshake. `None` ⇒ Ephemeral (no reachable collector).
-    pub(crate) fn connect_any() -> Option<Client> {
+    /// Probe both scopes for a reachable collector.
+    ///
+    /// Returns WHY on failure rather than a bare `None`. Flattening the reason
+    /// away made a version-drifted collector indistinguishable from no collector
+    /// at all: after upgrading the binary without restarting the service, the
+    /// dashboard silently dropped to Ephemeral with nothing to explain it.
+    pub(crate) fn connect_any() -> Result<Client, EphemeralReason> {
+        let mut reason = EphemeralReason::NoCollector;
         for scope in [Scope::System, Scope::User] {
             match Client::connect(scope) {
-                Ok(c) => return Some(c),
+                Ok(c) => return Ok(c),
                 Err(ConnectErr::Unreachable) => {}
-                Err(ConnectErr::Denied) => tracing::warn!(
-                    ?scope,
-                    "collector socket present but connect was denied (EACCES) — \
-                     check the unit's RuntimeDirectoryMode / socket permissions"
-                ),
-                Err(ConnectErr::Version { server }) => tracing::warn!(
-                    ?scope,
-                    server,
-                    client = VERSION,
-                    "collector IPC version mismatch — restart the service after upgrading the binary"
-                ),
+                Err(ConnectErr::Denied) => {
+                    tracing::warn!(
+                        ?scope,
+                        "collector socket present but connect was denied (EACCES) — \
+                         check the unit's RuntimeDirectoryMode / socket permissions"
+                    );
+                    reason = EphemeralReason::Denied;
+                }
+                Err(ConnectErr::Version { server }) => {
+                    tracing::warn!(
+                        ?scope,
+                        server,
+                        client = VERSION,
+                        "collector IPC version mismatch — restart the service after upgrading the binary"
+                    );
+                    // Most specific reason wins: a live-but-mismatched collector
+                    // is a different (and fixable) problem from an absent one.
+                    reason = EphemeralReason::VersionDrift { server };
+                }
                 Err(ConnectErr::Io(e)) => {
                     tracing::debug!(?scope, error = %e, "collector IPC connect failed")
                 }
             }
         }
-        None
+        Err(reason)
     }
 
     fn connect(scope: Scope) -> Result<Client, ConnectErr> {
@@ -70,11 +88,18 @@ impl Client {
         };
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let mut client = Client { stream, scope };
+        let mut client = Client {
+            stream,
+            scope,
+            version: String::new(),
+        };
         // Handshake: prove the peer speaks our exact protocol version.
         match client.request(&Request::Hello { client: VERSION })? {
-            Response::Hello { server } if server == VERSION => Ok(client),
-            Response::Hello { server } | Response::VersionMismatch { server } => {
+            Response::Hello { server, version } if server == VERSION => {
+                client.version = version;
+                Ok(client)
+            }
+            Response::Hello { server, .. } | Response::VersionMismatch { server } => {
                 Err(ConnectErr::Version { server })
             }
             _ => Err(ConnectErr::Io(io::Error::other(
@@ -94,14 +119,33 @@ impl Client {
     pub(crate) fn scope(&self) -> Scope {
         self.scope
     }
+
+    /// The connected collector's build version. `None` for a pre-v9 collector
+    /// that did not report one — which is itself a useful signal.
+    pub(crate) fn collector_version(&self) -> Option<&str> {
+        (!self.version.is_empty()).then_some(self.version.as_str())
+    }
 }
 
 /// Rebuild the `(org, agent_id) → ApiState` map from the wire's `Vec<ApiRow>`.
 /// The org is part of the key because `agent_id` is unique only within an org.
-pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), ApiState> {
+pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), GhView> {
     rows.into_iter()
-        .map(|r| ((r.org, r.agent_id), r.state))
+        .map(|r| ((r.org, r.agent_id), r.view))
         .collect()
+}
+
+/// Why the dashboard is running Ephemeral. Carried on the mode itself so the
+/// reason cannot be dropped on the floor between detecting it and showing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EphemeralReason {
+    /// No collector socket found in either scope.
+    NoCollector,
+    /// A collector IS running but speaks a different IPC wire version — nearly
+    /// always an upgraded binary whose service was not restarted.
+    VersionDrift { server: u16 },
+    /// The socket exists but this user may not connect to it.
+    Denied,
 }
 
 /// Why a connect attempt did not yield a Persistent client.

@@ -15,10 +15,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::shared::ipc::client::{self as ipc_client, Client, EphemeralReason};
 use crate::shared::ipc::{Mutation, Query, Request, Response};
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
 use crate::shared::paths::Scope;
-use crate::tui::ipc_client::{self, Client};
 
 /// Which data plane the TUI is on. Drives the header badge + Config tab. A pure
 /// data enum — how it is rendered (label, colour) lives in `viewmodel::style`.
@@ -42,7 +42,9 @@ pub(crate) enum MutateOutcome {
 
 /// The App's history source: an in-memory ring buffer, or a live collector.
 pub(crate) enum DataSource {
-    Ephemeral,
+    /// No usable collector — and WHY, so the dashboard can say so instead of
+    /// leaving the operator to guess.
+    Ephemeral(EphemeralReason),
     Persistent(Client),
 }
 
@@ -51,15 +53,15 @@ impl DataSource {
     /// Persistent; otherwise Ephemeral.
     pub(crate) fn detect() -> Self {
         match Client::connect_any() {
-            Some(c) => DataSource::Persistent(c),
-            None => DataSource::Ephemeral,
+            Ok(c) => DataSource::Persistent(c),
+            Err(reason) => DataSource::Ephemeral(reason),
         }
     }
 
     pub(crate) fn mode(&self) -> Mode {
         match self {
             DataSource::Persistent(_) => Mode::Persistent,
-            DataSource::Ephemeral => Mode::Ephemeral,
+            DataSource::Ephemeral(_) => Mode::Ephemeral,
         }
     }
 
@@ -68,16 +70,36 @@ impl DataSource {
     pub(crate) fn scope(&self) -> Option<Scope> {
         match self {
             DataSource::Persistent(c) => Some(c.scope()),
-            DataSource::Ephemeral => None,
+            DataSource::Ephemeral(_) => None,
+        }
+    }
+
+    /// The connected collector's build version, if it reported one.
+    pub(crate) fn collector_version(&self) -> Option<&str> {
+        match self {
+            DataSource::Persistent(c) => c.collector_version(),
+            DataSource::Ephemeral(_) => None,
+        }
+    }
+
+    /// Why we are Ephemeral, when we are.
+    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+        match self {
+            DataSource::Ephemeral(r) => Some(*r),
+            DataSource::Persistent(_) => None,
         }
     }
 
     /// When Ephemeral, try once to attach to a collector that has since started.
     pub(crate) fn reconnect_if_ephemeral(&mut self) {
-        if matches!(self, DataSource::Ephemeral)
-            && let Some(c) = Client::connect_any()
-        {
-            *self = DataSource::Persistent(c);
+        if matches!(self, DataSource::Ephemeral(_)) {
+            match Client::connect_any() {
+                Ok(c) => *self = DataSource::Persistent(c),
+                // Refresh the reason too: a collector that has since been
+                // restarted onto a matching wire version should stop being
+                // reported as drifted.
+                Err(reason) => *self = DataSource::Ephemeral(reason),
+            }
         }
     }
 
@@ -91,7 +113,7 @@ impl DataSource {
             Ok(resp) => Some(resp),
             Err(e) => {
                 tracing::debug!(error = %e, "ipc request failed — reverting to Ephemeral");
-                *self = DataSource::Ephemeral;
+                *self = DataSource::Ephemeral(EphemeralReason::NoCollector);
                 None
             }
         }
@@ -99,7 +121,7 @@ impl DataSource {
 
     // --- typed queries: IPC in Persistent mode, ring / empty fallback otherwise ---
 
-    pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), ApiState> {
+    pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), GhView> {
         match self.query(&Request::Query(Query::LatestApiRunners)) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only
@@ -331,7 +353,7 @@ mod tests {
 
     #[test]
     fn ephemeral_source_has_no_persistent_data() {
-        let mut s = DataSource::Ephemeral;
+        let mut s = DataSource::Ephemeral(EphemeralReason::NoCollector);
         assert_eq!(s.mode(), Mode::Ephemeral);
         assert!(s.recent_jobs(10).is_empty());
         assert!(s.latest_job("r").is_none());
