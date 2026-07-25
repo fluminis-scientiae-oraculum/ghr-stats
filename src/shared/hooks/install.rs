@@ -102,21 +102,39 @@ pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
     }
 }
 
+/// The three vars ghr-stats owns in a runner's `.env`. Every other line in that
+/// file is the operator's and survives every path below.
+const OUR_VARS: [&str; 3] = [STARTED_VAR, COMPLETED_VAR, EVENT_LOG_VAR];
+
+/// The raw value if `line` **assigns** `key` (`KEY=VALUE`), else `None`.
+///
+/// The single definition of "this line assigns KEY", so reading and rewriting
+/// cannot disagree about it. Until this was extracted, `env_value` required the
+/// `=` while the three rewrite paths tested a bare `starts_with(key)` — and a
+/// bare prefix also matches a *longer* var, so those paths would silently delete
+/// a line like `ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=…` that they would never
+/// read back. One predicate, four callers, nothing left to keep in sync. Pure.
+fn assignment<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return None;
+    }
+    line.strip_prefix(key)?.strip_prefix('=')
+}
+
+/// Whether `line` assigns any of `keys` — i.e. whether it is *ours to drop*.
+/// Never-clobber applies to `.env` content, not just to the operator's hook
+/// scripts, so every rewrite path filters through this one rule. Pure.
+fn assigns_any(line: &str, keys: &[&str]) -> bool {
+    keys.iter().any(|key| assignment(line, key).is_some())
+}
+
 /// The value of `.env` key `key` (KEY=VALUE; last wins; quotes stripped).
 fn env_value(env: &str, key: &str) -> Option<String> {
-    let mut val = None;
-    for line in env.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(key)
-            && let Some(v) = rest.strip_prefix('=')
-        {
-            val = Some(v.trim().trim_matches(['"', '\'']).to_string());
-        }
-    }
-    val
+    env.lines()
+        .filter_map(|l| assignment(l, key))
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        .next_back()
 }
 
 /// The current hook script paths from `.env` (for chaining onto a foreign hook).
@@ -163,12 +181,7 @@ pub(crate) fn rewrite_env(
 ) -> String {
     let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.starts_with(STARTED_VAR)
-                && !t.starts_with(COMPLETED_VAR)
-                && !t.starts_with(EVENT_LOG_VAR)
-        })
+        .filter(|l| !assigns_any(l, &OUR_VARS))
         .map(str::to_string)
         .collect();
     out.push(format!("{STARTED_VAR}={}", started.display()));
@@ -234,12 +247,7 @@ pub(crate) fn plan_chain_slot(
 pub(crate) fn remove_hook_vars(existing: &str) -> String {
     let kept: Vec<&str> = existing
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.starts_with(STARTED_VAR)
-                && !t.starts_with(COMPLETED_VAR)
-                && !t.starts_with(EVENT_LOG_VAR)
-        })
+        .filter(|l| !assigns_any(l, &OUR_VARS))
         .collect();
     if kept.is_empty() {
         return String::new();
@@ -262,7 +270,7 @@ pub(crate) fn ensure_event_log(existing: &str, log: &Path) -> Option<String> {
     }
     let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| !l.trim().starts_with(EVENT_LOG_VAR)) // drop any stale value
+        .filter(|l| !assigns_any(l, &[EVENT_LOG_VAR])) // drop any stale value
         .map(str::to_string)
         .collect();
     out.push(format!("{EVENT_LOG_VAR}={want}"));
@@ -407,6 +415,45 @@ mod tests {
         );
         assert!(out.contains("KEEP=1"));
         assert!(!out.contains("GHR_STATS_EVENT_LOG"));
+    }
+
+    #[test]
+    fn prefix_sharing_operator_vars_survive_every_rewrite_path() {
+        // All three drop paths tested a BARE `VAR` prefix until B19, so an
+        // operator line whose name merely *starts with* one of ours was deleted
+        // without ever being read back — `env_value` has always required the
+        // `=`, so the rewriters were dropping more than the reader could see.
+        // `_EXTRA`/`_ARCHIVE` are hypothetical; the gap is the point.
+        let existing = "ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=/op/extra.sh\n\
+                        GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson\n\
+                        ACTIONS_RUNNER_HOOK_JOB_STARTED=/old/start.sh\n\
+                        GHR_STATS_EVENT_LOG=/old/events.ndjson\n";
+
+        // The reader is the reference: a longer var is a DIFFERENT var.
+        assert_eq!(
+            env_value(existing, EVENT_LOG_VAR).as_deref(),
+            Some("/old/events.ndjson")
+        );
+
+        for out in [
+            rewrite_env(existing, Path::new("/h/s.sh"), Path::new("/h/c.sh"), None),
+            remove_hook_vars(existing),
+            ensure_event_log(existing, Path::new("/new/events.ndjson")).expect("stale → rewritten"),
+        ] {
+            assert!(
+                out.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=/op/extra.sh"),
+                "operator var dropped by prefix match:\n{out}"
+            );
+            assert!(
+                out.contains("GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson"),
+                "operator var dropped by prefix match:\n{out}"
+            );
+            // Ours still go, in every one of the three paths.
+            assert!(
+                !out.contains("/old/events.ndjson"),
+                "stale value kept:\n{out}"
+            );
+        }
     }
 
     #[test]
