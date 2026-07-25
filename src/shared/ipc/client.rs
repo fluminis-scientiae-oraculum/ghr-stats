@@ -165,6 +165,25 @@ pub(crate) enum EphemeralReason {
     QueryFailed,
 }
 
+impl EphemeralReason {
+    /// A stable machine-readable token for the cause, so a caller can branch on
+    /// it without matching prose that may be reworded.
+    ///
+    /// Lives on the reason rather than in the one verb that first rendered it:
+    /// `explain` puts it in a finding's evidence and `timeline` puts it on
+    /// stderr before exiting, and two spellings of "denied" would be two
+    /// vocabularies for one fact.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            EphemeralReason::NoCollector => "no-collector",
+            EphemeralReason::VersionDrift { .. } => "version-drift",
+            EphemeralReason::Denied => "denied",
+            EphemeralReason::Unusable => "handshake-failed",
+            EphemeralReason::QueryFailed => "query-failed",
+        }
+    }
+}
+
 /// Why a connect attempt did not yield a Persistent client.
 enum ConnectErr {
     /// No socket, or a stale socket with no listener ⇒ Ephemeral.

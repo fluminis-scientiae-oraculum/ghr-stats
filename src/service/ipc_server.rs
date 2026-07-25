@@ -339,6 +339,16 @@ fn clamped(limit: usize) -> usize {
     limit.min(MAX_QUERY_LIMIT)
 }
 
+/// `timeline`'s own, tighter bound.
+///
+/// Its rows are an order of magnitude wider than a `HistPoint` — org, runner
+/// name and an adjudicated GitHub view per sample — so `MAX_QUERY_LIMIT` rows
+/// would serialize past `MAX_FRAME` and fail the whole reply rather than
+/// returning a short one. A cap that turns a large request into a *bounded
+/// answer* is the point of the verb; a cap that turns it into an error is not.
+/// Sized so even the widest row shape stays comfortably inside the frame.
+const MAX_TIMELINE_LIMIT: usize = 2_000;
+
 /// Serve a read query. Exhaustive over [`Query`] (a new read variant is a compile
 /// error until handled here — no `unreachable!`). The DB-availability check is
 /// factored into [`with_db`], so only the arms that need the reader carry it;
@@ -406,6 +416,18 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                 )
                 .map(|s| Box::new(s.to_status(crate::shared::models::Mode::Persistent))),
                 Response::FleetStatus,
+            )
+        }),
+        // The window is the client's to choose; the ROW COUNT is not. Clamping
+        // here rather than trusting the CLI's own cap is what keeps the bound
+        // real — the socket is reachable by any local user, and `timeline` is
+        // the first query whose natural answer is unbounded.
+        Query::Timeline(q) => with_db(conn, |c| {
+            let mut q = q.clone();
+            q.limit = q.limit.min(MAX_TIMELINE_LIMIT);
+            wrap(
+                reader::timeline(c, &q, crate::shared::util::now_epoch(), max_age).map(Box::new),
+                Response::Timeline,
             )
         }),
         Query::RunnerStates => with_db(conn, |c| {
@@ -545,6 +567,52 @@ mod tests {
         drop(first);
         drop(second);
         server.join().unwrap();
+    }
+
+    /// `timeline`'s bound has to hold against the CLIENT, not just the CLI: the
+    /// socket is reachable by any local user, so a caller that ignores its own
+    /// cap must still get a bounded answer rather than an oversized frame the
+    /// server then fails to send.
+    #[test]
+    fn a_timeline_limit_is_clamped_server_side() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store::schema_for_test(&mut conn);
+        // Two samples, one edge — enough to prove the query ran, while the limit
+        // being clamped is what the assertion is really about.
+        for (ts, live) in [(100, "idle"), (200, "busy")] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
+                 VALUES (?1, 1, 'r1', 'o', ?2, '/d1')",
+                rusqlite::params![ts, live],
+            )
+            .unwrap();
+        }
+        let reply = handle(
+            &Request::Query(Query::Timeline(
+                crate::shared::models::timeline::TimelineQuery {
+                    since_ts: 0,
+                    // A limit that would serialize past MAX_FRAME if honoured.
+                    limit: usize::MAX,
+                    org: None,
+                    runner: None,
+                    samples: true,
+                },
+            )),
+            Some(&conn),
+            NOBODY,
+            &noconf(),
+            MAX_AGE,
+        );
+        match reply {
+            Response::Timeline(t) => {
+                assert_eq!(t.transitions.items.len(), 1);
+                // Clamped, so the reply is a bounded answer — not the frame-too-
+                // large error an unclamped `usize::MAX` would have produced.
+                assert!(!t.transitions.limited);
+                assert_eq!(t.samples.map(|s| s.items.len()), Some(2));
+            }
+            other => panic!("expected a timeline, got {other:?}"),
+        }
     }
 
     #[test]

@@ -52,6 +52,29 @@ pub struct ExplainArgs {
     pub json: bool,
 }
 
+/// Window, filters and output shape for `ghr-stats timeline`.
+#[derive(clap::Args, Debug)]
+pub struct TimelineArgs {
+    /// How far back to look: 90s, 30m, 6h, 2d. Capped at 7d.
+    #[arg(long, value_name = "DURATION", default_value = "6h")]
+    pub since: String,
+    /// Maximum rows per section (transitions, and samples if requested).
+    #[arg(long, value_name = "N", default_value_t = 500)]
+    pub limit: usize,
+    /// Only this org.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+    /// Only this runner (by name).
+    #[arg(long, value_name = "NAME")]
+    pub runner: Option<String>,
+    /// Also include the raw per-tick samples behind the transitions.
+    #[arg(long)]
+    pub samples: bool,
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Launch the interactive TUI dashboard (this is the default).
@@ -87,6 +110,23 @@ pub enum Command {
         assessed, and that limit is reported as a finding rather than left as silence."
     )]
     Explain(ExplainArgs),
+
+    /// What changed over a window — edges only, so causality is readable.
+    #[command(
+        long_about = "Replay a window as the things that CHANGED in it: local liveness edges, \
+        GitHub-online edges, and the per-org reconcile going bad or recovering. Reading those \
+        three together is what separates \"GitHub says these runners are gone\" from \"we stopped \
+        being able to ask\" — the distinction a raw sample dump buries under hundreds of \
+        identical rows.\n\n\
+        Output is bounded by construction: --since is capped at 7d, --limit applies to each \
+        section, and when a section was cut the payload says so rather than looking complete. Raw \
+        per-tick samples are omitted unless you ask for --samples; a window reaching past what \
+        `db prune` has left reports truncated_at instead of a silently short series.\n\n\
+        History lives only in the collector, so unlike `status` and `explain` this verb has no \
+        local fallback: with no collector it exits 2 (cannot determine) and says why. Exits 0 \
+        when the window was answered, 3 on a usage error."
+    )]
+    Timeline(TimelineArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

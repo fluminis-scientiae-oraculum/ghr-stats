@@ -16,6 +16,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::shared::models::timeline::{Timeline, TimelineQuery};
 use crate::shared::models::{
     BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
 };
@@ -41,7 +42,12 @@ use crate::shared::models::{
 ///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
 ///     read can no longer be rendered as live, and `BusyPoint` carries
 ///     `github_online` so the occupancy chart can plot a gap instead of a zero.
-pub const VERSION: u16 = 9;
+/// v10: added `Timeline` — the first query that answers about a WINDOW rather
+///     than an instant. It is also the first whose reply is explicitly bounded
+///     (`Bounded<T>` carries whether the limit cut it), because a history query
+///     is the one shape that can outgrow both the frame cap and a caller's
+///     context.
+pub const VERSION: u16 = 10;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -91,6 +97,10 @@ pub enum Query {
     /// made by the collector rather than reassembled (and mis-derived) by each
     /// client.
     FleetStatus,
+    /// What changed over a window, and optionally the samples underneath it.
+    /// The only query about a span rather than an instant, and the only one
+    /// whose caller states a bound — see [`TimelineQuery`].
+    Timeline(TimelineQuery),
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
@@ -167,6 +177,10 @@ pub enum Response {
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
     FleetStatus(Box<FleetStatus>),
+    /// Boxed like `FleetStatus`: both dwarf every other variant, and an enum is
+    /// as large as its largest arm — unboxed, every small reply would carry the
+    /// cost of the biggest one.
+    Timeline(Box<Timeline>),
     /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),

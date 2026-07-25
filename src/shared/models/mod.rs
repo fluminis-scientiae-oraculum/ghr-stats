@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod timeline;
+
 /// Static identity of a self-hosted runner, read from its `.runner` file plus
 /// the owning OS user of its install directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +319,27 @@ pub enum GhView {
 }
 
 impl GhView {
+    /// Adjudicate one reading against the freshness window: the single place the
+    /// Fresh/Stale call is made.
+    ///
+    /// `age_s` is how old the reading was *at the instant being described* —
+    /// now, for the live view; the sample's own tick, for a historical one. The
+    /// rule is the same either way, which is the point: a `timeline` row cannot
+    /// present as live something the live path would have called stale.
+    ///
+    /// The comparison happens in `u64` space. Casting `max_age` down to `i64`
+    /// would wrap a large window (`u64::MAX` ⇒ -1) and mark every reading stale
+    /// — the exact inverse of the intent. Clamping `age_s` non-negative first
+    /// makes widening it lossless.
+    pub fn observed(state: ApiState, age_s: i64, max_age: u64) -> GhView {
+        let age_s = age_s.max(0);
+        if age_s as u64 <= max_age {
+            GhView::Fresh { state, age_s }
+        } else {
+            GhView::Stale { age_s }
+        }
+    }
+
     /// GitHub's online bit, but only when it is trustworthy. `None` for stale
     /// or unknown — callers must not treat "we don't know" as "offline".
     pub fn online(&self) -> Option<bool> {

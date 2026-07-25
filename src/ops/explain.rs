@@ -515,11 +515,7 @@ fn github_view_unavailable(source: &Source) -> Option<Finding> {
 fn reason_word(source: &Source) -> &'static str {
     match source {
         Source::Collector => "connected",
-        Source::LocalScan(EphemeralReason::NoCollector) => "no-collector",
-        Source::LocalScan(EphemeralReason::VersionDrift { .. }) => "version-drift",
-        Source::LocalScan(EphemeralReason::Denied) => "denied",
-        Source::LocalScan(EphemeralReason::Unusable) => "handshake-failed",
-        Source::LocalScan(EphemeralReason::QueryFailed) => "query-failed",
+        Source::LocalScan(reason) => reason.word(),
     }
 }
 
