@@ -16,7 +16,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::shared::ipc::{Mutation, Query, Request, Response};
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
 use crate::shared::paths::Scope;
 use crate::tui::ipc_client::{self, Client};
 
@@ -99,7 +99,7 @@ impl DataSource {
 
     // --- typed queries: IPC in Persistent mode, ring / empty fallback otherwise ---
 
-    pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), ApiState> {
+    pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), GhView> {
         match self.query(&Request::Query(Query::LatestApiRunners)) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
             _ => HashMap::new(), // GitHub is Persistent-only

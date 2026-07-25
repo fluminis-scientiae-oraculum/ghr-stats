@@ -190,7 +190,11 @@ fn serve_conn(
             }
             Err(e) => return Err(e),
         };
-        let resp = handle(&req, conn, auth, config_path);
+        // Snapshot per request, so a config mutation that widens the freshness
+        // window takes effect immediately — same live-reload property the
+        // sampler threads have.
+        let max_age = shared.snapshot().intervals.api_max_age();
+        let resp = handle(&req, conn, auth, config_path, max_age);
         // A persisted mutation just changed /etc — reload so the running workers
         // pick it up live (the whole point of the shared, swappable config).
         if matches!(resp, Response::Mutated) {
@@ -213,11 +217,17 @@ fn reload_config(config_path: &Path) -> Config {
 /// Map one request to a response. Reads go through `store::reader`; mutations go
 /// through the authz gate to `config::persist` (writing `config_path`). A DB or
 /// query error becomes `Response::Error` rather than dropping the connection.
-fn handle(req: &Request, conn: Option<&Connection>, auth: Auth, config_path: &Path) -> Response {
+fn handle(
+    req: &Request,
+    conn: Option<&Connection>,
+    auth: Auth,
+    config_path: &Path,
+    max_age: u64,
+) -> Response {
     match req {
         Request::Hello { .. } => Response::Hello { server: VERSION },
         // Reads: never authorized (derived stats + config presence, no secrets).
-        Request::Query(q) => serve_query(q, conn, config_path),
+        Request::Query(q) => serve_query(q, conn, config_path, max_age),
         // Writes: the ONE authz gate. `apply_mutation` is reachable only past it,
         // so no mutation — present or future — can skip authorization.
         Request::Mutate(m) => {
@@ -251,7 +261,7 @@ fn clamped(limit: usize) -> usize {
 /// factored into [`with_db`], so only the arms that need the reader carry it;
 /// `ConfiguredTokenOrgs` reads the config file instead. Every `limit` is clamped
 /// to [`MAX_QUERY_LIMIT`] before it reaches the reader.
-fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Response {
+fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age: u64) -> Response {
     match q {
         // Presence-only view of configured token orgs (config file, not the DB).
         Query::ConfiguredTokenOrgs => {
@@ -285,17 +295,20 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path) -> Resp
             wrap(reader::latest_job(c, runner_name), Response::LatestJob)
         }),
         Query::LatestApiRunners => with_db(conn, |c| {
-            wrap(reader::latest_api_runners(c), |m| {
-                Response::LatestApiRunners(
-                    m.into_iter()
-                        .map(|((org, agent_id), state)| ApiRow {
-                            agent_id,
-                            org,
-                            state,
-                        })
-                        .collect(),
-                )
-            })
+            wrap(
+                reader::latest_api_runners(c, crate::shared::util::now_epoch(), max_age),
+                |m| {
+                    Response::LatestApiRunners(
+                        m.into_iter()
+                            .map(|((org, agent_id), view)| ApiRow {
+                                agent_id,
+                                org,
+                                view,
+                            })
+                            .collect(),
+                    )
+                },
+            )
         }),
         Query::RunnerStates => with_db(conn, |c| {
             wrap(reader::runner_states(c), |m| {
@@ -398,6 +411,9 @@ mod tests {
         uid: 1000,
         in_admin_group: false,
     };
+    /// Freshness window for tests whose assertions do not depend on it.
+    use crate::shared::models::GhView;
+    const MAX_AGE: u64 = 180;
     fn noconf() -> PathBuf {
         PathBuf::from("/nonexistent/ghr-stats-unused.toml")
     }
@@ -412,7 +428,7 @@ mod tests {
     #[test]
     fn hello_replies_with_server_version_without_a_db() {
         assert!(matches!(
-            handle(&Request::Hello { client: VERSION }, None, NOBODY, &noconf()),
+            handle(&Request::Hello { client: VERSION }, None, NOBODY, &noconf(), MAX_AGE),
             Response::Hello { server } if server == VERSION
         ));
     }
@@ -424,7 +440,8 @@ mod tests {
                 &Request::Query(Query::HostSeries { limit: 5 }),
                 None,
                 ROOT,
-                &noconf()
+                &noconf(),
+                MAX_AGE
             ),
             Response::Error(_)
         ));
@@ -438,7 +455,8 @@ mod tests {
                 &Request::Query(Query::HostSeries { limit: 5 }),
                 Some(&conn),
                 ROOT,
-                &noconf()
+                &noconf(),
+                MAX_AGE
             ),
             Response::HostSeries(v) if v.len() == 1 && v[0].ts == 100
         ));
@@ -453,16 +471,49 @@ mod tests {
             [],
         )
         .unwrap();
+        // A very wide window, so the row is unambiguously fresh regardless of
+        // the wall clock this test runs at.
         match handle(
             &Request::Query(Query::LatestApiRunners),
             Some(&conn),
             ROOT,
             &noconf(),
+            u64::MAX,
         ) {
             Response::LatestApiRunners(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].agent_id, 9);
-                assert!(rows[0].state.online && !rows[0].state.busy);
+                assert_eq!(rows[0].view.online(), Some(true));
+                assert_eq!(rows[0].view.busy(), Some(false));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The wire must carry the freshness verdict, not a bare state the TUI
+    /// would have to re-adjudicate. With a zero-second window the same row
+    /// crosses as Stale, and its online/busy read as unknown rather than as a
+    /// confident (and wrong) "online".
+    #[test]
+    fn latest_api_runners_reports_an_aged_row_as_stale_over_the_wire() {
+        let conn = seeded();
+        conn.execute(
+            "INSERT INTO api_runner_sample (ts, agent_id, org, name, online, busy) \
+             VALUES (200, 9, 'o', 'r', 1, 0)",
+            [],
+        )
+        .unwrap();
+        match handle(
+            &Request::Query(Query::LatestApiRunners),
+            Some(&conn),
+            ROOT,
+            &noconf(),
+            0,
+        ) {
+            Response::LatestApiRunners(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(rows[0].view, GhView::Stale { .. }));
+                assert_eq!(rows[0].view.online(), None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -482,6 +533,7 @@ mod tests {
             Some(&conn),
             ROOT,
             &noconf(),
+            MAX_AGE,
         ) {
             Response::RunnerStates(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -508,6 +560,7 @@ mod tests {
             None,
             NOBODY,
             &cfg,
+            MAX_AGE,
         ) {
             Response::ConfiguredTokenOrgs(orgs) => {
                 assert_eq!(orgs, vec!["acme".to_string(), "widgets".to_string()]);
@@ -516,7 +569,7 @@ mod tests {
         }
         // A missing/unreadable config yields an empty list, never an error.
         assert!(matches!(
-            handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &noconf()),
+            handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &noconf(), MAX_AGE),
             Response::ConfiguredTokenOrgs(orgs) if orgs.is_empty()
         ));
     }
@@ -529,7 +582,10 @@ mod tests {
             enabled: true,
             addr: "127.0.0.1:9999".to_string(),
         });
-        assert!(matches!(handle(&req, None, NOBODY, &cfg), Response::Denied));
+        assert!(matches!(
+            handle(&req, None, NOBODY, &cfg, MAX_AGE),
+            Response::Denied
+        ));
         assert!(!cfg.exists(), "denied mutation must not write the config");
     }
 
@@ -543,7 +599,7 @@ mod tests {
         });
         // A group member is authorized (as is root).
         assert!(matches!(
-            handle(&req, None, MEMBER, &cfg),
+            handle(&req, None, MEMBER, &cfg, MAX_AGE),
             Response::Mutated
         ));
         let text = std::fs::read_to_string(&cfg).unwrap();

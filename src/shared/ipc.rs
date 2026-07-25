@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
 
 /// Wire protocol version. Bump on any breaking change to `Request`/`Response`.
 /// The same binary ships both halves, so a mismatch means the installed service
@@ -32,7 +32,11 @@ use crate::shared::models::{ApiState, BusyPoint, HistPoint, HostPoint, JobRow, R
 /// v8: runner identity is the install `dir`, not `agentId` (which collides across
 ///     orgs). `RunnerHistory` keys by `dir`, `ApiRow` carries `org` (so the GH
 ///     join is `(org, agent_id)`), and `RunnerState` is keyed by `dir`.
-pub const VERSION: u16 = 8;
+/// v9: the GitHub view carries its own freshness verdict. `ApiRow.view` is a
+///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
+///     read can no longer be rendered as live, and `BusyPoint` carries
+///     `github_online` so the occupancy chart can plot a gap instead of a zero.
+pub const VERSION: u16 = 9;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -120,7 +124,10 @@ impl Mutation {
 pub struct ApiRow {
     pub agent_id: i64,
     pub org: String,
-    pub state: ApiState,
+    /// GitHub's view WITH its freshness already decided by the collector, which
+    /// is the side that knows when the reading was taken. The TUI renders the
+    /// verdict; it never re-derives it from a timestamp.
+    pub view: GhView,
 }
 
 /// A collector → TUI reply. `Error` carries a human string for logging; the TUI
@@ -189,6 +196,7 @@ mod tests {
             ts: 42,
             busy: 3,
             online: 7,
+            github_online: Some(5),
         }]);
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();

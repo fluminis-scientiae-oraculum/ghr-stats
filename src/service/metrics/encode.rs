@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::service::store::reader;
 use crate::shared::error::Result;
-use crate::shared::models::Liveness;
+use crate::shared::models::{GhView, Liveness};
 
 /// One runner's metric row.
 struct RunnerMetric {
@@ -20,8 +20,11 @@ struct RunnerMetric {
     mem_current_bytes: Option<u64>,
     /// Seconds in the current liveness state (`now - since_ts`).
     state_seconds: i64,
-    gh_online: Option<bool>,
-    gh_busy: Option<bool>,
+    /// GitHub's view, freshness already adjudicated by the reader. Held as the
+    /// whole verdict rather than pre-flattened booleans so the exporter can
+    /// distinguish "GitHub says offline" from "we have no current reading" —
+    /// the distinction the all-green rollup was missing.
+    gh: GhView,
 }
 
 impl RunnerMetric {
@@ -53,11 +56,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Read the current fleet state into a snapshot.
-    pub fn gather(conn: &Connection, now: i64, version: &str) -> Result<Snapshot> {
+    /// Read the current fleet state into a snapshot. `max_age` bounds how old a
+    /// GitHub reconcile row may be and still count as current — see
+    /// [`crate::shared::config::Intervals::api_max_age`], the one place it is
+    /// decided.
+    pub fn gather(conn: &Connection, now: i64, version: &str, max_age: u64) -> Result<Snapshot> {
         let latest = reader::latest_runners(conn)?;
         let states = reader::runner_states(conn)?;
-        let api = reader::latest_api_runners(conn)?;
+        let api = reader::latest_api_runners(conn, now, max_age)?;
         let host = reader::latest_host(conn)?;
         let (jobs_total, jobs_running) = reader::job_counts(conn)?;
 
@@ -75,7 +81,12 @@ impl Snapshot {
                     .get(&r.dir)
                     .map(|s| (now - s.since_ts).max(0))
                     .unwrap_or(0);
-                let gh = api.get(&(r.org.clone(), r.agent_id));
+                // A runner with no reconcile row at all is Unknown — never
+                // silently folded into "offline".
+                let gh = api
+                    .get(&(r.org.clone(), r.agent_id))
+                    .copied()
+                    .unwrap_or(GhView::Unknown);
                 RunnerMetric {
                     agent_id: r.agent_id,
                     name: r.name,
@@ -85,8 +96,7 @@ impl Snapshot {
                     mem_bytes: r.mem_bytes,
                     mem_current_bytes: r.mem_current_bytes,
                     state_seconds,
-                    gh_online: gh.map(|s| s.online),
-                    gh_busy: gh.map(|s| s.busy),
+                    gh,
                 }
             })
             .collect();
@@ -198,7 +208,7 @@ impl Snapshot {
         }
         let _ = writeln!(s, "# TYPE ghr_runner_github_online gauge");
         for r in &self.runners {
-            if let Some(o) = r.gh_online {
+            if let Some(o) = r.gh.online() {
                 let _ = writeln!(
                     s,
                     "ghr_runner_github_online{{{}}} {}",
@@ -209,7 +219,7 @@ impl Snapshot {
         }
         let _ = writeln!(s, "# TYPE ghr_runner_github_busy gauge");
         for r in &self.runners {
-            if let Some(b) = r.gh_busy {
+            if let Some(b) = r.gh.busy() {
                 let _ = writeln!(
                     s,
                     "ghr_runner_github_busy{{{}}} {}",
@@ -256,8 +266,8 @@ impl Snapshot {
                 "mem_bytes": r.mem_bytes,
                 "mem_current_bytes": r.mem_current_bytes,
                 "state_seconds": r.state_seconds,
-                "github_online": r.gh_online,
-                "github_busy": r.gh_busy,
+                "github_online": r.gh.online(),
+                "github_busy": r.gh.busy(),
             }));
         }
         serde_json::to_string(&Value::Array(arr)).unwrap_or_else(|_| "[]".to_string())
@@ -308,7 +318,7 @@ mod tests {
 
     #[test]
     fn prometheus_has_expected_families() {
-        let snap = Snapshot::gather(&seed(), 1100, "9.9.9").unwrap();
+        let snap = Snapshot::gather(&seed(), 1100, "9.9.9", 180).unwrap();
         let p = snap.to_prometheus();
         assert!(p.contains("ghr_build_info{version=\"9.9.9\"} 1"));
         assert!(p.contains("ghr_fleet_runners 2"));
@@ -331,7 +341,7 @@ mod tests {
 
     #[test]
     fn json_has_fleet_plus_runner_records() {
-        let snap = Snapshot::gather(&seed(), 1100, "9.9.9").unwrap();
+        let snap = Snapshot::gather(&seed(), 1100, "9.9.9", 180).unwrap();
         let v: serde_json::Value = serde_json::from_str(&snap.to_json()).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 3); // 1 fleet + 2 runners

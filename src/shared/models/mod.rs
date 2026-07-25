@@ -287,10 +287,52 @@ pub struct JobConclusion {
 }
 
 /// GitHub's view of one runner (from the latest reconcile tick).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiState {
     pub online: bool,
     pub busy: bool,
+}
+
+/// GitHub's view of one runner, with freshness ALREADY adjudicated.
+///
+/// The reader applies the age bound once and hands out this verdict, so no
+/// downstream consumer can read a six-hour-old row as though it were live. That
+/// is the whole point: the exporter, the TUI and the status verb each used to
+/// receive a bare `ApiState` and would each have had to remember to check a
+/// timestamp. Three consumers, three chances to forget.
+///
+/// `Stale` and `Unknown` are deliberately distinct. "We knew, but the data has
+/// aged out" and "we have never had data for this runner" call for different
+/// operator responses, and collapsing them — which is exactly what an
+/// `Option<ApiState>` does — is how a dead reconcile came to present as a calm
+/// fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum GhView {
+    /// Within the freshness window; `age_s` is how old the reading is.
+    Fresh { state: ApiState, age_s: i64 },
+    /// We have a reading, but it is older than the window allows.
+    Stale { age_s: i64 },
+    /// No reconcile row for this runner at all.
+    Unknown,
+}
+
+impl GhView {
+    /// GitHub's online bit, but only when it is trustworthy. `None` for stale
+    /// or unknown — callers must not treat "we don't know" as "offline".
+    pub fn online(&self) -> Option<bool> {
+        match self {
+            GhView::Fresh { state, .. } => Some(state.online),
+            GhView::Stale { .. } | GhView::Unknown => None,
+        }
+    }
+
+    /// GitHub's busy bit, on the same terms as [`Self::online`].
+    pub fn busy(&self) -> Option<bool> {
+        match self {
+            GhView::Fresh { state, .. } => Some(state.busy),
+            GhView::Stale { .. } | GhView::Unknown => None,
+        }
+    }
 }
 
 /// One historical runner sample, for sparklines.
@@ -318,5 +360,12 @@ pub struct HostPoint {
 pub struct BusyPoint {
     pub ts: i64,
     pub busy: u32,
+    /// Locally online (listener process present) — a purely local fact.
     pub online: u32,
+    /// How many runners GitHub considered online at this tick. `None` when the
+    /// tick has no reconcile data, which the chart must plot as a GAP rather
+    /// than as zero: drawing "0 online" for "we didn't ask" invents an outage,
+    /// and drawing the local line alone drew a flat healthy trace straight
+    /// through a real one.
+    pub github_online: Option<u32>,
 }

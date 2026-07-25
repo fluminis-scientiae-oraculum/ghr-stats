@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crate::shared::ipc::{self, ApiRow, Request, Response, VERSION};
-use crate::shared::models::ApiState;
+use crate::shared::models::GhView;
 use crate::shared::paths::Scope;
 
 /// The server is local and answers immediately; this only bounds a wedged or
@@ -98,9 +98,9 @@ impl Client {
 
 /// Rebuild the `(org, agent_id) → ApiState` map from the wire's `Vec<ApiRow>`.
 /// The org is part of the key because `agent_id` is unique only within an org.
-pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), ApiState> {
+pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), GhView> {
     rows.into_iter()
-        .map(|r| ((r.org, r.agent_id), r.state))
+        .map(|r| ((r.org, r.agent_id), r.view))
         .collect()
 }
 
