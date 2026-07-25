@@ -1,17 +1,23 @@
-//! Privileged host operations — the sudo model as a template-method CONTRACT.
+//! Privileged host operations. Two distinct needs, deliberately not unified:
 //!
-//! The project's trait-as-contract precedent, kept deliberately simple (KISS).
-//! [`PrivilegedExecution::do_execute`] is the entry point AND the template: it
-//! always clears the gate ([`ensure`](PrivilegedExecution::ensure)) before
-//! running the work ([`contract`](PrivilegedExecution::contract)). An op writes
-//! only `contract` (and overrides `ensure` if it needs a root *process*) — so
-//! the gate cannot be forgotten: it lives once, in the default `do_execute`, and
-//! that is how every privileged op is run. No capability token, no separate
-//! dispatcher — the default method *is* the enforcement.
+//! 1. **Per-command escalation** — [`run`] executes directly when already root,
+//!    else via `sudo`. Enough whenever each command can escalate on its own
+//!    (`systemctl restart`, `install(1)`). `sudo` prompts on `/dev/tty`, so call
+//!    only while the TUI is *suspended* — the typestate guarantees an action's
+//!    `execute` runs inside the suspend window.
+//! 2. **A root *process*** — [`require_root`] / [`is_root`], for work whose
+//!    correctness depends on the process itself being root: it writes across
+//!    scopes (`/etc`, `/usr/local/bin`, root-owned runner `.env` files) or must
+//!    resolve our own install scope. Per-op `sudo` cannot supply this. Gated at
+//!    the three entry points that need it — `ops::systemd::install`,
+//!    `ops::wizard::apply_hooks`, `ops::uninstall`.
 //!
-//! Commands run directly when already root, else via `sudo` (which prompts on
-//! `/dev/tty`, so call only while the TUI is *suspended* — the typestate
-//! guarantees an action's `execute` runs inside the suspend window).
+//! These are free functions on purpose. A `PrivilegedExecution` template-method
+//! trait lived here until 0.2.1 and was removed: it wrapped only the two TUI
+//! actions, which need (1) and never overrode the gate, while all four sites
+//! needing (2) called the free functions directly — so it advertised an
+//! enforcement it did not provide. Re-adding one is only worth it if it actually
+//! covers the `ops::` gates; see the backlog entry for D1.
 
 use std::process::Command;
 
@@ -25,11 +31,6 @@ pub(crate) enum Outcome {
     },
     /// The command could not be spawned at all (e.g. `sudo` not installed).
     Spawn(String),
-    /// `ensure` refused: this op needs a root *process* and we were not root —
-    /// carries the `sudo <abs> <cmd>` hint to re-run.
-    NeedsRoot {
-        hint: String,
-    },
 }
 
 impl Outcome {
@@ -51,39 +52,13 @@ impl Outcome {
                 format!("{what}: {detail}")
             }
             Outcome::Spawn(e) => format!("{what}: could not run ({e}) — is `sudo` installed?"),
-            Outcome::NeedsRoot { hint } => format!("{what}: needs root — re-run `{hint}`"),
-        }
-    }
-}
-
-/// A privileged operation, as a template-method contract.
-///
-/// - [`contract`](Self::contract) — the work. The only required method; shell
-///   out via [`run`] (which sudo-wraps when not root).
-/// - [`ensure`](Self::ensure) — the gate. DEFAULT = no extra requirement, since
-///   `contract`'s commands self-escalate via sudo. Override to require a root
-///   *process* when correctness depends on `Scope::System` (see [`require_root`]).
-/// - [`do_execute`](Self::do_execute) — the entry point and template: `ensure`
-///   then `contract`. It is the only way to run the op, so the gate can't be
-///   skipped.
-pub(crate) trait PrivilegedExecution {
-    fn contract(&self) -> Outcome;
-
-    fn ensure(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn do_execute(&self) -> Outcome {
-        match self.ensure() {
-            Ok(()) => self.contract(),
-            Err(hint) => Outcome::NeedsRoot { hint },
         }
     }
 }
 
 /// Require a root *process*, or the absolute-path re-run hint for `resume`. For
-/// `ensure` overrides and for interactive flows (the hook wizard) that gate once
-/// then do privileged work across several steps.
+/// the flows that gate once then do privileged work across several steps (the
+/// hook wizard, `systemd install --system`, system-scope `uninstall`).
 pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
     if is_root() {
         Ok(())
@@ -93,8 +68,7 @@ pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
 }
 
 /// Run a privileged command — directly if root, else via `sudo`. `argv[0]` is
-/// the program. Called by a `contract` (after `do_execute` cleared the gate) or
-/// by a gated interactive flow.
+/// the program.
 pub(crate) fn run(argv: &[&str]) -> Outcome {
     if argv.is_empty() {
         return Outcome::Spawn("empty command".to_string());
@@ -193,46 +167,18 @@ mod tests {
         );
     }
 
-    /// A no-op op whose `contract` does not shell out, so the template can be
-    /// exercised without a real command.
-    struct Probe {
-        gate: Result<(), String>,
-    }
-    impl PrivilegedExecution for Probe {
-        fn contract(&self) -> Outcome {
-            Outcome::Ok
-        }
-        fn ensure(&self) -> Result<(), String> {
-            self.gate.clone()
-        }
+    #[test]
+    fn sudo_hint_carries_an_absolute_path() {
+        // The whole point of the hint: `sudo ghr-stats …` fails on a user-wide
+        // install because sudo's secure_path excludes ~/.cargo/bin, so the hint
+        // must name the binary by absolute path.
+        let hint = sudo_hint("uninstall");
+        assert!(hint.starts_with("sudo /"), "not absolute: {hint}");
+        assert!(hint.ends_with(" uninstall"));
     }
 
     #[test]
-    fn do_execute_runs_contract_only_after_the_gate_passes() {
-        // gate passes → contract runs.
-        assert!(Probe { gate: Ok(()) }.do_execute().is_ok());
-        // gate refuses → NeedsRoot, contract never runs, hint carried through.
-        let refused = Probe {
-            gate: Err("sudo /opt/ghr-stats config".into()),
-        }
-        .do_execute();
-        assert!(matches!(refused, Outcome::NeedsRoot { .. }));
-        assert!(
-            refused
-                .describe("hooks")
-                .contains("sudo /opt/ghr-stats config")
-        );
-    }
-
-    #[test]
-    fn default_ensure_needs_no_root() {
-        // The default gate (no override) imposes no extra requirement.
-        struct Plain;
-        impl PrivilegedExecution for Plain {
-            fn contract(&self) -> Outcome {
-                Outcome::Ok
-            }
-        }
-        assert!(Plain.ensure().is_ok());
+    fn sudo_hint_has_no_trailing_space_for_the_bare_binary() {
+        assert_eq!(sudo_hint(""), format!("sudo {}", exe_path()));
     }
 }
