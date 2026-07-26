@@ -13,13 +13,46 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use crate::shared::ipc::{self, ApiRow, Request, Response, VERSION};
+use crate::shared::ipc::{self, ApiRow, Mutation, Query, Request, Response, VERSION};
 use crate::shared::models::GhView;
 use crate::shared::paths::Scope;
 
-/// The server is local and answers immediately; this only bounds a wedged or
-/// half-open peer so the TUI's render loop never blocks on it.
+/// The budget for a request the collector answers from memory or a keyed lookup:
+/// the handshake, and every query about an *instant*. The server is local and
+/// answers immediately, so this only bounds a wedged or half-open peer — and it
+/// stays tight because the TUI's render loop waits on it, and because a dead
+/// collector must be reported as dead quickly rather than slowly.
 const IO_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// The budget for a query about a *span*, which scans rather than looks up and
+/// therefore scales with both the window asked for and the size of the database.
+///
+/// One number for both was a real bug, not a tuning nit: at 750ms `doctor`'s
+/// 7-day retention probe timed out every single run, so the verb could never
+/// certify — exit 2, "the collector did not answer a history query", with
+/// nothing actually broken.
+///
+/// Measured on the fleet host (1.1 GiB, 8.1M sample rows), `timeline --limit 1`
+/// end to end:
+///
+/// | window | wall |
+/// |--------|------|
+/// | 1h     | 0.53s |
+/// | 6h     | 0.69s |
+/// | 24h    | 1.21s |
+/// | 3d     | 3.69s |
+/// | 7d     | 8.13s |
+///
+/// Roughly linear in the window at ~1.2s/day, because the cost is deriving edges
+/// across it — `--limit` bounds the OUTPUT, not the work. So this is sized for
+/// a month-ish window on a database this size, not for the 7 days `doctor` asks
+/// for; a ceiling that merely cleared the number in front of us would fail again
+/// on the next-larger deployment. The underlying cost is tracked as debt: the
+/// retention probe pays a full edge derivation to read one nullable timestamp.
+///
+/// Safe to be this generous because no span query is issued from the TUI — only
+/// from `ops::{timeline, tail, doctor}`, none of which hold a render loop.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A live connection to a collector's IPC socket.
 pub(crate) struct Client {
@@ -123,7 +156,13 @@ impl Client {
     }
 
     /// One request → one response, reusing the connection.
+    ///
+    /// The read budget is set per request, not once at connect: what counts as
+    /// "too long to wait" is a property of the question being asked, and a
+    /// single number for a keyed lookup and a multi-day scan can only be wrong
+    /// for one of them.
     pub(crate) fn request(&mut self, req: &Request) -> io::Result<Response> {
+        let _ = self.stream.set_read_timeout(Some(read_timeout(req)));
         ipc::write_frame(&mut self.stream, req)?;
         ipc::read_frame(&mut self.stream)
     }
@@ -138,6 +177,41 @@ impl Client {
     /// that did not report one — which is itself a useful signal.
     pub(crate) fn collector_version(&self) -> Option<&str> {
         (!self.version.is_empty()).then_some(self.version.as_str())
+    }
+}
+
+/// How long to wait for this request's answer.
+///
+/// Written as an exhaustive match with no `_` arm, for the same reason
+/// `init_tracing` picks a log sink per verb that way: a query added later must
+/// state whether it scans or looks up, and get a build error if it does not.
+/// The wrong default here is silent and only shows up on a large deployment,
+/// which is the worst place to discover it.
+fn read_timeout(req: &Request) -> Duration {
+    match req {
+        // The handshake must fail FAST — a collector that is not there should be
+        // reported as absent in milliseconds, not seconds.
+        Request::Hello { .. } => IO_TIMEOUT,
+        // A write is a small keyed update; it does not scan.
+        Request::Mutate(
+            Mutation::SetMetricsPull { .. }
+            | Mutation::AddOrgToken { .. }
+            | Mutation::RemoveOrgToken { .. },
+        ) => IO_TIMEOUT,
+        // The only query about a SPAN rather than an instant, and so the only
+        // one whose cost grows with the operator's retention and fleet size.
+        Request::Query(Query::Timeline(_)) => SCAN_TIMEOUT,
+        Request::Query(
+            Query::HostSeries { .. }
+            | Query::BusySeries { .. }
+            | Query::RunnerHistory { .. }
+            | Query::RecentJobs { .. }
+            | Query::LatestJob { .. }
+            | Query::LatestApiRunners
+            | Query::FleetStatus
+            | Query::RunnerStates
+            | Query::ConfiguredTokenOrgs,
+        ) => IO_TIMEOUT,
     }
 }
 
@@ -228,5 +302,69 @@ enum ConnectErr {
 impl From<io::Error> for ConnectErr {
     fn from(e: io::Error) -> Self {
         ConnectErr::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::models::timeline::TimelineQuery;
+
+    /// One budget for a keyed lookup and a multi-day scan can only be right for
+    /// one of them. It was right for the lookup, which is why `doctor` could
+    /// never certify on a large fleet and every dev database said it was fine.
+    #[test]
+    fn a_span_query_gets_a_larger_budget_than_an_instant_one() {
+        let span = Request::Query(Query::Timeline(TimelineQuery {
+            since_ts: 0,
+            limit: 1,
+            org: None,
+            runner: None,
+            samples: false,
+        }));
+        assert_eq!(read_timeout(&span), SCAN_TIMEOUT);
+        assert!(SCAN_TIMEOUT > IO_TIMEOUT);
+    }
+
+    /// The handshake and every instant query stay on the tight budget: a
+    /// collector that is not there must be reported absent in milliseconds, and
+    /// the TUI's render loop waits on these.
+    #[test]
+    fn the_handshake_and_instant_queries_stay_tight() {
+        assert_eq!(
+            read_timeout(&Request::Hello { client: VERSION }),
+            IO_TIMEOUT
+        );
+        assert_eq!(
+            read_timeout(&Request::Query(Query::FleetStatus)),
+            IO_TIMEOUT
+        );
+        assert_eq!(
+            read_timeout(&Request::Query(Query::RunnerStates)),
+            IO_TIMEOUT
+        );
+        assert_eq!(
+            read_timeout(&Request::Mutate(Mutation::RemoveOrgToken {
+                org: "example".to_string()
+            })),
+            IO_TIMEOUT
+        );
+    }
+
+    /// Sized against a MEASUREMENT, not a guess, and not against the one window
+    /// that happened to be in front of us: the span query costs ~1.2s per day of
+    /// window on a 1.1 GiB / 8.1M-row database (8.13s at 7 days). `doctor` asks
+    /// for 7 days, but an operator may ask for a month, so the budget is sized
+    /// for that rather than for the probe.
+    #[test]
+    fn the_scan_budget_is_sized_for_a_month_not_for_doctors_probe() {
+        const MEASURED_PER_DAY_MS: u64 = 1200;
+        let doctors_probe = Duration::from_millis(MEASURED_PER_DAY_MS * 7);
+        let a_month = Duration::from_millis(MEASURED_PER_DAY_MS * 30);
+        assert!(SCAN_TIMEOUT > doctors_probe);
+        assert!(
+            SCAN_TIMEOUT >= a_month,
+            "sizing to the probe alone is how 750ms was chosen"
+        );
     }
 }
