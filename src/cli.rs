@@ -52,6 +52,31 @@ pub struct ExplainArgs {
     pub json: bool,
 }
 
+/// Scope and backfill for `ghr-stats tail`.
+#[derive(clap::Args, Debug)]
+pub struct TailArgs {
+    /// Only follow this org's transitions.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+
+    /// Only follow this runner's transitions, by display name.
+    #[arg(long, value_name = "NAME")]
+    pub runner: Option<String>,
+
+    /// Emit this many seconds of history before following. Default 0: `tail`
+    /// answers "what is happening", and `timeline --since` already answers
+    /// "what happened", so backfill is a flag rather than a surprise flood.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    pub backfill: u64,
+}
+
+impl TailArgs {
+    /// How far back the first poll reaches.
+    pub fn since_secs(&self) -> u64 {
+        self.backfill
+    }
+}
+
 /// Predicate, scope and deadline for `ghr-stats wait`.
 ///
 /// The predicate is an `ArgGroup` with `required(true)` rather than a defaulted
@@ -202,6 +227,23 @@ pub enum Command {
         it could not be determined, 3 on a usage error."
     )]
     Wait(WaitArgs),
+
+    /// Follow the fleet's transitions as they happen — NDJSON, one per line.
+    #[command(
+        long_about = "Print each state change as one JSON object on its own line, flushed \
+        immediately: liveness edges, GitHub-online edges, per-org reconcile outcomes, and job \
+        starts and completions.\n\n\
+        This POLLS rather than subscribes, deliberately. A transition does not exist until a \
+        sampler observes it, so a subscription would deliver the same events at the same moments \
+        while holding one of the collector's few connection slots for its entire life. Polling \
+        also lets it prove it kept up: if more transitions occurred than one poll could carry, a \
+        {\"type\":\"gap\"} line names the section and window it could not cover, so falling \
+        behind is never silent.\n\n\
+        Starts from now; --backfill SECONDS replays a window first. Ends when you stop it (exit \
+        0), or immediately with exit 2 if there is no collector — the transition record lives \
+        only there."
+    )]
+    Tail(TailArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

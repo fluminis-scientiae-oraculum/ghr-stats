@@ -10,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::shared::error::Result;
 use crate::shared::models::timeline::{
-    Bounded, Edge, ReconcileEdge, Timeline, TimelinePoint, TimelineQuery, Transition, Window,
+    Bounded, Edge, JobEdge, JobTransition, ReconcileEdge, Timeline, TimelinePoint, TimelineQuery,
+    Transition, Window,
 };
 use crate::shared::models::{
     ApiReconcileState, ApiRunnerState, ApiState, BusyPoint, GhCount, GhView, HistPoint, HostPoint,
@@ -349,8 +350,51 @@ pub fn timeline(conn: &Connection, q: &TimelineQuery, now: i64, max_age: u64) ->
             truncated_at: earliest_sample(conn, q)?.filter(|first| *first > q.since_ts),
         },
         transitions: Bounded::newest(rows, q.limit),
+        jobs: Bounded::newest(job_edges(conn, q, probe)?, q.limit),
         samples,
     })
+}
+
+/// Job starts and completions in the window, newest first.
+///
+/// One `job_event` row yields up to TWO edges at different instants, so the two
+/// ends are selected separately and unioned rather than derived from one row —
+/// a job that started inside the window and has not finished contributes only
+/// its start, and one that finished inside a window it started before
+/// contributes only its completion. Filtering the union (rather than each half)
+/// keeps the org/runner predicate written once.
+fn job_edges(conn: &Connection, q: &TimelineQuery, limit: usize) -> Result<Vec<JobTransition>> {
+    let (org, runner) = filters(q);
+    let mut stmt = conn.prepare_cached(
+        "SELECT ts, org, runner_name, repo, job, started, conclusion FROM ( \
+             SELECT started_at AS ts, org, runner_name, repo, job, 1 AS started, \
+                    NULL AS conclusion \
+             FROM job_event WHERE started_at IS NOT NULL AND started_at >= ?1 \
+             UNION ALL \
+             SELECT completed_at AS ts, org, runner_name, repo, job, 0 AS started, conclusion \
+             FROM job_event WHERE completed_at IS NOT NULL AND completed_at >= ?1 \
+         ) WHERE (?2 IS NULL OR org = ?2) AND (?3 IS NULL OR runner_name = ?3) \
+         ORDER BY ts DESC LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(params![q.since_ts, org, runner, limit as i64], |r| {
+        let ts: i64 = r.get(0)?;
+        Ok(JobTransition {
+            ts,
+            at: to_rfc3339_utc(ts),
+            org: r.get(1)?,
+            runner: r.get(2)?,
+            repo: r.get(3)?,
+            job: r.get(4)?,
+            edge: if r.get::<_, i64>(5)? != 0 {
+                JobEdge::Started
+            } else {
+                JobEdge::Completed {
+                    conclusion: r.get(6)?,
+                }
+            },
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// The optional `--org` / `--runner` filters as SQL parameters.

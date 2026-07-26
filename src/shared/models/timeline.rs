@@ -140,6 +140,40 @@ pub enum ReconcileEdge {
     },
 }
 
+/// A job starting or finishing on a runner.
+///
+/// Its own type, and its own bounded section in [`Timeline`], rather than a
+/// fourth [`Edge`] variant. The reason is volume: on a busy fleet job edges
+/// outnumber state edges by orders of magnitude, so sharing one limit would let
+/// the loudest stream evict the diagnostic one — a `--since 6h` that returned
+/// nothing but job churn and dropped the four liveness flips that explain it.
+/// Bounding each stream separately means a noisy one cannot starve a quiet one,
+/// and each reports its own truncation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobTransition {
+    pub ts: i64,
+    pub at: String,
+    pub org: String,
+    pub runner: String,
+    pub repo: String,
+    pub job: String,
+    pub edge: JobEdge,
+}
+
+/// Which end of a job this is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobEdge {
+    Started,
+    /// Finished. `conclusion` is `None` until the reconcile resolves it from the
+    /// API — the hook knows a job ended, not whether it passed. A watcher
+    /// therefore sees the completion once, with an unknown outcome, and is not
+    /// sent a correction later; ask `recent_jobs` for the settled answer.
+    Completed {
+        conclusion: Option<String>,
+    },
+}
+
 /// One runner at one tick: the local truth, and GitHub's view *as of that
 /// instant* — with its freshness already adjudicated against the tick, exactly
 /// as the live path adjudicates against now. A reading taken an hour before the
@@ -165,6 +199,9 @@ pub struct Timeline {
     pub window: Window,
     /// Always present — the point of the verb.
     pub transitions: Bounded<Transition>,
+    /// Job starts and completions, bounded independently of `transitions` — see
+    /// [`JobTransition`] for why they are not merged.
+    pub jobs: Bounded<JobTransition>,
     /// `None` means "not requested", never "none found": an empty `Bounded` is
     /// the answer for a window in which nothing was sampled, and conflating the
     /// two would make `--samples` unfalsifiable.

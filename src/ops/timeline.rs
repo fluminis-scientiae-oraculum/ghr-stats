@@ -35,7 +35,9 @@ use crate::shared::config::Config;
 use crate::shared::ipc::client::Client;
 use crate::shared::ipc::{Query, Request, Response};
 use crate::shared::models::GhView;
-use crate::shared::models::timeline::{Bounded, Edge, ReconcileEdge, Timeline, TimelineQuery};
+use crate::shared::models::timeline::{
+    Bounded, Edge, JobEdge, JobTransition, ReconcileEdge, Timeline, TimelineQuery,
+};
 use crate::shared::util::{BUILD_VERSION, now_epoch};
 
 /// The furthest back a window may reach.
@@ -194,6 +196,23 @@ fn human(t: &Timeline, since: &str) -> String {
         let _ = writeln!(out, "  (nothing changed in this window)");
     }
 
+    // Its own section, not merged above: job churn would otherwise bury the
+    // handful of state changes that explain it.
+    if !t.jobs.items.is_empty() || t.jobs.limited {
+        let _ = writeln!(out, "{}", section("job event", &t.jobs));
+        for j in &t.jobs.items {
+            let _ = writeln!(
+                out,
+                "  {}  {}  {}  {}  {}",
+                j.at,
+                j.org,
+                j.runner,
+                job_word(&j.edge),
+                job_name(j)
+            );
+        }
+    }
+
     if let Some(samples) = &t.samples {
         let _ = writeln!(out, "{}", section("sample", samples));
         for p in &samples.items {
@@ -225,6 +244,30 @@ fn section<T>(singular: &str, b: &Bounded<T>) -> String {
         format!("{n} {noun} (limited — older rows exist; narrow --since or raise --limit)")
     } else {
         format!("{n} {noun}")
+    }
+}
+
+/// Which end of a job, and — for a completion — what came of it. An unresolved
+/// conclusion prints as `?` rather than as a guess: the hook knows a job ended,
+/// and only the reconcile learns whether it passed.
+fn job_word(edge: &JobEdge) -> String {
+    match edge {
+        JobEdge::Started => "job started".to_string(),
+        JobEdge::Completed { conclusion: None } => "job completed (conclusion ?)".to_string(),
+        JobEdge::Completed {
+            conclusion: Some(c),
+        } => format!("job completed ({c})"),
+    }
+}
+
+/// `repo/job`, with either half omitted when the hook did not record it —
+/// printing a bare `/` for a job whose repo is unknown reads like a path.
+fn job_name(j: &JobTransition) -> String {
+    match (j.repo.as_str(), j.job.as_str()) {
+        ("", "") => "(unnamed)".to_string(),
+        ("", job) => job.to_string(),
+        (repo, "") => repo.to_string(),
+        (repo, job) => format!("{repo}/{job}"),
     }
 }
 
@@ -336,6 +379,10 @@ mod tests {
             transitions: Bounded {
                 items: transitions,
                 limited,
+            },
+            jobs: Bounded {
+                items: Vec::new(),
+                limited: false,
             },
             samples: None,
         }
