@@ -44,6 +44,103 @@ pub struct StatusArgs {
     pub runner: Option<String>,
 }
 
+/// Output shape for `ghr-stats explain`.
+#[derive(clap::Args, Debug)]
+pub struct ExplainArgs {
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Scope and backfill for `ghr-stats tail`.
+#[derive(clap::Args, Debug)]
+pub struct TailArgs {
+    /// Only follow this org's transitions.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+
+    /// Only follow this runner's transitions, by display name.
+    #[arg(long, value_name = "NAME")]
+    pub runner: Option<String>,
+
+    /// Emit this many seconds of history before following. Default 0: `tail`
+    /// answers "what is happening", and `timeline --since` already answers
+    /// "what happened", so backfill is a flag rather than a surprise flood.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    pub backfill: u64,
+}
+
+impl TailArgs {
+    /// How far back the first poll reaches.
+    pub fn since_secs(&self) -> u64 {
+        self.backfill
+    }
+}
+
+/// Predicate, scope and deadline for `ghr-stats wait`.
+///
+/// The predicate is an `ArgGroup` with `required(true)` rather than a defaulted
+/// flag, so `wait` with no predicate is a usage error at parse time (exit 3)
+/// instead of a runtime check — and adding a second predicate later makes the
+/// two mutually exclusive by construction rather than silently changing what a
+/// bare `wait` means.
+#[derive(clap::Args, Debug)]
+#[command(group(clap::ArgGroup::new("predicate").required(true).args(["github_online"])))]
+pub struct WaitArgs {
+    /// Block until every runner in scope is online to GitHub.
+    #[arg(long)]
+    pub github_online: bool,
+
+    /// Only wait on this org's runners.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+
+    /// Give up after this many seconds. `0` evaluates once and exits.
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    pub timeout: u64,
+
+    /// Emit the final snapshot as JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Output shape and network policy for `ghr-stats doctor`.
+#[derive(clap::Args, Debug)]
+pub struct DoctorArgs {
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Skip the one check that calls GitHub (per-org PAT validation). The check
+    /// is then reported as skipped, which keeps the verdict at "cannot
+    /// determine" rather than green.
+    #[arg(long)]
+    pub offline: bool,
+}
+
+/// Window, filters and output shape for `ghr-stats timeline`.
+#[derive(clap::Args, Debug)]
+pub struct TimelineArgs {
+    /// How far back to look: 90s, 30m, 6h, 2d. Capped at 7d.
+    #[arg(long, value_name = "DURATION", default_value = "6h")]
+    pub since: String,
+    /// Maximum rows per section (transitions, and samples if requested).
+    #[arg(long, value_name = "N", default_value_t = 500)]
+    pub limit: usize,
+    /// Only this org.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+    /// Only this runner (by name).
+    #[arg(long, value_name = "NAME")]
+    pub runner: Option<String>,
+    /// Also include the raw per-tick samples behind the transitions.
+    #[arg(long)]
+    pub samples: bool,
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Launch the interactive TUI dashboard (this is the default).
@@ -67,6 +164,86 @@ pub enum Command {
         long_about = "Print the fleet's current state and an overall verdict, then exit with a         code that encodes it: 0 healthy, 1 degraded (a runner is offline, diverging from         GitHub's view, or its GitHub reading is stale), 2 cannot determine (no collector and no         readable runner root), 3 usage error. With --json the payload is machine-stable: no         colour, no localised time, both ISO-8601 and epoch, and a schema_version. Reads the         collector over its socket when one is running; otherwise falls back to a live local         scan, in which case the github_* fields are null rather than invented."
     )]
     Status(StatusArgs),
+
+    /// Why the fleet is degraded — findings with the boundary to investigate.
+    #[command(
+        long_about = "Turn the fleet's current state into findings rather than numbers. Each \
+        finding carries a claim and a `boundary` — local, github, network or config — naming which \
+        side to investigate, which is the expensive half of diagnosing a fleet fault and the half \
+        this tool is uniquely placed to shortcut: it holds the local process truth and GitHub's \
+        opinion at the same instant. Exits with the same code as `status`: 0 healthy, 1 degraded, \
+        2 cannot determine, 3 usage error. Without a collector the GitHub-side findings cannot be \
+        assessed, and that limit is reported as a finding rather than left as silence."
+    )]
+    Explain(ExplainArgs),
+
+    /// What changed over a window — edges only, so causality is readable.
+    #[command(
+        long_about = "Replay a window as the things that CHANGED in it: local liveness edges, \
+        GitHub-online edges, and the per-org reconcile going bad or recovering. Reading those \
+        three together is what separates \"GitHub says these runners are gone\" from \"we stopped \
+        being able to ask\" — the distinction a raw sample dump buries under hundreds of \
+        identical rows.\n\n\
+        Output is bounded by construction: --since is capped at 7d, --limit applies to each \
+        section, and when a section was cut the payload says so rather than looking complete. Raw \
+        per-tick samples are omitted unless you ask for --samples; a window reaching past what \
+        `db prune` has left reports truncated_at instead of a silently short series.\n\n\
+        History lives only in the collector, so unlike `status` and `explain` this verb has no \
+        local fallback: with no collector it exits 2 (cannot determine) and says why. Exits 0 \
+        when the window was answered, 3 on a usage error."
+    )]
+    Timeline(TimelineArgs),
+
+    /// Preflight the install itself: config, PATs, hooks, socket, database.
+    #[command(
+        long_about = "Check the things every other verb assumes: that the config parses, that \
+        each org's PAT can still list its runners, that the hooks are installed, that the \
+        collector is reachable and is the SAME BUILD as this binary, and where the retained \
+        record starts.\n\n\
+        A check that could not run is reported as skipped, never as passing, and any skip holds \
+        the verdict at 2 (cannot determine) rather than 0. The common case is real: the system \
+        config is root-owned and unreadable, so a non-root run genuinely cannot inspect PATs — \
+        re-run with sudo for the full picture. Every failure carries the single next action.\n\n\
+        --offline skips PAT validation, the only check that calls GitHub. Exits 0 when every \
+        check passed, 1 when one failed, 2 when any was skipped, 3 on a usage error."
+    )]
+    Doctor(DoctorArgs),
+
+    /// Block until the fleet reaches a state — the poll loop, written once.
+    #[command(
+        long_about = "Block until every runner in scope is online to GitHub, then exit 0. This \
+        replaces the `while ! ghr-stats status; do sleep 30; done` loop, which was written by \
+        hand three times during the 2026-07-25 investigation and got three things wrong each \
+        time.\n\n\
+        A timeout while the GitHub view was unreadable exits 2 (cannot determine), NOT 1: the \
+        caller must never read our blindness as the fleet's answer. A filter matching no runners \
+        exits 2 as well, because \"every runner in the empty set is online\" is vacuously true \
+        and exiting 0 on a typo is the worst failure available to a verb whose output is its \
+        exit code. And with no collector the predicate is unanswerable immediately rather than \
+        after the full timeout, since the GitHub view exists only there.\n\n\
+        Polls at the local sampling interval, because a transition does not exist until a \
+        sampler observes it. Progress goes to stderr and only when it changes; the final \
+        snapshot goes to stdout. Exits 0 when the predicate held, 1 on a genuine timeout, 2 when \
+        it could not be determined, 3 on a usage error."
+    )]
+    Wait(WaitArgs),
+
+    /// Follow the fleet's transitions as they happen — NDJSON, one per line.
+    #[command(
+        long_about = "Print each state change as one JSON object on its own line, flushed \
+        immediately: liveness edges, GitHub-online edges, per-org reconcile outcomes, and job \
+        starts and completions.\n\n\
+        This POLLS rather than subscribes, deliberately. A transition does not exist until a \
+        sampler observes it, so a subscription would deliver the same events at the same moments \
+        while holding one of the collector's few connection slots for its entire life. Polling \
+        also lets it prove it kept up: if more transitions occurred than one poll could carry, a \
+        {\"type\":\"gap\"} line names the section and window it could not cover, so falling \
+        behind is never silent.\n\n\
+        Starts from now; --backfill SECONDS replays a window first. Ends when you stop it (exit \
+        0), or immediately with exit 2 if there is no collector — the transition record lives \
+        only there."
+    )]
+    Tail(TailArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

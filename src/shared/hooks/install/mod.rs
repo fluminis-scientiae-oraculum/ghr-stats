@@ -7,10 +7,28 @@
 //! runs the existing hook then appends our event) or to INSTRUCT (print the
 //! snippet to add) — we never overwrite a foreign hook. Our scripts (and the
 //! wrapper) preserve the original exit code: a non-zero runner hook fails the job.
+//!
+//! Only ONE thing splits out of this file, and it is worth saying why the obvious
+//! candidates did not. Detect-vs-act, read-vs-write and parse-vs-render all FAIL
+//! the seam test: [`HookStatus`] is spoken by the detection, the chaining and the
+//! reversal alike; [`env_value`], [`OUR_VARS`] and [`assigns_any`] are shared by
+//! every path that touches a runner's `.env`. Manipulating one runner's hook
+//! configuration is genuinely one job, and cutting it along a layer would put the
+//! same vocabulary on both sides of the line.
+//!
+//! [`chain`] is different because it is not a layer but a FORMAT. The wrapper this
+//! module writes is parsed back by `uninstall`, and the two halves must stay
+//! symmetric or reversing a chained runner leaves it HOOKLESS — the exact inverse
+//! of never-clobber. A format with a writer and a reader is a real boundary even
+//! where the layering is not, so that is where the cut goes.
 
 use std::path::{Path, PathBuf};
 
 use crate::shared::error::Result;
+
+pub(crate) mod chain;
+
+pub(crate) use chain::{original_from_wrapper, plan_chain_slot};
 
 const STARTED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_STARTED";
 const COMPLETED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_COMPLETED";
@@ -19,15 +37,9 @@ const COMPLETED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_COMPLETED";
 /// writes a log the runner user owns (the collector reads it as root).
 const EVENT_LOG_VAR: &str = "GHR_STATS_EVENT_LOG";
 
-/// Provenance marker written into every chain wrapper so `uninstall` can recover
-/// the operator's ORIGINAL hook path unambiguously (a stable comment, not a
-/// re-parse of the exec line). Reversing a chained runner must restore this exact
-/// path — never leave the runner hookless (the inverse of never-clobber).
-const WRAP_MARKER: &str = "# ghr-stats-wraps:";
-
 /// Our hook scripts, embedded so the binary is self-contained for any adopter.
-const STARTED_SCRIPT: &str = include_str!("../../../packaging/hooks/job-started.sh");
-const COMPLETED_SCRIPT: &str = include_str!("../../../packaging/hooks/job-completed.sh");
+const STARTED_SCRIPT: &str = include_str!("../../../../packaging/hooks/job-started.sh");
+const COMPLETED_SCRIPT: &str = include_str!("../../../../packaging/hooks/job-completed.sh");
 
 /// What a runner's hook env vars currently point at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,21 +114,39 @@ pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
     }
 }
 
+/// The three vars ghr-stats owns in a runner's `.env`. Every other line in that
+/// file is the operator's and survives every path below.
+const OUR_VARS: [&str; 3] = [STARTED_VAR, COMPLETED_VAR, EVENT_LOG_VAR];
+
+/// The raw value if `line` **assigns** `key` (`KEY=VALUE`), else `None`.
+///
+/// The single definition of "this line assigns KEY", so reading and rewriting
+/// cannot disagree about it. Until this was extracted, `env_value` required the
+/// `=` while the three rewrite paths tested a bare `starts_with(key)` — and a
+/// bare prefix also matches a *longer* var, so those paths would silently delete
+/// a line like `ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=…` that they would never
+/// read back. One predicate, four callers, nothing left to keep in sync. Pure.
+fn assignment<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return None;
+    }
+    line.strip_prefix(key)?.strip_prefix('=')
+}
+
+/// Whether `line` assigns any of `keys` — i.e. whether it is *ours to drop*.
+/// Never-clobber applies to `.env` content, not just to the operator's hook
+/// scripts, so every rewrite path filters through this one rule. Pure.
+fn assigns_any(line: &str, keys: &[&str]) -> bool {
+    keys.iter().any(|key| assignment(line, key).is_some())
+}
+
 /// The value of `.env` key `key` (KEY=VALUE; last wins; quotes stripped).
 fn env_value(env: &str, key: &str) -> Option<String> {
-    let mut val = None;
-    for line in env.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix(key)
-            && let Some(v) = rest.strip_prefix('=')
-        {
-            val = Some(v.trim().trim_matches(['"', '\'']).to_string());
-        }
-    }
-    val
+    env.lines()
+        .filter_map(|l| assignment(l, key))
+        .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+        .next_back()
 }
 
 /// The current hook script paths from `.env` (for chaining onto a foreign hook).
@@ -163,12 +193,7 @@ pub(crate) fn rewrite_env(
 ) -> String {
     let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.starts_with(STARTED_VAR)
-                && !t.starts_with(COMPLETED_VAR)
-                && !t.starts_with(EVENT_LOG_VAR)
-        })
+        .filter(|l| !assigns_any(l, &OUR_VARS))
         .map(str::to_string)
         .collect();
     out.push(format!("{STARTED_VAR}={}", started.display()));
@@ -181,51 +206,6 @@ pub(crate) fn rewrite_env(
     s
 }
 
-/// A chain wrapper: run the operator's existing hook (preserving its exit code,
-/// which is the runner's pass/fail signal), then best-effort append our event.
-pub(crate) fn render_chain_wrapper(original: &Path, ours: &Path) -> String {
-    format!(
-        "#!/usr/bin/env bash\n\
-         # ghr-stats hook chain wrapper — runs the existing hook, then records\n\
-         # the ghr-stats event (best-effort). Preserves the original's exit code.\n\
-         {WRAP_MARKER} {orig}\n\
-         \"{orig}\" \"$@\"; rc=$?\n\
-         \"{ours}\" \"$@\" >/dev/null 2>&1 || true\n\
-         exit \"$rc\"\n",
-        orig = original.display(),
-        ours = ours.display(),
-    )
-}
-
-/// Plan one hook slot (started OR completed) for the CHAIN path. Given the
-/// operator's ORIGINAL hook for that slot (if any), our plain script, and where a
-/// chain wrapper would live, decide what to wire into `.env` and what wrapper (if
-/// any) to write:
-/// - original present ⇒ write a wrapper (runs their hook, then ours) and wire the
-///   var at the wrapper;
-/// - original absent ⇒ nothing to chain for THIS slot, so wire our plain script
-///   directly and write no wrapper.
-///
-/// This is what makes chaining a `Foreign` runner that has only ONE of the two
-/// hook vars set safe: the empty slot gets our script directly instead of being
-/// pointed at a wrapper that was never written. Pure — the caller does the I/O.
-pub(crate) fn plan_chain_slot(
-    original: Option<&str>,
-    our_script: &Path,
-    wrapper_path: &Path,
-) -> (PathBuf, Option<(PathBuf, String)>) {
-    match original {
-        Some(o) => (
-            wrapper_path.to_path_buf(),
-            Some((
-                wrapper_path.to_path_buf(),
-                render_chain_wrapper(Path::new(o), our_script),
-            )),
-        ),
-        None => (our_script.to_path_buf(), None),
-    }
-}
-
 /// Remove our three vars (both hook vars + [`EVENT_LOG_VAR`]) from `.env`
 /// content, preserving every other line — the inverse of [`rewrite_env`] for a
 /// runner we installed *fresh* (its pre-install state was [`HookStatus::Unset`]).
@@ -234,12 +214,7 @@ pub(crate) fn plan_chain_slot(
 pub(crate) fn remove_hook_vars(existing: &str) -> String {
     let kept: Vec<&str> = existing
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.starts_with(STARTED_VAR)
-                && !t.starts_with(COMPLETED_VAR)
-                && !t.starts_with(EVENT_LOG_VAR)
-        })
+        .filter(|l| !assigns_any(l, &OUR_VARS))
         .collect();
     if kept.is_empty() {
         return String::new();
@@ -262,42 +237,13 @@ pub(crate) fn ensure_event_log(existing: &str, log: &Path) -> Option<String> {
     }
     let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| !l.trim().starts_with(EVENT_LOG_VAR)) // drop any stale value
+        .filter(|l| !assigns_any(l, &[EVENT_LOG_VAR])) // drop any stale value
         .map(str::to_string)
         .collect();
     out.push(format!("{EVENT_LOG_VAR}={want}"));
     let mut s = out.join("\n");
     s.push('\n');
     Some(s)
-}
-
-/// Recover the operator's ORIGINAL hook path from a chain wrapper's text, so
-/// uninstall can restore it. Reads the [`WRAP_MARKER`] provenance line written by
-/// [`render_chain_wrapper`]; falls back to the first quoted path on the exec line
-/// for any wrapper written before the marker existed. Pure.
-pub(crate) fn original_from_wrapper(text: &str) -> Option<PathBuf> {
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix(WRAP_MARKER) {
-            let p = rest.trim();
-            if !p.is_empty() {
-                return Some(PathBuf::from(p));
-            }
-        }
-    }
-    // Pre-marker fallback: the first `"…"`-quoted token on a non-comment line
-    // (the wrapper's exec line is `"<orig>" "$@"; rc=$?`).
-    for line in text.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        if let Some(inner) = t.split('"').nth(1)
-            && !inner.is_empty()
-        {
-            return Some(PathBuf::from(inner));
-        }
-    }
-    None
 }
 
 /// The snippet printed for the "instruct" path (operator adds it to their hook).
@@ -314,13 +260,20 @@ pub(crate) fn instruct_snippet(our_dir: &Path) -> String {
     )
 }
 
+/// The one seeding helper both test modules need.
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod fixtures {
+    use std::path::PathBuf;
 
-    fn our() -> PathBuf {
+    pub(super) fn our() -> PathBuf {
         PathBuf::from("/var/lib/ghr-stats/hooks")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::our;
+    use super::*;
 
     #[test]
     fn classify_unset_ours_foreign() {
@@ -410,58 +363,42 @@ mod tests {
     }
 
     #[test]
-    fn chain_wrapper_runs_both_and_preserves_rc() {
-        let orig = Path::new("/usr/local/sbin/cleanup-started.sh");
-        let w = render_chain_wrapper(orig, Path::new("/var/lib/ghr-stats/hooks/job-started.sh"));
-        assert!(w.contains("/usr/local/sbin/cleanup-started.sh"));
-        assert!(w.contains("/var/lib/ghr-stats/hooks/job-started.sh"));
-        assert!(w.contains("exit \"$rc\""));
-        // The provenance marker must be present AND recover the exact original,
-        // or uninstall could strand the operator's hook. (Regression pin.)
-        assert!(w.contains(WRAP_MARKER));
-        assert_eq!(original_from_wrapper(&w).as_deref(), Some(orig));
-    }
+    fn prefix_sharing_operator_vars_survive_every_rewrite_path() {
+        // All three drop paths tested a BARE `VAR` prefix until B19, so an
+        // operator line whose name merely *starts with* one of ours was deleted
+        // without ever being read back — `env_value` has always required the
+        // `=`, so the rewriters were dropping more than the reader could see.
+        // `_EXTRA`/`_ARCHIVE` are hypothetical; the gap is the point.
+        let existing = "ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=/op/extra.sh\n\
+                        GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson\n\
+                        ACTIONS_RUNNER_HOOK_JOB_STARTED=/old/start.sh\n\
+                        GHR_STATS_EVENT_LOG=/old/events.ndjson\n";
 
-    #[test]
-    fn plan_chain_slot_wraps_when_original_present_else_wires_our_script() {
-        let our = Path::new("/var/lib/ghr-stats/hooks/job-started.sh");
-        let wrapper = Path::new("/var/lib/ghr-stats/hooks/chain-r1-started.sh");
-        // Original present → write a wrapper, wire the wrapper.
-        let (target, w) = plan_chain_slot(Some("/opt/orig.sh"), our, wrapper);
-        assert_eq!(target, wrapper);
-        let (wp, content) = w.expect("a wrapper to write");
-        assert_eq!(wp, wrapper);
-        assert!(content.contains("/opt/orig.sh"));
-        assert!(content.contains("job-started.sh"));
-        // No original (the one-var-Foreign case) → wire our script directly, NO
-        // wrapper (the bug was pointing the var at a wrapper never written).
-        let (target, w) = plan_chain_slot(None, our, wrapper);
-        assert_eq!(target, our);
-        assert!(
-            w.is_none(),
-            "must not fabricate a wrapper with nothing to chain"
+        // The reader is the reference: a longer var is a DIFFERENT var.
+        assert_eq!(
+            env_value(existing, EVENT_LOG_VAR).as_deref(),
+            Some("/old/events.ndjson")
         );
-    }
 
-    #[test]
-    fn original_from_wrapper_reads_marker_then_falls_back() {
-        // Marker present (the wrapper we render today).
-        let w = render_chain_wrapper(
-            Path::new("/opt/hooks/foreign.sh"),
-            Path::new("/var/lib/ghr-stats/hooks/job-started.sh"),
-        );
-        assert_eq!(
-            original_from_wrapper(&w).as_deref(),
-            Some(Path::new("/opt/hooks/foreign.sh"))
-        );
-        // Pre-marker wrapper: recover from the first quoted exec token.
-        let legacy =
-            "#!/usr/bin/env bash\n# old\n\"/opt/hooks/foreign.sh\" \"$@\"; rc=$?\nexit \"$rc\"\n";
-        assert_eq!(
-            original_from_wrapper(legacy).as_deref(),
-            Some(Path::new("/opt/hooks/foreign.sh"))
-        );
-        assert_eq!(original_from_wrapper("not a wrapper\n"), None);
+        for out in [
+            rewrite_env(existing, Path::new("/h/s.sh"), Path::new("/h/c.sh"), None),
+            remove_hook_vars(existing),
+            ensure_event_log(existing, Path::new("/new/events.ndjson")).expect("stale → rewritten"),
+        ] {
+            assert!(
+                out.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=/op/extra.sh"),
+                "operator var dropped by prefix match:\n{out}"
+            );
+            assert!(
+                out.contains("GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson"),
+                "operator var dropped by prefix match:\n{out}"
+            );
+            // Ours still go, in every one of the three paths.
+            assert!(
+                !out.contains("/old/events.ndjson"),
+                "stale value kept:\n{out}"
+            );
+        }
     }
 
     #[test]
@@ -519,34 +456,5 @@ mod tests {
         assert_eq!(classify(&installed, &our()), HookStatus::Ours);
         assert!(installed.contains("GHR_STATS_EVENT_LOG="));
         assert_eq!(remove_hook_vars(&installed), original);
-    }
-
-    #[test]
-    fn chained_install_reverses_to_original_foreign() {
-        // A foreign runner (canonical STARTED-then-COMPLETED order) → chain → the
-        // uninstall reversal must restore the exact original .env, byte-for-byte.
-        let original = "TMPDIR=/var/tmp/runner\n\
-                        ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup-started.sh\n\
-                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup-completed.sh\n";
-        // Install's chain step (mirrors ops::wizard::chain_for).
-        let (orig_started, orig_completed) = current_hook_paths(original);
-        let wrap_started = our().join("chain-runner-01-started.sh");
-        let wrap_completed = our().join("chain-runner-01-completed.sh");
-        let ws = render_chain_wrapper(Path::new(&orig_started.unwrap()), &wrap_started);
-        let wc = render_chain_wrapper(Path::new(&orig_completed.unwrap()), &wrap_completed);
-        let event_log = our().join("../runner-01/.ghr-stats-events.ndjson");
-        let installed = rewrite_env(original, &wrap_started, &wrap_completed, Some(&event_log));
-        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
-
-        // Uninstall reversal: recover the originals from the wrappers, restore.
-        // `None` for the event log strips the var we injected, so the operator's
-        // .env comes back byte-for-byte (no orphaned GHR_STATS_EVENT_LOG).
-        let restored = rewrite_env(
-            &installed,
-            &original_from_wrapper(&ws).unwrap(),
-            &original_from_wrapper(&wc).unwrap(),
-            None,
-        );
-        assert_eq!(restored, original); // never stranded — the foreign hook is back
     }
 }

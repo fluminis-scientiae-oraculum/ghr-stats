@@ -58,9 +58,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Pass a DIRECTORY, not a glob. lychee-action feeds `args` through a bash
+      # that runs without globstar (`bash --noprofile --norc`), so `./**/*.md`
+      # silently degrades to `./*/*.md` — exactly one directory level. That
+      # checked `docs/` and quietly skipped `README.md` (depth 0, 15 links) and
+      # `packaging/hooks/README.md` (depth 2), while still reporting success:
+      # 16 links checked where the directory walk finds 34. A link check that
+      # passes without checking the most-read file in the repo is worse than one
+      # that fails, because nothing ever tells you.
+      #
+      # For the same reason `fail-if-empty` must stay at its default (true): it
+      # is what turns "this pattern matched nothing" into a loud error instead
+      # of a green tick.
       - uses: lycheeverse/lychee-action@v2
         with:
-          args: "--config lychee.toml --no-progress ./**/*.md"
+          args: "--config lychee.toml --no-progress ."
           fail: true
 
   # Gather: the single required status check. Fails unless every scatter job

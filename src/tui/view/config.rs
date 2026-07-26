@@ -13,9 +13,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
 use crate::shared::hooks::install::HookStatus;
+use crate::shared::models::Mode;
 use crate::shared::paths::Scope;
 use crate::tui::app::{App, LiveRunner};
-use crate::tui::history::Mode;
 use crate::tui::viewmodel;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {

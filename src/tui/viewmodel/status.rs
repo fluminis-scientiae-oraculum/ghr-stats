@@ -1,7 +1,7 @@
 //! Presentation status derived from Model state — pure functions over primitive
 //! inputs so the rules are testable in isolation and shared by every view.
 
-use crate::tui::history::Mode;
+use crate::shared::models::Mode;
 
 /// Why the GitHub view has no data for the fleet. `github_reason` returning
 /// `None` means data is present (render the counts / the runner's state).
@@ -134,7 +134,7 @@ mod tests {
         // Wire drift: the actionable one — it also explains the empty dashboard.
         let w = version_warning(
             VersionState::NoCollector,
-            Some(EphemeralReason::VersionDrift { server: 8 }),
+            Some(&EphemeralReason::VersionDrift { server: 8 }),
         )
         .expect("wire drift must warn");
         assert!(w.contains("IPC v8"));
@@ -144,7 +144,7 @@ mod tests {
         assert!(
             version_warning(
                 VersionState::NoCollector,
-                Some(EphemeralReason::NoCollector)
+                Some(&EphemeralReason::NoCollector)
             )
             .is_none()
         );

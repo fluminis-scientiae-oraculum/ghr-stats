@@ -251,7 +251,7 @@ fn file_name_str(p: &Path) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::hooks::install::render_chain_wrapper;
+    use crate::shared::hooks::install::chain::render_chain_wrapper;
     use std::io::Write;
 
     fn our() -> PathBuf {

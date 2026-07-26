@@ -88,7 +88,7 @@ pub(crate) fn work_persistent_only() -> &'static str {
 /// enough that the dashboard fell back to Ephemeral entirely.
 pub(crate) fn version_warning(
     state: super::status::VersionState,
-    ephemeral: Option<crate::shared::ipc::client::EphemeralReason>,
+    ephemeral: Option<&crate::shared::ipc::client::EphemeralReason>,
 ) -> Option<String> {
     use super::status::VersionState;
     use crate::shared::ipc::client::EphemeralReason;

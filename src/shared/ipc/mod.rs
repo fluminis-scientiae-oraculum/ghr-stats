@@ -1,14 +1,30 @@
-//! The collector↔TUI IPC: a small, synchronous, length-prefixed JSON protocol
+//! The collector↔client IPC: a small, synchronous, length-prefixed JSON protocol
 //! over a Unix domain socket. No HTTP framework, no async runtime — one frame is
 //! a `u32`-LE length followed by a `serde_json` body. The collector (Persistent
-//! mode) serves it; the TUI is the only client, and a successful `connect` is
-//! itself the Persistent-mode signal.
+//! mode) serves it; the TUI and every machine-facing verb (`status`, `explain`,
+//! `timeline`, `doctor`) are clients, and a successful `connect` is itself the
+//! Persistent-mode signal.
 //!
 //! By construction the protocol carries ONLY derived fleet stats: there is no
 //! `Request`/`Response` variant that returns a GitHub token or a config value.
 //! Every response payload reuses a `shared::models` type verbatim (the shapes the
 //! store's read queries return), so the wire types and the query types can never
 //! drift apart.
+//!
+//! **One request, one response — deliberately, and there is no subscribe path.**
+//! A streaming verb (`tail`) was specced against this protocol and the shape was
+//! decided against on three grounds. Transitions do not exist until a sampler
+//! observes them, so a subscriber would receive events quantised to the same
+//! `local_secs` grid a poller sees — the latency argument is empty against this
+//! collector's own cadence. A long-lived subscription would hold one of
+//! `MAX_CONNS` connection slots for its lifetime, and the accept loop *drops*
+//! callers past that cap rather than queueing them, so a handful of forgotten
+//! streams would refuse every other client — the exact lockout the
+//! thread-per-connection fix was written to end. And a poll can prove it kept up,
+//! because `Bounded<T>` reports whether a limit truncated the answer, whereas a
+//! stream that drops events under backpressure has to be built to admit it.
+//! A verb that wants a live feed therefore polls a `Query` with a cursor; adding
+//! a many-response frame shape needs to defeat those three first.
 
 pub mod client;
 
@@ -16,6 +32,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::shared::models::timeline::{Timeline, TimelineQuery};
 use crate::shared::models::{
     BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
 };
@@ -41,7 +58,20 @@ use crate::shared::models::{
 ///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
 ///     read can no longer be rendered as live, and `BusyPoint` carries
 ///     `github_online` so the occupancy chart can plot a gap instead of a zero.
-pub const VERSION: u16 = 9;
+/// v10: added `Timeline` — the first query that answers about a WINDOW rather
+///     than an instant. It is also the first whose reply is explicitly bounded
+///     (`Bounded<T>` carries whether the limit cut it), because a history query
+///     is the one shape that can outgrow both the frame cap and a caller's
+///     context. `BusyPoint.github_online: Option<u32>` also became
+///     `github: Option<GhCount>`, which carries the population the count speaks
+///     for — the occupancy chart's GitHub line is meaningless without its
+///     denominator on a fleet that holds runners GitHub is never asked about.
+///     Also `Retention` — where the record starts, as its own question. It was
+///     first answered by reading `Timeline.window.truncated_at`, which meant
+///     `doctor` derived every edge across a 7-day window (8.13s on a 1.1 GiB
+///     database) to read one nullable timestamp a covering index answers in
+///     0.25ms. A cheap fact deserves a cheap question.
+pub const VERSION: u16 = 10;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
 /// before allocating. 1 MiB is far above any real history response.
@@ -91,6 +121,14 @@ pub enum Query {
     /// made by the collector rather than reassembled (and mis-derived) by each
     /// client.
     FleetStatus,
+    /// What changed over a window, and optionally the samples underneath it.
+    /// The only query about a span rather than an instant, and the only one
+    /// whose caller states a bound — see [`TimelineQuery`].
+    Timeline(TimelineQuery),
+    /// Where the retained record starts. Takes no window BY DESIGN: the answer
+    /// is a property of the store, not of any span, and asking it through
+    /// [`Query::Timeline`] made a `min(ts)` cost a full edge derivation.
+    Retention,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
@@ -157,6 +195,14 @@ pub enum Response {
         #[serde(default)]
         version: String,
     },
+    /// A peer refusing our version outright.
+    ///
+    /// **This collector never sends it** — its handshake reports rather than
+    /// negotiates, answering [`Response::Hello`] with its own version whatever
+    /// the client claims, because it cannot know which request shapes a
+    /// differing client will actually use. The variant exists so a client can
+    /// still understand a peer that does refuse, and `client.rs` reads `server`
+    /// out of either reply identically. Pinned by an integration test.
     VersionMismatch {
         server: u16,
     },
@@ -167,6 +213,18 @@ pub enum Response {
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
     FleetStatus(Box<FleetStatus>),
+    /// Boxed like `FleetStatus`: both dwarf every other variant, and an enum is
+    /// as large as its largest arm — unboxed, every small reply would carry the
+    /// cost of the biggest one.
+    Timeline(Box<Timeline>),
+    /// The oldest retained sample, or `None` when nothing has been sampled yet.
+    ///
+    /// A bare timestamp rather than a computed "days of history": retention is
+    /// reported, never judged (pruning is manual), and the caller that renders
+    /// it is better placed than the collector to decide what it means.
+    Retention {
+        earliest_ts: Option<i64>,
+    },
     /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
@@ -210,6 +268,7 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::GhCount;
 
     #[test]
     fn frame_round_trips() {
@@ -217,7 +276,7 @@ mod tests {
             ts: 42,
             busy: 3,
             online: 7,
-            github_online: Some(5),
+            github: GhCount::new(5, 7),
         }]);
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();

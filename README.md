@@ -150,6 +150,8 @@ same file.
 - **[Metrics](docs/metrics.md)** — the Prometheus pull endpoint and the JSON push.
 - **[CLI & operations](docs/cli.md)** — every command, uninstall, and the
   per-runner Restart/Recycle actions.
+- **[For agents](docs/agents.md)** — the six machine-facing verbs, the exit-code
+  contract, the JSON payloads, and why `2` never means "no".
 - **[Privileged operations](docs/privileged.md)** — the complete list of what
   runs as root, when `sudo` is enough versus a root process, and the `sudo`
   PATH gotcha.

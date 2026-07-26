@@ -3,6 +3,14 @@
 //! `tui` / `service` / `ops` over the `shared` kernel — and holds no domain logic
 //! of its own.
 
+// Zero `unsafe` is already true of this tree; `forbid` (not `deny`) makes it a
+// property of the crate rather than a habit — an inner `#[allow]` cannot buy it
+// back, so re-introducing `unsafe` is a build failure that has to be argued at
+// this line. Host integration stays safe by construction: procfs/cgroup reads go
+// through `std::fs`, `sysconf` through `nix`, and the allocator through
+// `mimalloc`'s own `GlobalAlloc` impl.
+#![forbid(unsafe_code)]
+
 mod cli;
 mod ops;
 mod service;
@@ -70,9 +78,12 @@ fn run() -> Result<std::process::ExitCode> {
     // load lazy and per-arm — so there is no unreachable arm to assert away.
     let load =
         || crate::shared::config::Config::load(config_path.as_deref()).context("loading config");
-    // `status` is the only verb whose exit code carries meaning beyond
-    // success/failure — it IS the verdict, so a caller can branch without
-    // parsing the payload. Every other verb exits 0 on success.
+    // `status`, `explain` and `timeline` are the verbs whose exit code carries
+    // meaning beyond success/failure, so a caller can branch without parsing the
+    // payload. For the first two it is the verdict; `timeline` makes no health
+    // call, so its code reports availability instead — over the same numbers, so
+    // 2 still means "cannot determine" whichever verb returned it. Every other
+    // verb exits 0 on success.
     let ok = std::process::ExitCode::SUCCESS;
     match args.command {
         Some(Command::Config) => crate::ops::wizard::run(config_path.as_deref()).map(|()| ok),
@@ -80,6 +91,24 @@ fn run() -> Result<std::process::ExitCode> {
         None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()).map(|()| ok),
         Some(Command::Status(a)) => {
             crate::ops::status::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        Some(Command::Explain(a)) => {
+            crate::ops::explain::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        Some(Command::Timeline(a)) => {
+            crate::ops::timeline::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        // Takes the PATH, not the loaded config: `load` substitutes defaults for
+        // an unreadable system config, and a preflight reasoning over a config
+        // it never read would report a phantom install as merely empty.
+        Some(Command::Doctor(a)) => {
+            crate::ops::doctor::run(&a, config_path.as_deref()).map(std::process::ExitCode::from)
+        }
+        Some(Command::Wait(a)) => {
+            crate::ops::wait::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
+        Some(Command::Tail(a)) => {
+            crate::ops::tail::run(&a, &load()?).map(std::process::ExitCode::from)
         }
         Some(Command::Serve) => {
             crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
@@ -139,7 +168,12 @@ fn logs_to_stderr(command: &Option<Command>) -> bool {
         // The dashboard owns the terminal; any log line bleeds onto it.
         None | Some(Command::Tui) => false,
         // Machine-facing stdout — a log line would corrupt the payload.
-        Some(Command::Status(_)) => false,
+        Some(Command::Status(_))
+        | Some(Command::Explain(_))
+        | Some(Command::Timeline(_))
+        | Some(Command::Doctor(_))
+        | Some(Command::Wait(_))
+        | Some(Command::Tail(_)) => false,
         // Runs under systemd, so its output lands in the journal.
         Some(Command::Serve) => true,
         Some(Command::Config) | Some(Command::Systemd { .. }) | Some(Command::Db { .. }) => true,

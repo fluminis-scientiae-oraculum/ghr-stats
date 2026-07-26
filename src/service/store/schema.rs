@@ -7,10 +7,33 @@ use crate::shared::error::Result;
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// Apply any migrations newer than the DB's recorded `user_version`.
+///
+/// Refuses a database written by a NEWER build. Migrations are append-only, so
+/// this build knows every schema up to its own and nothing about the ones after
+/// it: it cannot know which columns a later migration made `NOT NULL`, which
+/// table it re-keyed, or what a row it writes would mean to the build that owns
+/// the file. Proceeding is a silent write against a contract we do not have —
+/// and the way that surfaces is the collector failing an INSERT in its sampling
+/// loop hours later, which reads as a runtime bug rather than as the downgrade
+/// it is.
+///
+/// This makes rollback *say so* instead of half-working: to run an older binary,
+/// restore a database it wrote. The guard only binds builds that carry it — an
+/// already-installed older binary has the permissive code and is unaffected — so
+/// it constrains downgrades from here forward, not the rollback path already on
+/// disk.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let target = MIGRATIONS.len() as i64;
-    if current >= target {
+    if current > target {
+        return Err(crate::shared::error::Error::Config(format!(
+            "database schema is v{current}, but this build knows only v{target} — the database \
+             was written by a NEWER ghr-stats. Upgrade the binary, or point this one at a \
+             database it wrote; migrations are append-only, so an older build cannot know what \
+             a newer schema requires."
+        )));
+    }
+    if current == target {
         return Ok(());
     }
     let tx = conn.transaction()?;
@@ -184,6 +207,25 @@ CREATE INDEX idx_api_runner_sample_org_agent_ts
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database from the future is refused, not silently written to. The
+    /// failure it prevents is not at open time — it is an INSERT failing inside
+    /// the collector's sampling loop hours later, against a column a migration
+    /// this build has never seen made `NOT NULL`.
+    #[test]
+    fn a_database_written_by_a_newer_build_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+
+        let e = migrate(&mut conn).unwrap_err().to_string();
+        assert!(e.contains("written by a NEWER ghr-stats"), "{e}");
+        // The message must name both versions: "which binary do I need" is the
+        // only question the operator has at that moment.
+        assert!(e.contains(&format!("v{}", MIGRATIONS.len() + 1)), "{e}");
+        assert!(e.contains(&format!("v{}", MIGRATIONS.len())), "{e}");
+    }
 
     #[test]
     fn migrate_creates_tables_and_is_idempotent() {

@@ -1,223 +1,31 @@
-//! The collector half of the IPC: a `UnixListener` on the scope's socket path,
-//! answering the TUI's read-only queries from a WAL reader connection. Modeled
-//! on `metrics::pull::spawn` — a named thread, its own reader connection, a
-//! non-fatal bind, and a `term`-polled (non-blocking) accept loop so a SIGTERM
-//! exits promptly. The handlers are thin adapters over `store::reader`.
+//! What a request means.
+//!
+//! One request in, one response out, with no notion of sockets, threads or
+//! shutdown — [`super`] owns those. Everything here is a pure-ish adapter over
+//! two backing stores, and which one an arm reaches for is the file's internal
+//! grain: reads go to `store::reader` (plus `metrics::Snapshot` for the verdict),
+//! writes and token-org presence go to the config file through `config::persist`.
+//!
+//! Both dispatch tables are exhaustive with no `_` arm, so a new [`Query`] or
+//! [`Mutation`] variant is a compile error until it is handled here. That is also
+//! what makes the authz gate total: [`apply_mutation`] is reachable only through
+//! the one check in [`handle`], so every present and future mutation is gated by
+//! construction rather than by remembering to add a check.
 
-use std::io;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::path::Path;
 
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use rusqlite::Connection;
 
-use crate::service::store::{self, reader};
-use crate::shared::config::{Config, SharedConfig, persist};
-use crate::shared::ipc::{self, ApiRow, Mutation, Query, Request, Response, VERSION};
-use crate::shared::paths::{ADMIN_GROUP, Scope};
+use crate::service::store::reader;
+use crate::shared::config::persist;
+use crate::shared::ipc::{ApiRow, Mutation, Query, Request, Response, VERSION};
 
-/// How often the non-blocking accept loop wakes to re-check the shutdown flag.
-const ACCEPT_POLL: Duration = Duration::from_millis(500);
-/// Per-connection I/O timeout — a wedged client can't stall the accept loop.
-const CONN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The authenticated peer of a connection, from `SO_PEERCRED` (kernel-provided,
-/// unspoofable). Resolved once per connection.
-#[derive(Clone, Copy)]
-struct Auth {
-    uid: u32,
-    in_admin_group: bool,
-}
-
-/// Whether a peer may mutate config: root, or a member of [`ADMIN_GROUP`]. Pure.
-fn authorized(uid: u32, in_admin_group: bool) -> bool {
-    uid == 0 || in_admin_group
-}
-
-/// Read the connection's peer credentials and resolve group membership. Fails
-/// CLOSED — an unreadable peer is treated as unprivileged, never authorized.
-fn peer_auth(stream: &UnixStream) -> Auth {
-    match getsockopt(stream, PeerCredentials) {
-        Ok(cred) => {
-            let uid = cred.uid();
-            Auth {
-                uid,
-                in_admin_group: uid_in_group(uid, ADMIN_GROUP),
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "ipc: peer credentials unavailable — treating as unprivileged");
-            Auth {
-                uid: u32::MAX,
-                in_admin_group: false,
-            }
-        }
-    }
-}
-
-/// Whether `uid`'s group memberships (resolved from the group DB, so `usermod
-/// -aG` takes effect without a re-login) include `group`.
-fn uid_in_group(uid: u32, group: &str) -> bool {
-    let Some(user) = uzers::get_user_by_uid(uid) else {
-        return false;
-    };
-    uzers::get_user_groups(user.name(), user.primary_group_id())
-        .into_iter()
-        .flatten()
-        .any(|g| g.name().to_str() == Some(group))
-}
-
-/// Spawn the IPC server thread. Always spawns; a bind failure is logged and the
-/// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
-/// Holds the [`SharedConfig`] so it can reload the collector's config in-process
-/// after an authorized mutation (making a newly added PAT live without restart).
-pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>, config_path: PathBuf) -> JoinHandle<()> {
-    // Bind the socket for the process's own scope — the same scope `systemd
-    // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats). The
-    // DB path is fixed for the run, so snapshot it once here.
-    let sock = Scope::detect().socket_path();
-    let db = shared.snapshot().db_path.clone();
-    let shared = shared.clone();
-    thread::Builder::new()
-        .name("ipc-server".into())
-        .spawn(move || run(&sock, &db, &shared, &term, &config_path))
-        .expect("spawn ipc-server")
-}
-
-fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &AtomicBool, config_path: &Path) {
-    let listener = match bind(sock) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, sock = %sock.display(),
-                "ipc: bind failed — Persistent-mode TUI features unavailable");
-            return;
-        }
-    };
-    if let Err(e) = listener.set_nonblocking(true) {
-        tracing::error!(error = %e, "ipc: set_nonblocking failed");
-        return;
-    }
-    tracing::info!(sock = %sock.display(), "ipc listening");
-
-    let conn = store::open_reader(db);
-    while !term.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                // One local client at a low rate — serve inline. `serve_conn`
-                // polls `term` and drops a stalled/idle connection at the read
-                // timeout, so neither a slow client nor a pending SIGTERM can
-                // wedge the accept loop.
-                if let Err(e) = serve_conn(stream, conn.as_ref(), config_path, shared, term) {
-                    tracing::debug!(error = %e, "ipc: connection ended");
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
-            Err(e) => {
-                tracing::warn!(error = %e, "ipc: accept");
-                thread::sleep(ACCEPT_POLL);
-            }
-        }
-    }
-    // Best-effort: systemd's RuntimeDirectory= also removes this on stop.
-    let _ = std::fs::remove_file(sock);
-    tracing::debug!("ipc stopped");
-}
-
-/// Create the runtime dir, clear any stale socket, bind, and widen perms so a
-/// non-root TUI can connect.
-fn bind(sock: &Path) -> io::Result<UnixListener> {
-    if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // A stale socket (unclean prior exit) makes bind fail EADDRINUSE. Removing it
-    // is safe: serve holds the exclusive flock before spawning us, so no live
-    // collector owns this path.
-    if sock.exists() {
-        let _ = std::fs::remove_file(sock);
-    }
-    let listener = UnixListener::bind(sock)?;
-    // connect(2) needs WRITE permission on the socket file; bind creates it
-    // ~0755 (umask), which a non-root TUI cannot connect to. Widen to 0666 — the
-    // same unauthenticated-loopback posture as /metrics; the IPC serves only
-    // derived fleet stats, never tokens. The parent dir is root-only-writable, so
-    // this is not a meaningful TOCTOU.
-    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o666))?;
-    Ok(listener)
-}
-
-/// Serve requests on one connection until the client hangs up (EOF), the read
-/// times out (a stalled/idle client is dropped rather than held forever), or
-/// shutdown is signalled. Polls `term` between requests so a pending SIGTERM
-/// exits promptly instead of blocking on a connected client; the live TUI
-/// refreshes well inside `CONN_TIMEOUT`, so it is never dropped mid-use, and it
-/// reconnects on the next refresh if it ever is. A successful mutation triggers
-/// an in-process config reload so a change (e.g. a newly added PAT) reaches the
-/// sampler/reconcile threads without a restart.
-fn serve_conn(
-    mut stream: UnixStream,
-    conn: Option<&Connection>,
-    config_path: &Path,
-    shared: &SharedConfig,
-    term: &AtomicBool,
-) -> io::Result<()> {
-    stream.set_read_timeout(Some(CONN_TIMEOUT))?;
-    stream.set_write_timeout(Some(CONN_TIMEOUT))?;
-    // Resolve the peer's identity once, from the kernel — used to gate mutations.
-    let auth = peer_auth(&stream);
-    loop {
-        if term.load(Ordering::SeqCst) {
-            return Ok(()); // shutdown — release the connection so `serve` can exit
-        }
-        let req: Request = match ipc::read_frame(&mut stream) {
-            Ok(r) => r,
-            // Clean client hang-up between requests.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            // Read timed out: the client sent no complete frame within the window.
-            // Drop it (freeing the accept loop) rather than hold the sole
-            // connection open indefinitely — a would-be local DoS.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        // Snapshot per request, so a config mutation that widens the freshness
-        // window takes effect immediately — same live-reload property the
-        // sampler threads have.
-        let max_age = shared.snapshot().intervals.api_max_age();
-        let resp = handle(&req, conn, auth, config_path, max_age);
-        // A persisted mutation just changed /etc — reload so the running workers
-        // pick it up live (the whole point of the shared, swappable config).
-        if matches!(resp, Response::Mutated) {
-            shared.store(reload_config(config_path));
-            tracing::info!("ipc: config reloaded after mutation");
-        }
-        ipc::write_frame(&mut stream, &resp)?;
-    }
-}
-
-/// Reload the collector's config from disk, re-applying systemd root discovery
-/// (as `serve` does at startup) so an empty `runner_roots` still finds the fleet.
-/// An unreadable/invalid file falls back to defaults rather than failing.
-fn reload_config(config_path: &Path) -> Config {
-    let mut cfg = Config::load(Some(config_path)).unwrap_or_default();
-    cfg.runner_roots = crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);
-    cfg
-}
+use super::auth::{Auth, authorized};
 
 /// Map one request to a response. Reads go through `store::reader`; mutations go
 /// through the authz gate to `config::persist` (writing `config_path`). A DB or
 /// query error becomes `Response::Error` rather than dropping the connection.
-fn handle(
+pub(super) fn handle(
     req: &Request,
     conn: Option<&Connection>,
     auth: Auth,
@@ -262,6 +70,16 @@ fn clamped(limit: usize) -> usize {
     limit.min(MAX_QUERY_LIMIT)
 }
 
+/// `timeline`'s own, tighter bound.
+///
+/// Its rows are an order of magnitude wider than a `HistPoint` — org, runner
+/// name and an adjudicated GitHub view per sample — so `MAX_QUERY_LIMIT` rows
+/// would serialize past `MAX_FRAME` and fail the whole reply rather than
+/// returning a short one. A cap that turns a large request into a *bounded
+/// answer* is the point of the verb; a cap that turns it into an error is not.
+/// Sized so even the widest row shape stays comfortably inside the frame.
+const MAX_TIMELINE_LIMIT: usize = 2_000;
+
 /// Serve a read query. Exhaustive over [`Query`] (a new read variant is a compile
 /// error until handled here — no `unreachable!`). The DB-availability check is
 /// factored into [`with_db`], so only the arms that need the reader carry it;
@@ -281,7 +99,7 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
         }),
         Query::BusySeries { limit } => with_db(conn, |c| {
             wrap(
-                reader::busy_series(c, clamped(*limit)),
+                reader::busy_series(c, clamped(*limit), max_age),
                 Response::BusySeries,
             )
         }),
@@ -327,8 +145,27 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                     crate::shared::util::BUILD_VERSION,
                     max_age,
                 )
-                .map(|s| Box::new(s.to_status("persistent"))),
+                .map(|s| Box::new(s.to_status(crate::shared::models::Mode::Persistent))),
                 Response::FleetStatus,
+            )
+        }),
+        // The window is the client's to choose; the ROW COUNT is not. Clamping
+        // here rather than trusting the CLI's own cap is what keeps the bound
+        // real — the socket is reachable by any local user, and `timeline` is
+        // the first query whose natural answer is unbounded.
+        // Deliberately takes no window: the answer is a property of the store,
+        // so there is nothing for a caller to bound and nothing to clamp.
+        Query::Retention => with_db(conn, |c| {
+            wrap(reader::retention(c), |earliest_ts| Response::Retention {
+                earliest_ts,
+            })
+        }),
+        Query::Timeline(q) => with_db(conn, |c| {
+            let mut q = q.clone();
+            q.limit = q.limit.min(MAX_TIMELINE_LIMIT);
+            wrap(
+                reader::timeline(c, &q, crate::shared::util::now_epoch(), max_age).map(Box::new),
+                Response::Timeline,
             )
         }),
         Query::RunnerStates => with_db(conn, |c| {
@@ -397,6 +234,54 @@ mod tests {
 
     use std::path::PathBuf;
 
+    use crate::service::store;
+
+    /// `timeline`'s bound has to hold against the CLIENT, not just the CLI: the
+    /// socket is reachable by any local user, so a caller that ignores its own
+    /// cap must still get a bounded answer rather than an oversized frame the
+    /// server then fails to send.
+    #[test]
+    fn a_timeline_limit_is_clamped_server_side() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        store::schema_for_test(&mut conn);
+        // Two samples, one edge — enough to prove the query ran, while the limit
+        // being clamped is what the assertion is really about.
+        for (ts, live) in [(100, "idle"), (200, "busy")] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
+                 VALUES (?1, 1, 'r1', 'o', ?2, '/d1')",
+                rusqlite::params![ts, live],
+            )
+            .unwrap();
+        }
+        let reply = handle(
+            &Request::Query(Query::Timeline(
+                crate::shared::models::timeline::TimelineQuery {
+                    since_ts: 0,
+                    // A limit that would serialize past MAX_FRAME if honoured.
+                    limit: usize::MAX,
+                    org: None,
+                    runner: None,
+                    samples: true,
+                },
+            )),
+            Some(&conn),
+            NOBODY,
+            &noconf(),
+            MAX_AGE,
+        );
+        match reply {
+            Response::Timeline(t) => {
+                assert_eq!(t.transitions.items.len(), 1);
+                // Clamped, so the reply is a bounded answer — not the frame-too-
+                // large error an unclamped `usize::MAX` would have produced.
+                assert!(!t.transitions.limited);
+                assert_eq!(t.samples.map(|s| s.items.len()), Some(2));
+            }
+            other => panic!("expected a timeline, got {other:?}"),
+        }
+    }
+
     #[test]
     fn query_limit_is_clamped() {
         // A hostile/huge limit is bounded; `usize::MAX` (which would cast to a
@@ -437,13 +322,6 @@ mod tests {
     const MAX_AGE: u64 = 180;
     fn noconf() -> PathBuf {
         PathBuf::from("/nonexistent/ghr-stats-unused.toml")
-    }
-
-    #[test]
-    fn authorized_only_for_root_or_group_member() {
-        assert!(authorized(0, false)); // root
-        assert!(authorized(1000, true)); // group member
-        assert!(!authorized(1000, false)); // neither
     }
 
     #[test]

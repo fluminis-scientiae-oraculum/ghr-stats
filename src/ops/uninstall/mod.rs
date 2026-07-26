@@ -9,6 +9,19 @@
 //! value, and runner `.env` contents are never echoed. Hooks are reverted
 //! detect-first (see [`crate::shared::hooks::uninstall`]) so a foreign hook is never
 //! stranded. The receipt is stdout-only — uninstall leaves nothing behind.
+//!
+//! Those two phases are the seam, and it is a SAFETY boundary rather than a
+//! layer. [`plan`] holds everything the read-only phase does; [`apply`] holds
+//! EVERY function in this module that can delete something. So "a dry-run removes
+//! nothing" is now checkable by reading one file's imports rather than by
+//! auditing every call site — `std::fs::remove_*` appears in [`apply`] and
+//! nowhere else.
+//!
+//! This file keeps [`run`], the shapes both phases speak, and the receipt.
+//! `Plan::render` takes an `execute: bool` precisely BECAUSE it serves both
+//! phases — the dry-run and the real run print the same inventory, differing only
+//! in tense — so it belongs above the cut rather than in either half. That
+//! sameness is the feature: what you were shown is what gets removed.
 
 use std::path::{Path, PathBuf};
 
@@ -16,11 +29,14 @@ use anyhow::{Result, bail};
 
 use crate::cli::{UninstallArgs, UninstallDomain};
 use crate::ops::systemd;
-use crate::shared::collectors::{procscan, runners};
-use crate::shared::hooks::install;
-use crate::shared::hooks::uninstall::{self as hook_revert, RevertAction, RunnerHookPlan};
-use crate::shared::paths::{self, Scope};
+use crate::shared::hooks::uninstall::{RevertAction, RunnerHookPlan};
+use crate::shared::paths::Scope;
 use crate::shared::privileged;
+
+mod apply;
+mod plan;
+
+use plan::BinaryAction;
 
 pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
     let scope = systemd::resolve_scope(args.system, args.user);
@@ -107,41 +123,6 @@ impl Domains {
     }
 }
 
-/// What removing the binary means on this host. Pure result of [`binary_action`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BinaryAction {
-    /// A `systemd install` copy at this path — safe to remove (even if running).
-    Remove(PathBuf),
-    /// Running from a `cargo install` build — we don't own it; print the command.
-    InstructCargo(PathBuf),
-    /// No installed copy found.
-    NotInstalled(PathBuf),
-}
-
-/// Decide the binary action from the (would-be) installed path, whether it
-/// exists, and the running exe. Pure + tested. A `cargo install` build is never
-/// deleted by us — Cargo owns `~/.cargo/bin`; we print `cargo uninstall`.
-fn binary_action(
-    installed: &Path,
-    installed_exists: bool,
-    current_exe: Option<&Path>,
-) -> BinaryAction {
-    if installed_exists {
-        return BinaryAction::Remove(installed.to_path_buf());
-    }
-    if let Some(exe) = current_exe
-        && is_cargo_bin(exe)
-    {
-        return BinaryAction::InstructCargo(exe.to_path_buf());
-    }
-    BinaryAction::NotInstalled(installed.to_path_buf())
-}
-
-/// Whether `exe` lives in a Cargo bin dir (`…/.cargo/bin/<exe>`).
-fn is_cargo_bin(exe: &Path) -> bool {
-    exe.parent().is_some_and(|p| p.ends_with(".cargo/bin"))
-}
-
 /// One config file slated for removal + how many tokens it holds (redacted).
 struct ConfigItem {
     path: PathBuf,
@@ -162,70 +143,6 @@ struct Plan {
 }
 
 impl Plan {
-    fn detect(scope: Scope, domains: Domains, config_override: Option<&Path>) -> Self {
-        let our_dir = install::hooks_dir(&scope.data_dir());
-
-        let runners = if domains.hooks {
-            discover_runners(config_override)
-                .iter()
-                .map(|r| hook_revert::plan_runner(r, &our_dir))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let service_unit = if domains.service {
-            let p = scope.systemd_unit_path();
-            p.exists().then_some(p)
-        } else {
-            None
-        };
-
-        let binary = domains.binary.then(|| {
-            let installed = scope.bin_path();
-            let exists = installed.exists();
-            binary_action(&installed, exists, std::env::current_exe().ok().as_deref())
-        });
-
-        let config = if domains.config {
-            config_candidates(scope, config_override)
-                .into_iter()
-                .filter(|p| p.exists())
-                .map(|path| {
-                    let token_count = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|t| crate::shared::config::count_tokens(&t));
-                    ConfigItem { path, token_count }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let data = if domains.data {
-            data_files(scope)
-                .into_iter()
-                .filter(|p| p.exists())
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let cross_scope = cross_scope_probe(scope);
-
-        Self {
-            scope,
-            domains,
-            our_dir,
-            runners,
-            service_unit,
-            binary,
-            config,
-            data,
-            cross_scope,
-        }
-    }
-
     /// Anything actually removable (used to short-circuit an all-clean execute).
     fn has_actions(&self) -> bool {
         self.runners.iter().any(|r| {
@@ -328,176 +245,6 @@ impl Plan {
             }
         }
     }
-
-    fn apply(&self) {
-        // Hooks first: revert runners, then GC the shared scripts if orphaned.
-        if self.domains.hooks {
-            println!("Hooks:");
-            if !privileged::is_root() {
-                println!(
-                    "  ⚠ skipped — reverting hooks needs root; re-run `{}`",
-                    privileged::sudo_hint("uninstall --hooks")
-                );
-            } else {
-                let procs = procscan::scan();
-                for rp in &self.runners {
-                    let idle = hook_revert::is_idle(rp.uid, &procs);
-                    println!("{}", hook_revert::apply_runner(rp, idle));
-                }
-                gc_shared_scripts(&self.our_dir, &self.runners);
-            }
-        }
-
-        if let Some(unit) = &self.service_unit {
-            println!("Service:");
-            match systemd::uninstall(self.scope) {
-                Ok(()) => {}
-                Err(e) => println!("  ✗ {} — {e}", unit.display()),
-            }
-        }
-
-        if let Some(BinaryAction::Remove(p)) = &self.binary {
-            println!("Binary:");
-            match std::fs::remove_file(p) {
-                Ok(()) => println!("  ✓ removed {}", p.display()),
-                Err(e) => println!("  ✗ {} — {e}", p.display()),
-            }
-        }
-
-        if !self.config.is_empty() {
-            println!("Config:");
-            for c in &self.config {
-                remove_reporting(&c.path);
-                let _ = c.path.parent().map(std::fs::remove_dir); // only if empty
-            }
-        }
-
-        if !self.data.is_empty() {
-            println!("Data:");
-            for p in &self.data {
-                remove_reporting(p);
-            }
-            let _ = std::fs::remove_dir(self.scope.data_dir()); // only if empty
-        }
-
-        println!("\nDone.");
-    }
-}
-
-/// Remove the shared `job-*.sh` scripts + the hooks dir — but only once no
-/// runner's live `.env` still points into it (a foreign/unreverted runner might).
-fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
-    let still_referenced = plans
-        .iter()
-        .any(|rp| env_points_into(&rp.env_path, our_dir));
-    if still_referenced {
-        println!(
-            "  · kept {} — still referenced by a runner not managed by ghr-stats",
-            our_dir.display()
-        );
-        return;
-    }
-    let _ = std::fs::remove_file(our_dir.join("job-started.sh"));
-    let _ = std::fs::remove_file(our_dir.join("job-completed.sh"));
-    if std::fs::remove_dir(our_dir).is_ok() {
-        println!("  ✓ removed shared hook scripts {}", our_dir.display());
-    }
-}
-
-/// Whether a runner's current `.env` still points a hook var inside `our_dir`.
-fn env_points_into(env_path: &Path, our_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(env_path) else {
-        return false;
-    };
-    let (s, c) = install::current_hook_paths(&text);
-    [s, c]
-        .into_iter()
-        .flatten()
-        .any(|v| Path::new(&v).starts_with(our_dir))
-}
-
-fn remove_reporting(p: &Path) {
-    match std::fs::remove_file(p) {
-        Ok(()) => println!("  ✓ removed {}", p.display()),
-        Err(e) => println!("  ✗ {} — {e}", p.display()),
-    }
-}
-
-/// Runner install roots for hook reversal — a loadable config's roots if present,
-/// else auto-detected from systemd (same as the wizard's Step 1). Config-free so
-/// hooks can be reverted even after the config is gone.
-fn discover_runners(config_override: Option<&Path>) -> Vec<crate::shared::models::RunnerInfo> {
-    let roots = crate::shared::config::Config::load(config_override)
-        .ok()
-        .map(|c| c.runner_roots)
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(runners::discover_roots);
-    runners::discover(&roots)
-}
-
-/// Every place the config might live, so uninstall finds it wherever `config`
-/// wrote it: an explicit override, `$GHR_STATS_CONFIG`, the scope's file, and the
-/// sudo-invoker's home (where `sudo ghr-stats config` lands it).
-fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    };
-    if let Some(p) = config_override {
-        push(p.to_path_buf());
-    }
-    if let Some(p) = std::env::var_os("GHR_STATS_CONFIG") {
-        push(PathBuf::from(p));
-    }
-    push(scope.config_file());
-    push(paths::config_write_target(config_override));
-    out
-}
-
-/// The data-domain files (database + WAL/SHM sidecars, event log, serve lock).
-/// The IPC socket is deliberately NOT here: it lives on tmpfs under the unit's
-/// RuntimeDirectory=, torn down by `systemd::uninstall` (the `service` domain),
-/// not left in `data_dir`.
-fn data_files(scope: Scope) -> Vec<PathBuf> {
-    let db = scope.db_path();
-    vec![
-        db.clone(),
-        db.with_extension("db-wal"),
-        db.with_extension("db-shm"),
-        scope.event_log(),
-        scope.data_dir().join("serve.lock"),
-    ]
-}
-
-/// Best-effort note when artifacts exist in the OTHER scope than the one we're
-/// acting on — so a user-scope run doesn't silently ignore a system install.
-fn cross_scope_probe(scope: Scope) -> Vec<String> {
-    let other = match scope {
-        Scope::User => Scope::System,
-        Scope::System => Scope::User,
-    };
-    let hits = [
-        other.config_file(),
-        other.db_path(),
-        other.bin_path(),
-        other.systemd_unit_path(),
-    ]
-    .into_iter()
-    .filter(|p| p.exists())
-    .map(|p| p.display().to_string())
-    .collect::<Vec<_>>();
-    if hits.is_empty() {
-        return Vec::new();
-    }
-    let re_run = match other {
-        Scope::System => "sudo ghr-stats uninstall --system",
-        Scope::User => "ghr-stats uninstall --user",
-    };
-    let mut lines: Vec<String> = hits;
-    lines.push(format!("↳ to remove these, re-run: {re_run}"));
-    lines
 }
 
 fn plan_line(rp: &RunnerHookPlan) -> String {
@@ -527,6 +274,7 @@ fn confirm() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::plan::{binary_action, is_cargo_bin};
     use super::*;
 
     #[test]

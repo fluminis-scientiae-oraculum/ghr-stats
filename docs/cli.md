@@ -8,6 +8,11 @@
 ghr-stats                       # the dashboard (default; `tui` is a hidden alias)
 ghr-stats status                # one-shot fleet state; exit code is the verdict
 ghr-stats status --json         # the same, machine-readable
+ghr-stats explain               # why the fleet isn't healthy, with a boundary to investigate
+ghr-stats timeline --since 6h   # what changed in a window, as edges rather than samples
+ghr-stats doctor                # preflight the install: config, PATs, hooks, socket, versions
+ghr-stats wait --github-online  # block until every runner is online to GitHub
+ghr-stats tail                  # follow transitions as NDJSON, one object per line
 ghr-stats serve                 # the collector — systemd-managed; refuses to run on a terminal
 ghr-stats config                # the configuration wizard (orgs / PATs / hooks)
 ghr-stats systemd install --user | --system   # install/enable the collector service
@@ -23,6 +28,12 @@ while the collector writes (SQLite WAL); `VACUUM` separately to reclaim file
 space after a large prune.
 
 ## status — for scripts and agents
+
+> `status`, `explain`, `timeline`, `doctor`, `wait` and `tail` are the
+> machine-facing verbs. **[For agents](agents.md)** documents all six together:
+> the shared exit-code contract, the JSON payloads, and the distinction between
+> a verb that judges (`0` means healthy) and one that merely retrieves (`0` means
+> answerable).
 
 `ghr-stats status` answers "is the fleet healthy right now" in one call, and
 encodes the answer in its **exit code** so a caller can branch without parsing:

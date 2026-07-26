@@ -17,16 +17,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::shared::ipc::client::{self as ipc_client, Client, EphemeralReason};
 use crate::shared::ipc::{Mutation, Query, Request, Response};
-use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, RunnerState};
+use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Mode, RunnerState};
 use crate::shared::paths::Scope;
-
-/// Which data plane the TUI is on. Drives the header badge + Config tab. A pure
-/// data enum — how it is rendered (label, colour) lives in `viewmodel::style`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    Ephemeral,
-    Persistent,
-}
 
 /// Result of a config mutation attempted over the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,9 +75,9 @@ impl DataSource {
     }
 
     /// Why we are Ephemeral, when we are.
-    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+    pub(crate) fn ephemeral_reason(&self) -> Option<&EphemeralReason> {
         match self {
-            DataSource::Ephemeral(r) => Some(*r),
+            DataSource::Ephemeral(r) => Some(r),
             DataSource::Persistent(_) => None,
         }
     }
