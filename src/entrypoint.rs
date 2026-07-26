@@ -104,6 +104,9 @@ fn run() -> Result<std::process::ExitCode> {
         Some(Command::Doctor(a)) => {
             crate::ops::doctor::run(&a, config_path.as_deref()).map(std::process::ExitCode::from)
         }
+        Some(Command::Wait(a)) => {
+            crate::ops::wait::run(&a, &load()?).map(std::process::ExitCode::from)
+        }
         Some(Command::Serve) => {
             crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
         }
@@ -165,7 +168,8 @@ fn logs_to_stderr(command: &Option<Command>) -> bool {
         Some(Command::Status(_))
         | Some(Command::Explain(_))
         | Some(Command::Timeline(_))
-        | Some(Command::Doctor(_)) => false,
+        | Some(Command::Doctor(_))
+        | Some(Command::Wait(_)) => false,
         // Runs under systemd, so its output lands in the journal.
         Some(Command::Serve) => true,
         Some(Command::Config) | Some(Command::Systemd { .. }) | Some(Command::Db { .. }) => true,

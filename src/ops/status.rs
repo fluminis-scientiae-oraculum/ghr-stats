@@ -179,7 +179,7 @@ fn ephemeral_status(cfg: &Config) -> FleetStatus {
 
 /// The human rendering. Deliberately plain — no colour, no box drawing — so it
 /// stays readable when piped, and so the only difference from `--json` is shape.
-fn human(s: &FleetStatus) -> String {
+pub(crate) fn human(s: &FleetStatus) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let verdict = match s.verdict {

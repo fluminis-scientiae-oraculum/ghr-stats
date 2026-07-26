@@ -52,6 +52,33 @@ pub struct ExplainArgs {
     pub json: bool,
 }
 
+/// Predicate, scope and deadline for `ghr-stats wait`.
+///
+/// The predicate is an `ArgGroup` with `required(true)` rather than a defaulted
+/// flag, so `wait` with no predicate is a usage error at parse time (exit 3)
+/// instead of a runtime check — and adding a second predicate later makes the
+/// two mutually exclusive by construction rather than silently changing what a
+/// bare `wait` means.
+#[derive(clap::Args, Debug)]
+#[command(group(clap::ArgGroup::new("predicate").required(true).args(["github_online"])))]
+pub struct WaitArgs {
+    /// Block until every runner in scope is online to GitHub.
+    #[arg(long)]
+    pub github_online: bool,
+
+    /// Only wait on this org's runners.
+    #[arg(long, value_name = "ORG")]
+    pub org: Option<String>,
+
+    /// Give up after this many seconds. `0` evaluates once and exits.
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    pub timeout: u64,
+
+    /// Emit the final snapshot as JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Output shape and network policy for `ghr-stats doctor`.
 #[derive(clap::Args, Debug)]
 pub struct DoctorArgs {
@@ -156,6 +183,25 @@ pub enum Command {
         check passed, 1 when one failed, 2 when any was skipped, 3 on a usage error."
     )]
     Doctor(DoctorArgs),
+
+    /// Block until the fleet reaches a state — the poll loop, written once.
+    #[command(
+        long_about = "Block until every runner in scope is online to GitHub, then exit 0. This \
+        replaces the `while ! ghr-stats status; do sleep 30; done` loop, which was written by \
+        hand three times during the 2026-07-25 investigation and got three things wrong each \
+        time.\n\n\
+        A timeout while the GitHub view was unreadable exits 2 (cannot determine), NOT 1: the \
+        caller must never read our blindness as the fleet's answer. A filter matching no runners \
+        exits 2 as well, because \"every runner in the empty set is online\" is vacuously true \
+        and exiting 0 on a typo is the worst failure available to a verb whose output is its \
+        exit code. And with no collector the predicate is unanswerable immediately rather than \
+        after the full timeout, since the GitHub view exists only there.\n\n\
+        Polls at the local sampling interval, because a transition does not exist until a \
+        sampler observes it. Progress goes to stderr and only when it changes; the final \
+        snapshot goes to stdout. Exits 0 when the predicate held, 1 on a genuine timeout, 2 when \
+        it could not be determined, 3 on a usage error."
+    )]
+    Wait(WaitArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.
