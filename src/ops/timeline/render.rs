@@ -1,173 +1,23 @@
-//! `ghr-stats timeline` — what changed over a window.
+//! The answer out: a `Timeline` as plain text.
 //!
-//! `status` answers *is the fleet healthy now*; `explain` answers *why isn't
-//! it*. Neither can answer *when did this start, and what moved first* — and
-//! that ordering is what turns a set of symptoms into a cause. The 2026-07-25
-//! investigation reached for it by hand: two SQL queries against a private
-//! schema, because the ordering existed in the database and nowhere in the
-//! interface.
+//! Chronological, one line per change, no ANSI — so a terminal reader and `grep`
+//! see the same thing, and an agent that shells out gets the same bytes a human
+//! does.
 //!
-//! Two properties are load-bearing.
-//!
-//! **Edges, not samples.** A six-hour window on this fleet is tens of thousands
-//! of rows that mostly say "still idle". The same window as transitions is a
-//! handful of lines, and the three streams — local liveness, GitHub's view, the
-//! per-org reconcile outcome — are kept separate precisely so their
-//! disagreement stays visible.
-//!
-//! **Bounded by construction.** Every collection carries whether it was cut, the
-//! window is capped before it leaves this process and clamped again by the
-//! collector, and a window reaching past what `db prune` left says so. An agent
-//! that cannot trust the bound has to fetch everything to find out, which is the
-//! situation the verb exists to end.
-//!
-//! Unlike `status` and `explain` there is no local-scan fallback: history exists
-//! only in the collector's database. A live scan can say what is true now; it
-//! cannot say what was true an hour ago, and inventing a one-point "timeline"
-//! from the present would answer a different question than the one asked.
+//! [`section`] exists because "500" and "500, and there are more" are different
+//! answers and must not print the same: a truncated stream says so. The three
+//! edge streams are rendered separately for the reason the whole verb exists —
+//! their disagreement is the finding.
 
-use std::process::ExitCode;
-
-use anyhow::Result;
-
-use crate::cli::TimelineArgs;
-use crate::shared::config::Config;
-use crate::shared::ipc::client::Client;
-use crate::shared::ipc::{Query, Request, Response};
 use crate::shared::models::GhView;
 use crate::shared::models::timeline::{
-    Bounded, Edge, JobEdge, JobTransition, ReconcileEdge, Timeline, TimelineQuery,
+    Bounded, Edge, JobEdge, JobTransition, ReconcileEdge, Timeline,
 };
-use crate::shared::util::{BUILD_VERSION, now_epoch};
-
-/// The furthest back a window may reach.
-///
-/// Not a storage limit — `db prune` keeps 14 days by default — but a bound on
-/// what one call may be asked to produce. Seven days is past every "what
-/// happened overnight / over the weekend" question while staying an order of
-/// magnitude short of a window whose transitions would swamp any caller.
-const MAX_WINDOW_SECS: u64 = 7 * 86_400;
-
-/// Whether the question could be answered at all.
-///
-/// `timeline` makes no health call, so its exit code must not pretend to: a
-/// window with no transitions in it is a perfectly healthy answer, and mapping
-/// that to [`crate::shared::models::Verdict::Ok`] would let `timeline && echo
-/// healthy` claim something this verb never assessed. What it *can* report is
-/// availability — and the two codes it uses keep the meanings the `status` table
-/// already gives them, so one vocabulary spans the verbs.
-pub(crate) enum Availability {
-    /// The window was answered.
-    Answered,
-    /// No collector, so there is no history to answer from — "cannot
-    /// determine", the same 2 `status` returns when it cannot say anything.
-    Unavailable,
-}
-
-impl From<Availability> for ExitCode {
-    fn from(a: Availability) -> Self {
-        ExitCode::from(match a {
-            Availability::Answered => 0,
-            Availability::Unavailable => 2,
-        })
-    }
-}
-
-/// Run the verb.
-pub fn run(args: &TimelineArgs, _cfg: &Config) -> Result<Availability> {
-    let window = parse_since(&args.since)?;
-    if window.clamped {
-        // The effective window is in the payload either way, but an operator who
-        // asked for 30d should not have to read a field to discover they got 7.
-        eprintln!(
-            "note: --since {} exceeds the {}d maximum window; using 7d",
-            args.since,
-            MAX_WINDOW_SECS / 86_400
-        );
-    }
-
-    let mut client = match Client::connect_any() {
-        Ok(c) => c,
-        Err(reason) => {
-            eprintln!(
-                "cannot read history: {} — timeline needs the collector, which is the only \
-                 thing that keeps a record; a local scan can only see the present.",
-                reason.word()
-            );
-            return Ok(Availability::Unavailable);
-        }
-    };
-
-    let query = TimelineQuery {
-        since_ts: now_epoch() - window.secs as i64,
-        limit: args.limit,
-        org: args.org.clone(),
-        runner: args.runner.clone(),
-        samples: args.samples,
-    };
-    let timeline = match client.request(&Request::Query(Query::Timeline(query)))? {
-        Response::Timeline(t) => *t,
-        // The collector is up and speaks our wire version, so this is its own
-        // fault (a database error, almost always) — the same distinction
-        // `explain` draws between "absent" and "broken".
-        Response::Error(e) => {
-            eprintln!("cannot read history: the collector answered with an error: {e}");
-            return Ok(Availability::Unavailable);
-        }
-        other => {
-            eprintln!("cannot read history: unexpected reply from the collector: {other:?}");
-            return Ok(Availability::Unavailable);
-        }
-    };
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&timeline)?);
-    } else {
-        print!("{}", human(&timeline, &args.since));
-    }
-    Ok(Availability::Answered)
-}
-
-/// A parsed `--since`, and whether the cap moved it.
-struct SinceWindow {
-    secs: u64,
-    clamped: bool,
-}
-
-/// Parse `90s` / `30m` / `6h` / `2d` into seconds, capped at [`MAX_WINDOW_SECS`].
-///
-/// A unit is required. A bare `6` could mean seconds or hours depending on who
-/// wrote the caller, and a window silently a hundred times wider than intended
-/// is worse than a rejected flag.
-fn parse_since(s: &str) -> Result<SinceWindow> {
-    let s = s.trim();
-    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
-    let multiplier = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3_600,
-        "d" => 86_400,
-        _ => anyhow::bail!("--since needs a unit: 90s, 30m, 6h or 2d (got {s:?})"),
-    };
-    let n: u64 = digits
-        .parse()
-        .map_err(|_| anyhow::anyhow!("--since needs a whole number before the unit (got {s:?})"))?;
-    if n == 0 {
-        anyhow::bail!("--since must be greater than zero (got {s:?})");
-    }
-    // Saturating, so `999999999d` clamps to the cap rather than wrapping into a
-    // tiny window — an overflow that silently NARROWS the window would be the
-    // one failure mode a caller could not see in the output.
-    let secs = n.saturating_mul(multiplier);
-    Ok(SinceWindow {
-        secs: secs.min(MAX_WINDOW_SECS),
-        clamped: secs > MAX_WINDOW_SECS,
-    })
-}
+use crate::shared::util::BUILD_VERSION;
 
 /// The human rendering. Plain text, chronological, one line per change — so a
 /// terminal reader and `grep` see the same thing.
-fn human(t: &Timeline, since: &str) -> String {
+pub(super) fn human(t: &Timeline, since: &str) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(
@@ -322,48 +172,8 @@ fn gh_word(view: GhView) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::models::timeline::{Timeline, TimelinePoint, Transition, Window};
+    use crate::shared::models::timeline::{TimelinePoint, Transition, Window};
     use crate::shared::models::{ApiState, Liveness};
-
-    #[test]
-    fn since_accepts_every_unit() {
-        for (text, secs) in [("90s", 90), ("30m", 1_800), ("6h", 21_600), ("2d", 172_800)] {
-            let w = parse_since(text).unwrap();
-            assert_eq!(w.secs, secs, "{text}");
-            assert!(!w.clamped);
-        }
-    }
-
-    /// A bare number is rejected rather than guessed at: `--since 6` meaning six
-    /// seconds when the caller meant six hours is a wrong answer that looks
-    /// right.
-    #[test]
-    fn since_requires_a_unit() {
-        assert!(parse_since("6").is_err());
-        assert!(parse_since("").is_err());
-        assert!(parse_since("6y").is_err());
-        assert!(parse_since("hh").is_err());
-        assert!(parse_since("0h").is_err());
-    }
-
-    #[test]
-    fn since_is_capped_and_says_so() {
-        let w = parse_since("30d").unwrap();
-        assert_eq!(w.secs, MAX_WINDOW_SECS);
-        assert!(w.clamped);
-    }
-
-    /// A window so large it overflows `u64` seconds must clamp UP to the cap,
-    /// never wrap down to a few seconds — a silently narrowed window is the one
-    /// error a caller could not detect from the output.
-    #[test]
-    fn an_overflowing_window_clamps_to_the_cap() {
-        let w = parse_since("999999999999999999999d").is_err();
-        assert!(w, "a value past u64 is a parse error, not a wrap");
-        let w = parse_since("500000000000000d").unwrap();
-        assert_eq!(w.secs, MAX_WINDOW_SECS);
-        assert!(w.clamped);
-    }
 
     fn timeline(transitions: Vec<Transition>, limited: bool) -> Timeline {
         Timeline {
@@ -522,20 +332,5 @@ mod tests {
         assert!(text.contains("github=stale (900s)"), "{text}");
         assert!(text.contains("github=unknown"), "{text}");
         assert!(text.contains("github=online (12s)"), "{text}");
-    }
-
-    /// The exit code is availability, never health: an answered window exits 0
-    /// even when it is full of failures, and a missing collector exits 2 — the
-    /// same "cannot determine" `status` uses.
-    #[test]
-    fn exit_codes_carry_availability_not_health() {
-        assert_eq!(
-            format!("{:?}", ExitCode::from(Availability::Answered)),
-            format!("{:?}", ExitCode::from(0))
-        );
-        assert_eq!(
-            format!("{:?}", ExitCode::from(Availability::Unavailable)),
-            format!("{:?}", ExitCode::from(2))
-        );
     }
 }
