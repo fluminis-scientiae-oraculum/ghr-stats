@@ -52,6 +52,20 @@ pub struct ExplainArgs {
     pub json: bool,
 }
 
+/// Output shape and network policy for `ghr-stats doctor`.
+#[derive(clap::Args, Debug)]
+pub struct DoctorArgs {
+    /// Emit JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Skip the one check that calls GitHub (per-org PAT validation). The check
+    /// is then reported as skipped, which keeps the verdict at "cannot
+    /// determine" rather than green.
+    #[arg(long)]
+    pub offline: bool,
+}
+
 /// Window, filters and output shape for `ghr-stats timeline`.
 #[derive(clap::Args, Debug)]
 pub struct TimelineArgs {
@@ -127,6 +141,21 @@ pub enum Command {
         when the window was answered, 3 on a usage error."
     )]
     Timeline(TimelineArgs),
+
+    /// Preflight the install itself: config, PATs, hooks, socket, database.
+    #[command(
+        long_about = "Check the things every other verb assumes: that the config parses, that \
+        each org's PAT can still list its runners, that the hooks are installed, that the \
+        collector is reachable and is the SAME BUILD as this binary, and where the retained \
+        record starts.\n\n\
+        A check that could not run is reported as skipped, never as passing, and any skip holds \
+        the verdict at 2 (cannot determine) rather than 0. The common case is real: the system \
+        config is root-owned and unreadable, so a non-root run genuinely cannot inspect PATs — \
+        re-run with sudo for the full picture. Every failure carries the single next action.\n\n\
+        --offline skips PAT validation, the only check that calls GitHub. Exits 0 when every \
+        check passed, 1 when one failed, 2 when any was skipped, 3 on a usage error."
+    )]
+    Doctor(DoctorArgs),
 
     /// Interactive first-run setup (run with sudo): runner root, per-org PATs,
     /// metrics, and hooks. Writes the system config at /etc.

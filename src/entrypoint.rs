@@ -98,6 +98,12 @@ fn run() -> Result<std::process::ExitCode> {
         Some(Command::Timeline(a)) => {
             crate::ops::timeline::run(&a, &load()?).map(std::process::ExitCode::from)
         }
+        // Takes the PATH, not the loaded config: `load` substitutes defaults for
+        // an unreadable system config, and a preflight reasoning over a config
+        // it never read would report a phantom install as merely empty.
+        Some(Command::Doctor(a)) => {
+            crate::ops::doctor::run(&a, config_path.as_deref()).map(std::process::ExitCode::from)
+        }
         Some(Command::Serve) => {
             crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
         }
@@ -156,7 +162,10 @@ fn logs_to_stderr(command: &Option<Command>) -> bool {
         // The dashboard owns the terminal; any log line bleeds onto it.
         None | Some(Command::Tui) => false,
         // Machine-facing stdout — a log line would corrupt the payload.
-        Some(Command::Status(_)) | Some(Command::Explain(_)) | Some(Command::Timeline(_)) => false,
+        Some(Command::Status(_))
+        | Some(Command::Explain(_))
+        | Some(Command::Timeline(_))
+        | Some(Command::Doctor(_)) => false,
         // Runs under systemd, so its output lands in the journal.
         Some(Command::Serve) => true,
         Some(Command::Config) | Some(Command::Systemd { .. }) | Some(Command::Db { .. }) => true,
