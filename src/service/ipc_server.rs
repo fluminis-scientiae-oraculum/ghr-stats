@@ -368,7 +368,7 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
         }),
         Query::BusySeries { limit } => with_db(conn, |c| {
             wrap(
-                reader::busy_series(c, clamped(*limit)),
+                reader::busy_series(c, clamped(*limit), max_age),
                 Response::BusySeries,
             )
         }),

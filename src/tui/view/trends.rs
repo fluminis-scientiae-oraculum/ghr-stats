@@ -67,16 +67,21 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     // data are simply absent from this series, so the line breaks rather than
     // dropping to zero. Without it the occupancy chart drew a flat healthy trace
     // straight through a four-hour outage, because local liveness never moved.
+    //
+    // The headline prints the denominator (`GH 9/17`) because the overlaid line
+    // cannot: a fleet with runners GitHub is never asked about keeps the magenta
+    // trace permanently below the yellow one, and only the ratio says whether
+    // that gap is an outage or a silence.
     let gh_pts: Vec<(f64, f64)> = app
         .trend_busy
         .iter()
-        .filter_map(|b| b.github_online.map(|g| (b.ts as f64, g as f64)))
+        .filter_map(|b| b.github.map(|g| (b.ts as f64, g.online as f64)))
         .collect();
     let gh_now = app
         .trend_busy
         .last()
-        .and_then(|b| b.github_online)
-        .map(|g| format!("   GH {g}"))
+        .and_then(|b| b.github)
+        .map(|g| format!("   GH {}/{}", g.online, g.known))
         .unwrap_or_default();
     draw_time_chart(
         f,

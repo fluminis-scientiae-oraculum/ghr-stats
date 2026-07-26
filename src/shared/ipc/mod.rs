@@ -46,7 +46,10 @@ use crate::shared::models::{
 ///     than an instant. It is also the first whose reply is explicitly bounded
 ///     (`Bounded<T>` carries whether the limit cut it), because a history query
 ///     is the one shape that can outgrow both the frame cap and a caller's
-///     context.
+///     context. `BusyPoint.github_online: Option<u32>` also became
+///     `github: Option<GhCount>`, which carries the population the count speaks
+///     for — the occupancy chart's GitHub line is meaningless without its
+///     denominator on a fleet that holds runners GitHub is never asked about.
 pub const VERSION: u16 = 10;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
@@ -224,6 +227,7 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::GhCount;
 
     #[test]
     fn frame_round_trips() {
@@ -231,7 +235,7 @@ mod tests {
             ts: 42,
             busy: 3,
             online: 7,
-            github_online: Some(5),
+            github: GhCount::new(5, 7),
         }]);
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();

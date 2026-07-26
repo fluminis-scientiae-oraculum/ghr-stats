@@ -13,8 +13,8 @@ use crate::shared::models::timeline::{
     Bounded, Edge, ReconcileEdge, Timeline, TimelinePoint, TimelineQuery, Transition, Window,
 };
 use crate::shared::models::{
-    ApiReconcileState, ApiRunnerState, ApiState, BusyPoint, GhView, HistPoint, HostPoint, JobRow,
-    Liveness, PendingConclusion, RunnerSample, RunnerState,
+    ApiReconcileState, ApiRunnerState, ApiState, BusyPoint, GhCount, GhView, HistPoint, HostPoint,
+    JobRow, Liveness, PendingConclusion, RunnerSample, RunnerState,
 };
 use crate::shared::util::to_rfc3339_utc;
 
@@ -173,24 +173,49 @@ pub fn api_reconcile_states(conn: &Connection) -> Result<Vec<ApiReconcileState>>
 
 /// Fleet occupancy per tick (busy and online counts), oldest → newest.
 ///
-/// `github_online` is LEFT-joined from the reconcile samples, so a tick with no
-/// API data yields `None` and the chart plots a gap. Deriving occupancy from
-/// local liveness alone is what let the Trends chart draw a flat healthy line
-/// straight through a four-hour outage.
-pub fn busy_series(conn: &Connection, limit: usize) -> Result<Vec<BusyPoint>> {
+/// The GitHub count is LEFT-joined per runner from the newest reconcile reading
+/// AT OR BEFORE that tick, bounded by `max_age` — the same shape
+/// [`timeline_samples`] uses, for the same reason. The two producers are
+/// independent threads on different periods (local ticks default to 5s, API
+/// ticks to 60s) that each stamp their own clock, so joining on exact `ts`
+/// equality only matched when both happened to fire inside the same second:
+/// roughly one point per twelve, and the density tracked scheduler drift rather
+/// than whether GitHub data existed. Carrying the last reading forward gives a
+/// continuous series; `max_age` is what keeps it honest, so a dead reconcile
+/// thread decays into a gap instead of a confident flat line.
+///
+/// Joining per `(org, agent_id)` also narrows the count to OUR runners: the old
+/// query summed every API row at the matching tick, which on an org whose
+/// runners are spread across hosts counted machines this host cannot see.
+///
+/// Deriving occupancy from local liveness alone is what let the Trends chart
+/// draw a flat healthy line straight through a four-hour outage.
+pub fn busy_series(conn: &Connection, limit: usize, max_age: u64) -> Result<Vec<BusyPoint>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.ts, \
                 SUM(r.liveness = 'busy') AS busy, \
                 SUM(r.liveness <> 'offline') AS online, \
-                (SELECT SUM(a.online) FROM api_runner_sample a WHERE a.ts = r.ts) AS gh_online \
-         FROM runner_sample r GROUP BY r.ts ORDER BY r.ts DESC LIMIT ?1",
+                SUM(a.online) AS gh_online, \
+                SUM(a.ts IS NOT NULL) AS gh_known \
+         FROM runner_sample r \
+         LEFT JOIN api_runner_sample a \
+                ON a.org = r.org AND a.agent_id = r.agent_id \
+               AND a.ts = (SELECT max(x.ts) FROM api_runner_sample x \
+                            WHERE x.org = r.org AND x.agent_id = r.agent_id \
+                              AND x.ts <= r.ts AND x.ts >= r.ts - ?2) \
+         GROUP BY r.ts ORDER BY r.ts DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![limit as i64], |r| {
+    let rows = stmt.query_map(params![limit as i64, max_age as i64], |r| {
         Ok(BusyPoint {
             ts: r.get(0)?,
             busy: r.get::<_, i64>(1)? as u32,
             online: r.get::<_, i64>(2)? as u32,
-            github_online: r.get::<_, Option<i64>>(3)?.map(|v| v as u32),
+            // `gh_online` is NULL exactly when no row joined, which is the same
+            // condition as `gh_known == 0`; `GhCount::new` owns that decision.
+            github: GhCount::new(
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u32,
+                r.get::<_, i64>(4)? as u32,
+            ),
         })
     })?;
     let mut out: Vec<BusyPoint> = rows.collect::<std::result::Result<_, _>>()?;
@@ -575,7 +600,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = busy_series(&conn, 10).unwrap();
+        let s = busy_series(&conn, 10, 180).unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].busy, s[0].online), (1, 3));
     }
@@ -672,10 +697,93 @@ mod tests {
         // Only tick 200 has a reconcile row.
         api_sample(&conn, 200, "o", 1, 1, 0);
 
-        let s = busy_series(&conn, 10).unwrap();
+        let s = busy_series(&conn, 10, 180).unwrap();
         assert_eq!(s.len(), 2);
-        assert_eq!(s[0].github_online, None); // tick 100 — gap, not zero
-        assert_eq!(s[1].github_online, Some(1)); // tick 200
+        // Tick 100 predates every reading — a gap, and never a zero. A reading
+        // is only ever carried FORWARD; inventing GitHub's opinion of a moment
+        // before it was asked would be a different lie in the same family.
+        assert!(s[0].github.is_none());
+        let gh = s[1].github.unwrap();
+        assert_eq!((gh.online, gh.known), (1, 1));
+    }
+
+    /// The bug this fixes: the two producers are independent threads on
+    /// different periods (5s local, 60s API) that each stamp their own clock, so
+    /// an exact-`ts` join matched only when both fired inside the same second.
+    /// Every tick between two reconciles reported a gap, and the series' density
+    /// tracked scheduler drift rather than whether GitHub data existed.
+    #[test]
+    fn busy_series_carries_the_newest_reading_at_or_before_each_tick() {
+        let conn = mem_db();
+        for ts in [100, 105, 110, 115] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
+                 VALUES (?1, 1, 'r', 'o', 'idle', '/d1')",
+                params![ts],
+            )
+            .unwrap();
+        }
+        // One reconcile, landing on the first tick only.
+        api_sample(&conn, 100, "o", 1, 1, 0);
+
+        let s = busy_series(&conn, 10, 180).unwrap();
+        assert_eq!(s.len(), 4);
+        // All four ticks carry it: under the old exact-`ts` join only the first
+        // did, so three of every four points vanished.
+        for p in &s {
+            let gh = p.github.expect("reading carried forward");
+            assert_eq!((gh.online, gh.known), (1, 1));
+        }
+    }
+
+    /// Carrying forward is only honest while the reading is fresh. Past
+    /// `max_age` the series must decay into a gap — otherwise a dead reconcile
+    /// thread draws a confident flat line forever, which is the failure the
+    /// whole GitHub-view rework exists to prevent.
+    #[test]
+    fn busy_series_stops_carrying_a_reading_past_max_age() {
+        let conn = mem_db();
+        for ts in [100, 200, 400] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
+                 VALUES (?1, 1, 'r', 'o', 'idle', '/d1')",
+                params![ts],
+            )
+            .unwrap();
+        }
+        api_sample(&conn, 100, "o", 1, 1, 0);
+
+        let s = busy_series(&conn, 10, 180).unwrap();
+        assert!(s[0].github.is_some()); // age 0
+        assert!(s[1].github.is_some()); // age 100, inside the window
+        assert!(s[2].github.is_none()); // age 300, past it — a gap
+    }
+
+    /// The count speaks only for runners it has a reading for, and says so.
+    /// A fleet holding an org GitHub is never asked about (a personal account
+    /// has no org runner API) would otherwise draw a permanent divergence: the
+    /// GitHub line sitting below the local one forever, for runners nobody ever
+    /// asked about. `known` is what tells that silence apart from an outage.
+    #[test]
+    fn busy_series_counts_only_the_runners_it_has_a_reading_for() {
+        let conn = mem_db();
+        for (id, org) in [(1, "asked"), (2, "never-asked")] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
+                 VALUES (100, ?1, 'r', ?2, 'idle', ?3)",
+                params![id, org, format!("/d{id}")],
+            )
+            .unwrap();
+        }
+        api_sample(&conn, 100, "asked", 1, 1, 0);
+        // A runner GitHub knows about that this host does not run — another
+        // machine in the same org. It must not inflate our count.
+        api_sample(&conn, 100, "asked", 99, 1, 0);
+
+        let s = busy_series(&conn, 10, 180).unwrap();
+        let gh = s[0].github.unwrap();
+        assert_eq!(s[0].online, 2);
+        assert_eq!((gh.online, gh.known), (1, 1));
     }
 
     #[test]

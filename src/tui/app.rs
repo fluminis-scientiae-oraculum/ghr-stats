@@ -529,7 +529,7 @@ impl App {
             // Ephemeral mode has no collector and therefore no GitHub reconcile.
             // `None` plots a gap; emitting 0 would draw "GitHub says nothing is
             // online" for a fleet nobody has asked GitHub about.
-            github_online: None,
+            github: None,
         });
         self.edges = edges;
         self.runners = runners;

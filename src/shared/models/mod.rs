@@ -564,6 +564,39 @@ pub struct RunnerStatus {
     pub mem_bytes: Option<u64>,
 }
 
+/// GitHub's count for one occupancy tick, carried with the population it can
+/// actually speak for.
+///
+/// A bare count is ambiguous, and on a real fleet the ambiguity is permanent:
+/// a host with an org that can never be reconciled (a personal account has no
+/// org runner API) will always have runners GitHub was never asked about. Plot
+/// only `online` and the GitHub line sits forever below the local one — a
+/// standing outage that is really just a standing silence. `known` is the
+/// denominator that tells "GitHub says 9 of the 17 it knows are online" apart
+/// from "9 of 17, and 4 more we never asked".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GhCount {
+    /// Runners GitHub considered online, out of `known`.
+    pub online: u32,
+    /// Runners at this tick that had a reading fresh enough to count.
+    pub known: u32,
+}
+
+impl GhCount {
+    /// A tick's GitHub count, or `None` when nothing at this tick had a fresh
+    /// reading.
+    ///
+    /// The gap/zero decision lives HERE rather than at each call site: `known
+    /// == 0` is the "nobody asked" case, and it must reach the chart as an
+    /// absent point. Emitting `GhCount { online: 0, known: 0 }` would draw
+    /// "GitHub says nothing is online" for a fleet nobody asked GitHub about —
+    /// inventing an outage instead of admitting ignorance. Returning `Option`
+    /// makes the empty count unrepresentable rather than merely discouraged.
+    pub fn new(online: u32, known: u32) -> Option<Self> {
+        (known > 0).then_some(Self { online, known })
+    }
+}
+
 /// One fleet-occupancy point: how many runners were busy / online at a tick.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BusyPoint {
@@ -571,10 +604,10 @@ pub struct BusyPoint {
     pub busy: u32,
     /// Locally online (listener process present) — a purely local fact.
     pub online: u32,
-    /// How many runners GitHub considered online at this tick. `None` when the
-    /// tick has no reconcile data, which the chart must plot as a GAP rather
-    /// than as zero: drawing "0 online" for "we didn't ask" invents an outage,
-    /// and drawing the local line alone drew a flat healthy trace straight
-    /// through a real one.
-    pub github_online: Option<u32>,
+    /// What GitHub said about this tick's runners. `None` when no runner had a
+    /// fresh reading, which the chart must plot as a GAP rather than as zero:
+    /// drawing "0 online" for "we didn't ask" invents an outage, and drawing
+    /// the local line alone drew a flat healthy trace straight through a real
+    /// one.
+    pub github: Option<GhCount>,
 }
