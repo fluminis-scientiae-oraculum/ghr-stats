@@ -1,5 +1,10 @@
 # lychee link-checker config — https://github.com/lycheeverse/lychee
-# Applies to the docs link check (CI: .github/workflows/docs.yml).
+# Applies to the docs link check (CI: the `links` job in
+# .github/workflows/on-pr-sync.yml, which passes `.` and lets lychee walk —
+# see the comment there for why a `**` glob silently under-collects).
+#
+# Reproduce that job locally with:
+#   lychee --config lychee.toml --no-progress .
 
 # Don't descend into the gitignored build dir's packaged doc copies.
 exclude_path = ["target"]
