@@ -1,14 +1,30 @@
-//! The collector↔TUI IPC: a small, synchronous, length-prefixed JSON protocol
+//! The collector↔client IPC: a small, synchronous, length-prefixed JSON protocol
 //! over a Unix domain socket. No HTTP framework, no async runtime — one frame is
 //! a `u32`-LE length followed by a `serde_json` body. The collector (Persistent
-//! mode) serves it; the TUI is the only client, and a successful `connect` is
-//! itself the Persistent-mode signal.
+//! mode) serves it; the TUI and every machine-facing verb (`status`, `explain`,
+//! `timeline`, `doctor`) are clients, and a successful `connect` is itself the
+//! Persistent-mode signal.
 //!
 //! By construction the protocol carries ONLY derived fleet stats: there is no
 //! `Request`/`Response` variant that returns a GitHub token or a config value.
 //! Every response payload reuses a `shared::models` type verbatim (the shapes the
 //! store's read queries return), so the wire types and the query types can never
 //! drift apart.
+//!
+//! **One request, one response — deliberately, and there is no subscribe path.**
+//! A streaming verb (`tail`) was specced against this protocol and the shape was
+//! decided against on three grounds. Transitions do not exist until a sampler
+//! observes them, so a subscriber would receive events quantised to the same
+//! `local_secs` grid a poller sees — the latency argument is empty against this
+//! collector's own cadence. A long-lived subscription would hold one of
+//! `MAX_CONNS` connection slots for its lifetime, and the accept loop *drops*
+//! callers past that cap rather than queueing them, so a handful of forgotten
+//! streams would refuse every other client — the exact lockout the
+//! thread-per-connection fix was written to end. And a poll can prove it kept up,
+//! because `Bounded<T>` reports whether a limit truncated the answer, whereas a
+//! stream that drops events under backpressure has to be built to admit it.
+//! A verb that wants a live feed therefore polls a `Query` with a cursor; adding
+//! a many-response frame shape needs to defeat those three first.
 
 pub mod client;
 
