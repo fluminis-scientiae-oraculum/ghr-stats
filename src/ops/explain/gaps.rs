@@ -172,7 +172,7 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
             "the socket's permissions and the unit's RuntimeDirectoryMode".to_string(),
             "re-running as root, or as a member of the `ghr-stats` group".to_string(),
         ],
-        Source::LocalScan(EphemeralReason::Unusable | EphemeralReason::QueryFailed) => vec![
+        Source::LocalScan(EphemeralReason::Unusable { .. } | EphemeralReason::QueryFailed) => vec![
             "`journalctl -u ghr-stats` for the collector's own errors".to_string(),
             "whether another client is holding the collector's only connection".to_string(),
             "that the socket belongs to a live collector and is not stale".to_string(),
@@ -203,7 +203,7 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
              unit's RuntimeDirectoryMode and the socket's permissions, or re-run as root."
                 .to_string(),
         ),
-        Source::LocalScan(EphemeralReason::Unusable) => (
+        Source::LocalScan(EphemeralReason::Unusable { .. }) => (
             Boundary::Local,
             "A collector socket accepted the connection but the handshake did not complete, \
              so something IS listening and installing another would not help. Read \
@@ -218,12 +218,20 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
                 .to_string(),
         ),
     };
+    // The word is the branchable token; the detail, when the reason carries one,
+    // is what turns "the handshake failed" into something to act on. Evidence is
+    // where it belongs — the claim states the situation, evidence carries the
+    // observation, and only one of those may be a verbatim error string.
+    let mut evidence = vec![format!("ipc: {}", reason_word(source))];
+    if let Some(why) = reason_detail(source) {
+        evidence.push(format!("handshake error: {why}"));
+    }
     Some(Finding {
         id: "github-view-unavailable",
         severity: Severity::Info,
         boundary,
         claim,
-        evidence: vec![format!("ipc: {}", reason_word(source))],
+        evidence,
         // The fallback is observed now; how long it has been true is not knowable
         // from a snapshot that could not reach the thing that would know.
         first_seen: None,
@@ -237,6 +245,16 @@ fn reason_word(source: &Source) -> &'static str {
     match source {
         Source::Collector => "connected",
         Source::LocalScan(reason) => reason.word(),
+    }
+}
+
+/// The underlying failure behind the fallback, when the reason carries one.
+/// Kept separate from [`reason_word`] so the stable token an agent branches on
+/// never has a verbatim error string spliced into it.
+fn reason_detail(source: &Source) -> Option<&str> {
+    match source {
+        Source::Collector => None,
+        Source::LocalScan(reason) => reason.detail(),
     }
 }
 
@@ -301,7 +319,10 @@ mod tests {
                 "journalctl -u ghr-stats",
             ),
         ] {
-            let s = fell_back(reason, vec![runner("a0", "org-a", Liveness::Idle, None)]);
+            let s = fell_back(
+                reason.clone(),
+                vec![runner("a0", "org-a", Liveness::Idle, None)],
+            );
             let f = &findings(&s)[0];
             assert_eq!(f.id, "github-view-unavailable");
             assert_eq!(f.boundary, expect_boundary, "for {reason:?}");
@@ -316,6 +337,50 @@ mod tests {
                 f.claim
             );
         }
+    }
+
+    /// `explain` had the same hole `doctor` did: the handshake error was warn-
+    /// logged and dropped, so the finding said only "handshake-failed". It goes
+    /// in EVIDENCE, not the claim — the claim states the situation, evidence
+    /// carries the observation, and only one of those may be a raw error string.
+    #[test]
+    fn an_unusable_collector_evidences_the_handshake_error() {
+        let s = fell_back(
+            EphemeralReason::Unusable {
+                detail: "unexpected handshake reply".to_string(),
+            },
+            vec![runner("a0", "org-a", Liveness::Idle, None)],
+        );
+        let f = &findings(&s)[0];
+        assert_eq!(f.id, "github-view-unavailable");
+        assert!(
+            f.evidence.iter().any(|e| e == "ipc: handshake-failed"),
+            "{:?}",
+            f.evidence
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|e| e.contains("unexpected handshake reply")),
+            "{:?}",
+            f.evidence
+        );
+        // The branchable token stays clean — no error text spliced into it.
+        assert!(
+            !f.claim.contains("unexpected handshake reply"),
+            "{}",
+            f.claim
+        );
+    }
+
+    /// A reason with no detail must not grow an empty evidence line.
+    #[test]
+    fn a_reason_without_a_detail_adds_no_evidence_line() {
+        let s = fell_back(
+            EphemeralReason::NoCollector,
+            vec![runner("a0", "org-a", Liveness::Idle, None)],
+        );
+        assert_eq!(findings(&s)[0].evidence, ["ipc: no-collector"]);
     }
 
     /// The drift claim must quote BOTH versions — one of them alone does not

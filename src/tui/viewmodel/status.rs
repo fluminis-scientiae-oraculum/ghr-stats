@@ -134,7 +134,7 @@ mod tests {
         // Wire drift: the actionable one — it also explains the empty dashboard.
         let w = version_warning(
             VersionState::NoCollector,
-            Some(EphemeralReason::VersionDrift { server: 8 }),
+            Some(&EphemeralReason::VersionDrift { server: 8 }),
         )
         .expect("wire drift must warn");
         assert!(w.contains("IPC v8"));
@@ -144,7 +144,7 @@ mod tests {
         assert!(
             version_warning(
                 VersionState::NoCollector,
-                Some(EphemeralReason::NoCollector)
+                Some(&EphemeralReason::NoCollector)
             )
             .is_none()
         );

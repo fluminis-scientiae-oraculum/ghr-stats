@@ -225,7 +225,7 @@ impl App {
     /// Why the dashboard is Ephemeral, when it is. Surfaced on the Config tab so
     /// "the service is an older build" is not silently indistinguishable from
     /// "there is no service".
-    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+    pub(crate) fn ephemeral_reason(&self) -> Option<&EphemeralReason> {
         self.source.ephemeral_reason()
     }
 

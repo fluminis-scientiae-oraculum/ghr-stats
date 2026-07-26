@@ -11,7 +11,7 @@
 //! [`Outcome`]; their import lists do not intersect.
 
 use crate::ops::explain::Boundary;
-use crate::shared::ipc::client::Client;
+use crate::shared::ipc::client::{Client, EphemeralReason};
 use crate::shared::ipc::{self, Query, Request, Response};
 use crate::shared::models::timeline::TimelineQuery;
 use crate::shared::models::{FleetStatus, Verdict};
@@ -30,27 +30,11 @@ pub(super) fn collector_checks() -> Vec<Check> {
     let mut client = match Client::connect_any() {
         Ok(c) => c,
         Err(reason) => {
-            let (detail, fix) = match reason {
-                crate::shared::ipc::client::EphemeralReason::VersionDrift { server } => (
-                    format!(
-                        "the collector speaks wire v{server}, this binary speaks v{} — almost \
-                         always a binary upgraded without restarting the service",
-                        ipc::VERSION
-                    ),
-                    "sudo systemctl restart ghr-stats.service".to_string(),
-                ),
-                other => (
-                    format!("no usable collector on the socket ({})", other.word()),
-                    "check `systemctl status ghr-stats.service` and \
-                     `journalctl -u ghr-stats -n 50`"
-                        .to_string(),
-                ),
-            };
             return vec![
                 Check {
                     id: "collector",
                     boundary: Boundary::Local,
-                    outcome: Outcome::Fail { detail, fix },
+                    outcome: unreachable_outcome(&reason),
                 },
                 skipped("reconcile", Boundary::Github, "no collector answered"),
                 skipped("history", Boundary::Local, "no collector answered"),
@@ -81,6 +65,39 @@ pub(super) fn collector_checks() -> Vec<Check> {
     }
     checks.push(history_check(&mut client));
     checks
+}
+
+/// Why we could not talk to a collector, in the operator's terms. Pure.
+///
+/// Extracted from [`collector_checks`] rather than written inline, because
+/// inline it was reachable only with a real broken socket — which is exactly how
+/// it came to report `handshake-failed` and nothing else for months. A branch
+/// that can only be exercised by breaking production is a branch nobody checks.
+fn unreachable_outcome(reason: &EphemeralReason) -> Outcome {
+    match reason {
+        EphemeralReason::VersionDrift { server } => Outcome::Fail {
+            detail: format!(
+                "the collector speaks wire v{server}, this binary speaks v{} — almost always a \
+                 binary upgraded without restarting the service",
+                ipc::VERSION
+            ),
+            fix: "sudo systemctl restart ghr-stats.service".to_string(),
+        },
+        // The detail is the whole point of this arm: "handshake-failed" alone
+        // sends the operator to a journal that may say nothing, while the
+        // underlying error usually names the fault outright.
+        other => Outcome::Fail {
+            detail: match other.detail() {
+                Some(why) => format!(
+                    "no usable collector on the socket ({}): {why}",
+                    other.word()
+                ),
+                None => format!("no usable collector on the socket ({})", other.word()),
+            },
+            fix: "check `systemctl status ghr-stats.service` and `journalctl -u ghr-stats -n 50`"
+                .to_string(),
+        },
+    }
 }
 
 /// Binary semver against the collector's. Pure.
@@ -262,6 +279,51 @@ mod tests {
                 assert!(detail.contains("personal"), "{detail}");
             }
             other => panic!("expected a pass, got {other:?}"),
+        }
+    }
+
+    /// The regression this arm exists to prevent: `doctor` used to report
+    /// `handshake-failed` and drop the error that explained it, because the
+    /// error was only `tracing::warn!`-ed and `doctor` has no log sink. The
+    /// operator was then sent to a journal that need not mention it at all.
+    #[test]
+    fn an_unusable_collector_reports_the_error_that_explains_it() {
+        let outcome = unreachable_outcome(&EphemeralReason::Unusable {
+            detail: "unexpected handshake reply".to_string(),
+        });
+        match outcome {
+            Outcome::Fail { detail, .. } => {
+                assert!(detail.contains("handshake-failed"), "{detail}");
+                assert!(detail.contains("unexpected handshake reply"), "{detail}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// ...and a reason that carries no detail must not grow an empty suffix.
+    /// The word alone is the whole answer for those, and `(no-collector): `
+    /// would read as a truncated message.
+    #[test]
+    fn a_reason_without_a_detail_renders_the_word_alone() {
+        match unreachable_outcome(&EphemeralReason::NoCollector) {
+            Outcome::Fail { detail, .. } => {
+                assert_eq!(detail, "no usable collector on the socket (no-collector)");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// Wire drift keeps its own arm and its own fix: it is the one cause whose
+    /// remedy is a restart rather than an investigation.
+    #[test]
+    fn wire_drift_keeps_the_restart_as_its_fix() {
+        match unreachable_outcome(&EphemeralReason::VersionDrift { server: 9 }) {
+            Outcome::Fail { detail, fix } => {
+                assert!(detail.contains("wire v9"), "{detail}");
+                assert!(detail.contains(&format!("v{}", ipc::VERSION)), "{detail}");
+                assert!(fix.contains("systemctl restart"), "{fix}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
         }
     }
 

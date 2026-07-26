@@ -71,8 +71,14 @@ impl Client {
                     // report as absent. Only fill the default in: a `Denied` or
                     // `VersionDrift` found in the other scope is more specific
                     // and must not be downgraded.
+                    //
+                    // The error rides ON the reason, not just into the log: the
+                    // callers that most need it (`doctor`, `explain`) have no log
+                    // sink by design, so a warn alone reaches nobody.
                     if reason == EphemeralReason::NoCollector {
-                        reason = EphemeralReason::Unusable;
+                        reason = EphemeralReason::Unusable {
+                            detail: e.to_string(),
+                        };
                     }
                 }
             }
@@ -145,7 +151,14 @@ pub(crate) fn api_map(rows: Vec<ApiRow>) -> HashMap<(String, i64), GhView> {
 
 /// Why the dashboard is running Ephemeral. Carried on the mode itself so the
 /// reason cannot be dropped on the floor between detecting it and showing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deliberately not `Copy`: [`Self::Unusable`] carries the failure it stands for.
+/// That detail used to be `tracing::warn!`-ed beside this value and thrown away,
+/// which left `doctor` — the one verb whose whole job is explaining a broken
+/// install — reporting `handshake-failed` with nothing to act on, because
+/// `doctor` deliberately has no log sink. The same principle the type already
+/// rested on applies one level down: a reason that needs a detail must carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EphemeralReason {
     /// No collector socket found in either scope.
     NoCollector,
@@ -157,7 +170,11 @@ pub(crate) enum EphemeralReason {
     /// The socket accepted the connection but the handshake never completed —
     /// an I/O error, or a reply we could not make sense of. Something IS
     /// listening, so "install a collector" is the wrong advice.
-    Unusable,
+    ///
+    /// `detail` is the underlying failure, verbatim. It is the difference
+    /// between "the collector is broken somehow" and a timeout, a truncated
+    /// frame, or a payload this build cannot parse — three different next steps.
+    Unusable { detail: String },
     /// The collector completed the handshake but did not answer the query — so
     /// it is running AND speaks our wire version, and the fault is its own
     /// (usually a database error). Distinct from [`Self::NoCollector`] because
@@ -173,13 +190,25 @@ impl EphemeralReason {
     /// `explain` puts it in a finding's evidence and `timeline` puts it on
     /// stderr before exiting, and two spellings of "denied" would be two
     /// vocabularies for one fact.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) fn word(&self) -> &'static str {
         match self {
             EphemeralReason::NoCollector => "no-collector",
             EphemeralReason::VersionDrift { .. } => "version-drift",
             EphemeralReason::Denied => "denied",
-            EphemeralReason::Unusable => "handshake-failed",
+            EphemeralReason::Unusable { .. } => "handshake-failed",
             EphemeralReason::QueryFailed => "query-failed",
+        }
+    }
+
+    /// The underlying failure, when there is one to show. `None` for every
+    /// reason whose `word` already says everything knowable about it.
+    ///
+    /// Returned rather than folded into the word so the two stay separable: an
+    /// agent branches on the stable token, a human reads the detail.
+    pub(crate) fn detail(&self) -> Option<&str> {
+        match self {
+            EphemeralReason::Unusable { detail } => Some(detail.as_str()),
+            _ => None,
         }
     }
 }

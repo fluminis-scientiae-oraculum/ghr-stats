@@ -75,9 +75,9 @@ impl DataSource {
     }
 
     /// Why we are Ephemeral, when we are.
-    pub(crate) fn ephemeral_reason(&self) -> Option<EphemeralReason> {
+    pub(crate) fn ephemeral_reason(&self) -> Option<&EphemeralReason> {
         match self {
-            DataSource::Ephemeral(r) => Some(*r),
+            DataSource::Ephemeral(r) => Some(r),
             DataSource::Persistent(_) => None,
         }
     }
