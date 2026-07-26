@@ -1,5 +1,5 @@
-//! Readers for the `timeline` query: the three edge streams, the job stream,
-//! and the window assembly that bounds them.
+//! Readers for the `timeline` query: the window assembly that bounds the edge
+//! streams, and the raw samples inside it.
 //!
 //! Separated from the rest of `reader` because the shape differs. Everything
 //! else there answers "what is true NOW" from the newest rows; these derive
@@ -12,16 +12,24 @@
 //! fall inside it. The first sample in a window is a baseline, not an edge —
 //! and an incremental consumer (`ops::tail`) must therefore overlap its windows
 //! rather than re-asking from the last edge it saw.
+//!
+//! That invariant is why the four edge derivations sit together in [`edges`]
+//! rather than one per producer: they are four spellings of the same `LAG`
+//! argument, and a change to how an edge is bounded has to land on all four at
+//! once. This file keeps what BOUNDS them — the assembly, the shared filter, the
+//! raw sample read and the retention floor — so the window's rules are in one
+//! place and the streams that obey them are in another.
 
 use rusqlite::{Connection, params};
 
 use crate::shared::error::Result;
-use crate::shared::models::timeline::{
-    Bounded, Edge, JobEdge, JobTransition, ReconcileEdge, Timeline, TimelinePoint, TimelineQuery,
-    Transition, Window,
-};
+use crate::shared::models::timeline::{Bounded, Timeline, TimelinePoint, TimelineQuery, Window};
 use crate::shared::models::{ApiState, GhView, Liveness};
 use crate::shared::util::to_rfc3339_utc;
+
+mod edges;
+
+use edges::{github_edges, job_edges, liveness_edges, reconcile_edges};
 
 /// Assemble the `timeline` answer for one window: the edges, optionally the raw
 /// samples, and how much of the requested window the DB can actually cover.
@@ -65,163 +73,13 @@ pub fn timeline(conn: &Connection, q: &TimelineQuery, now: i64, max_age: u64) ->
     })
 }
 
-/// Job starts and completions in the window, newest first.
-///
-/// One `job_event` row yields up to TWO edges at different instants, so the two
-/// ends are selected separately and unioned rather than derived from one row —
-/// a job that started inside the window and has not finished contributes only
-/// its start, and one that finished inside a window it started before
-/// contributes only its completion. Filtering the union (rather than each half)
-/// keeps the org/runner predicate written once.
-fn job_edges(conn: &Connection, q: &TimelineQuery, limit: usize) -> Result<Vec<JobTransition>> {
-    let (org, runner) = filters(q);
-    let mut stmt = conn.prepare_cached(
-        "SELECT ts, org, runner_name, repo, job, started, conclusion FROM ( \
-             SELECT started_at AS ts, org, runner_name, repo, job, 1 AS started, \
-                    NULL AS conclusion \
-             FROM job_event WHERE started_at IS NOT NULL AND started_at >= ?1 \
-             UNION ALL \
-             SELECT completed_at AS ts, org, runner_name, repo, job, 0 AS started, conclusion \
-             FROM job_event WHERE completed_at IS NOT NULL AND completed_at >= ?1 \
-         ) WHERE (?2 IS NULL OR org = ?2) AND (?3 IS NULL OR runner_name = ?3) \
-         ORDER BY ts DESC LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(params![q.since_ts, org, runner, limit as i64], |r| {
-        let ts: i64 = r.get(0)?;
-        Ok(JobTransition {
-            ts,
-            at: to_rfc3339_utc(ts),
-            org: r.get(1)?,
-            runner: r.get(2)?,
-            repo: r.get(3)?,
-            job: r.get(4)?,
-            edge: if r.get::<_, i64>(5)? != 0 {
-                JobEdge::Started
-            } else {
-                JobEdge::Completed {
-                    conclusion: r.get(6)?,
-                }
-            },
-        })
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
 /// The optional `--org` / `--runner` filters as SQL parameters.
 ///
 /// Expressed as `(?n IS NULL OR col = ?n)` rather than by concatenating
 /// predicates onto the query text: one statement shape, so `prepare_cached`
 /// actually caches, and no string building anywhere near a query.
-fn filters(q: &TimelineQuery) -> (Option<&str>, Option<&str>) {
+pub(super) fn filters(q: &TimelineQuery) -> (Option<&str>, Option<&str>) {
     (q.org.as_deref(), q.runner.as_deref())
-}
-
-/// Local liveness edges — a runner's process state changing between two
-/// consecutive samples.
-///
-/// The first sample inside the window has no predecessor and so yields no edge:
-/// it establishes the baseline. A change that happened exactly at the window's
-/// opening tick is therefore attributed to before the window, which is the
-/// conservative direction — better to omit an edge we cannot date than to
-/// invent one from a value we never observed.
-fn liveness_edges(conn: &Connection, q: &TimelineQuery, limit: usize) -> Result<Vec<Transition>> {
-    let (org, runner) = filters(q);
-    let mut stmt = conn.prepare_cached(
-        "SELECT ts, org, name, prev, liveness FROM ( \
-             SELECT r.ts, r.org, r.name, r.liveness, \
-                    LAG(r.liveness) OVER (PARTITION BY r.org, r.agent_id ORDER BY r.ts) AS prev \
-             FROM runner_sample r \
-             WHERE r.ts >= ?1 AND (?2 IS NULL OR r.org = ?2) AND (?3 IS NULL OR r.name = ?3) \
-         ) WHERE prev IS NOT NULL AND prev <> liveness \
-         ORDER BY ts DESC LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(params![q.since_ts, org, runner, limit as i64], |r| {
-        let ts: i64 = r.get(0)?;
-        Ok(Transition {
-            ts,
-            at: to_rfc3339_utc(ts),
-            org: r.get(1)?,
-            edge: Edge::Liveness {
-                runner: r.get(2)?,
-                from: Liveness::from_db(&r.get::<_, String>(3)?),
-                to: Liveness::from_db(&r.get::<_, String>(4)?),
-            },
-        })
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-/// GitHub-side online edges, from the reconcile samples.
-///
-/// Derived from consecutive READINGS, not from the local tick grid: an edge
-/// means GitHub told us something different from last time it told us anything.
-/// A reconcile gap therefore produces no edge — we did not observe a change, we
-/// stopped observing, and those are different claims. The gap itself shows up as
-/// a `Reconcile` edge if the fetch failed, and as staleness in `--samples`.
-fn github_edges(conn: &Connection, q: &TimelineQuery, limit: usize) -> Result<Vec<Transition>> {
-    let (org, runner) = filters(q);
-    let mut stmt = conn.prepare_cached(
-        "SELECT ts, org, name, online FROM ( \
-             SELECT a.ts, a.org, a.name, a.online, \
-                    LAG(a.online) OVER (PARTITION BY a.org, a.agent_id ORDER BY a.ts) AS prev \
-             FROM api_runner_sample a \
-             WHERE a.ts >= ?1 AND (?2 IS NULL OR a.org = ?2) AND (?3 IS NULL OR a.name = ?3) \
-         ) WHERE prev IS NOT NULL AND prev <> online \
-         ORDER BY ts DESC LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(params![q.since_ts, org, runner, limit as i64], |r| {
-        let ts: i64 = r.get(0)?;
-        Ok(Transition {
-            ts,
-            at: to_rfc3339_utc(ts),
-            org: r.get(1)?,
-            edge: Edge::GithubOnline {
-                runner: r.get(2)?,
-                online: r.get::<_, i64>(3)? != 0,
-            },
-        })
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-/// Per-org reconcile edges — whether we were in a position to hold an opinion
-/// about GitHub at all.
-///
-/// `--runner` does NOT filter these out: they are the context that makes the
-/// runner's own edges readable. Narrowing to one runner instead narrows to the
-/// org(s) that runner belongs to, so the reply still answers "could we reach
-/// GitHub for this runner's org at the time".
-fn reconcile_edges(conn: &Connection, q: &TimelineQuery, limit: usize) -> Result<Vec<Transition>> {
-    let (org, runner) = filters(q);
-    let mut stmt = conn.prepare_cached(
-        "SELECT ts, org, ok, error_kind, http_status FROM ( \
-             SELECT s.ts, s.org, s.ok, s.error_kind, s.http_status, \
-                    LAG(s.ok) OVER (PARTITION BY s.org ORDER BY s.ts) AS prev \
-             FROM api_reconcile_sample s \
-             WHERE s.ts >= ?1 AND (?2 IS NULL OR s.org = ?2) \
-               AND (?3 IS NULL OR s.org IN \
-                    (SELECT DISTINCT org FROM runner_sample WHERE name = ?3)) \
-         ) WHERE prev IS NOT NULL AND prev <> ok \
-         ORDER BY ts DESC LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(params![q.since_ts, org, runner, limit as i64], |r| {
-        let ts: i64 = r.get(0)?;
-        let ok: i64 = r.get(2)?;
-        Ok(Transition {
-            ts,
-            at: to_rfc3339_utc(ts),
-            org: r.get(1)?,
-            edge: Edge::Reconcile(if ok != 0 {
-                ReconcileEdge::Recovered
-            } else {
-                ReconcileEdge::Failed {
-                    error_kind: r.get(3)?,
-                    http_status: r.get::<_, Option<i64>>(4)?.map(|v| v as u16),
-                }
-            }),
-        })
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 /// Raw per-tick rows: local liveness, plus GitHub's view AS OF that tick.
@@ -288,6 +146,7 @@ fn earliest_sample(conn: &Connection, q: &TimelineQuery) -> Result<Option<i64>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::timeline::{Edge, ReconcileEdge};
 
     fn mem_db() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
