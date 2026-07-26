@@ -422,6 +422,13 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
         // here rather than trusting the CLI's own cap is what keeps the bound
         // real — the socket is reachable by any local user, and `timeline` is
         // the first query whose natural answer is unbounded.
+        // Deliberately takes no window: the answer is a property of the store,
+        // so there is nothing for a caller to bound and nothing to clamp.
+        Query::Retention => with_db(conn, |c| {
+            wrap(reader::retention(c), |earliest_ts| Response::Retention {
+                earliest_ts,
+            })
+        }),
         Query::Timeline(q) => with_db(conn, |c| {
             let mut q = q.clone();
             q.limit = q.limit.min(MAX_TIMELINE_LIMIT);

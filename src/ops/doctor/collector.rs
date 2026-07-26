@@ -13,16 +13,10 @@
 use crate::ops::explain::Boundary;
 use crate::shared::ipc::client::{Client, EphemeralReason};
 use crate::shared::ipc::{self, Query, Request, Response};
-use crate::shared::models::timeline::TimelineQuery;
 use crate::shared::models::{FleetStatus, Verdict};
-use crate::shared::util::{BUILD_VERSION, now_epoch, to_rfc3339_utc};
+use crate::shared::util::{BUILD_VERSION, to_rfc3339_utc};
 
 use super::{Check, Outcome, skipped};
-
-/// How far back `doctor` looks when asking where the record starts. Only the
-/// window's `truncated_at` is read, so the limit is 1: this asks a question
-/// about retention, not for history.
-const HISTORY_PROBE_SECS: i64 = 7 * 86_400;
 
 /// Everything the collector can answer for: that it is there, that it speaks our
 /// wire version, and — if it does — what it knows about reconciles and history.
@@ -168,36 +162,33 @@ fn reconcile_check(s: &FleetStatus) -> Check {
     }
 }
 
-/// Where the retained record starts.
+/// Where the retained record starts. Pruning is manual, so this reports rather
+/// than judges.
 ///
-/// Asked through the existing `timeline` query rather than a new one: its window
-/// already reports `truncated_at` — where data begins when it begins after the
-/// window opens — which is exactly the retention question. Pruning is manual, so
-/// this reports rather than judges.
+/// Asked through [`Query::Retention`], which takes no window. It used to be read
+/// out of a 7-day `Timeline`'s `window.truncated_at`, and that framing cost the
+/// answer its meaning as well as its speed: a probe window can only ever say
+/// "the record starts HERE, or else somewhere before my horizon", so the honest
+/// answer required a horizon big enough to be expensive. Asking the store
+/// directly removes the horizon and the cost together — 8.13s to 0.25ms — and
+/// the reply is now an actual date in every case rather than in some of them.
 fn history_check(client: &mut Client) -> Check {
-    let query = TimelineQuery {
-        since_ts: now_epoch() - HISTORY_PROBE_SECS,
-        limit: 1,
-        org: None,
-        runner: None,
-        samples: false,
-    };
-    let outcome = match client.request(&Request::Query(Query::Timeline(query))) {
-        Ok(Response::Timeline(t)) => Outcome::Pass {
-            detail: match t.window.truncated_at {
+    let outcome = match client.request(&Request::Query(Query::Retention)) {
+        Ok(Response::Retention { earliest_ts }) => Outcome::Pass {
+            detail: match earliest_ts {
                 Some(first) => format!(
                     "the record starts {} — pruning is manual (`ghr-stats db prune --days N`)",
                     to_rfc3339_utc(first)
                 ),
-                None => format!(
-                    "the record covers the full {}d probe — pruning is manual \
-                     (`ghr-stats db prune --days N`)",
-                    HISTORY_PROBE_SECS / 86_400
-                ),
+                // Not a failure: this is also what a correct install looks like
+                // for its first few seconds. A collector that is up and still
+                // writing nothing is caught by the `collector` and `database`
+                // checks, which is where that judgement belongs.
+                None => "no samples retained yet — the collector has not written one".to_string(),
             },
         },
         _ => Outcome::Skipped {
-            why: "the collector did not answer a history query".to_string(),
+            why: "the collector did not answer a retention query".to_string(),
         },
     };
     Check {

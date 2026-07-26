@@ -66,6 +66,11 @@ use crate::shared::models::{
 ///     `github: Option<GhCount>`, which carries the population the count speaks
 ///     for — the occupancy chart's GitHub line is meaningless without its
 ///     denominator on a fleet that holds runners GitHub is never asked about.
+///     Also `Retention` — where the record starts, as its own question. It was
+///     first answered by reading `Timeline.window.truncated_at`, which meant
+///     `doctor` derived every edge across a 7-day window (8.13s on a 1.1 GiB
+///     database) to read one nullable timestamp a covering index answers in
+///     0.25ms. A cheap fact deserves a cheap question.
 pub const VERSION: u16 = 10;
 
 /// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
@@ -120,6 +125,10 @@ pub enum Query {
     /// The only query about a span rather than an instant, and the only one
     /// whose caller states a bound — see [`TimelineQuery`].
     Timeline(TimelineQuery),
+    /// Where the retained record starts. Takes no window BY DESIGN: the answer
+    /// is a property of the store, not of any span, and asking it through
+    /// [`Query::Timeline`] made a `min(ts)` cost a full edge derivation.
+    Retention,
     /// Persisted per-runner liveness edges (survive restarts) — for the "For"
     /// duration. Falls back to the TUI's in-memory edge when absent.
     RunnerStates,
@@ -208,6 +217,14 @@ pub enum Response {
     /// as large as its largest arm — unboxed, every small reply would carry the
     /// cost of the biggest one.
     Timeline(Box<Timeline>),
+    /// The oldest retained sample, or `None` when nothing has been sampled yet.
+    ///
+    /// A bare timestamp rather than a computed "days of history": retention is
+    /// reported, never judged (pruning is manual), and the caller that renders
+    /// it is better placed than the collector to decide what it means.
+    Retention {
+        earliest_ts: Option<i64>,
+    },
     /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
     /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),

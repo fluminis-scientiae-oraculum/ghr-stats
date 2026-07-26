@@ -284,6 +284,24 @@ pub fn latest_host(conn: &Connection) -> Result<Option<HostPoint>> {
     Ok(host_series(conn, 1)?.pop())
 }
 
+/// The oldest retained sample, or `None` when nothing has been sampled yet.
+///
+/// `runner_sample` alone, not a union across every `*_sample` table: they are
+/// pruned together by `db prune`, and runners are the series that exists on
+/// every deployment — a host with metrics disabled still samples runners. A
+/// union would trade a covering-index probe for a scan per table to sharpen an
+/// answer nobody reads that precisely.
+///
+/// The cheapness is the point. This fact was previously read out of
+/// [`timeline::timeline`]'s `window.truncated_at`, which meant deriving every
+/// edge across the caller's window: 8.13s for the 7 days `doctor` asked for, on
+/// a 1.1 GiB / 8.1M-row database. `min(ts)` over `idx_runner_sample_ts` is a
+/// covering-index search — 0.25ms on the same table.
+pub fn retention(conn: &Connection) -> Result<Option<i64>> {
+    conn.query_row("SELECT min(ts) FROM runner_sample", [], |r| r.get(0))
+        .map_err(Into::into)
+}
+
 /// Completed jobs whose pass/fail conclusion has not yet been resolved from the
 /// API — the reconcile's work-list. Newest completions first; bounded so a large
 /// backlog is drained a batch at a time. Only rows that carry an `org` + `repo`
@@ -351,6 +369,33 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::service::store::schema_for_test(&mut conn);
         conn
+    }
+
+    /// An empty store must answer "nothing yet" rather than a zero timestamp —
+    /// `doctor` renders this, and 1970 is not a retention window.
+    #[test]
+    fn retention_of_an_empty_store_is_none_not_zero() {
+        assert_eq!(retention(&mem_db()).unwrap(), None);
+    }
+
+    /// The OLDEST sample, not the newest, and unaffected by which runner or org
+    /// wrote it: retention is a property of the store, not of any one series.
+    #[test]
+    fn retention_is_the_oldest_sample_across_every_runner() {
+        let conn = mem_db();
+        for (ts, name, org) in [
+            (900, "b", "org-b"),
+            (300, "a", "org-a"),
+            (600, "c", "org-a"),
+        ] {
+            conn.execute(
+                "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, cpu_pct, mem_bytes, dir) \
+                 VALUES (?1, 7, ?2, ?3, 'idle', 1.0, 1024, '/srv/r7')",
+                params![ts, name, org],
+            )
+            .unwrap();
+        }
+        assert_eq!(retention(&conn).unwrap(), Some(300));
     }
 
     #[test]

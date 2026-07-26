@@ -209,6 +209,9 @@ fn read_timeout(req: &Request) -> Duration {
             | Query::LatestJob { .. }
             | Query::LatestApiRunners
             | Query::FleetStatus
+            // A covering-index `min(ts)`. It answers about the whole record but
+            // does not SCAN it, which is the distinction that matters here.
+            | Query::Retention
             | Query::RunnerStates
             | Query::ConfiguredTokenOrgs,
         ) => IO_TIMEOUT,

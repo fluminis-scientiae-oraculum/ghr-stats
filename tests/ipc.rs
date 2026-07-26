@@ -244,6 +244,29 @@ fn queries_are_answered_without_authorization() {
     );
 }
 
+/// `Retention` over the real wire, on a collector whose database is brand new.
+///
+/// The empty case is the one worth pinning end to end: a fresh store must answer
+/// `null` rather than `0`, because `doctor` renders this straight to an operator
+/// and a 1970 timestamp would read as a real retention window rather than as
+/// "nothing sampled yet". It also proves the variant is serialized as a struct
+/// with a named field, which a unit test on the reader alone cannot show.
+#[test]
+fn retention_reports_an_empty_record_as_null_rather_than_epoch_zero() {
+    let c = Collector::start("retention");
+    let mut s = c.session();
+
+    let r = round_trip(&mut s, &json!({"Query": "Retention"}));
+    assert!(
+        r.get("Retention").is_some(),
+        "expected a Retention reply, got: {r}"
+    );
+    assert!(
+        r["Retention"]["earliest_ts"].is_null(),
+        "a store with no samples must answer null, not a timestamp: {r}"
+    );
+}
+
 /// The mutation gate, and — when this caller passes it — that a persisted
 /// mutation actually reaches the config file. The reload is the whole point of
 /// routing config edits through the collector rather than writing `/etc`
