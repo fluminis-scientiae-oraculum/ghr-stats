@@ -71,6 +71,10 @@ impl RunnerMetric {
 struct OrgRollup {
     org: String,
     total: u32,
+    /// Runners for which GitHub's view is FRESH — i.e. an opinion we may hold.
+    /// Distinct from `total`, because a runner we cannot currently see is not a
+    /// runner GitHub reports as offline.
+    github_known: u32,
     github_online: u32,
 }
 
@@ -160,19 +164,26 @@ impl Snapshot {
 
         // Per-org totals. Only FRESH readings count as online — a stale row must
         // not inflate an org's health.
-        let mut by_org: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
+        let mut by_org: BTreeMap<&str, (u32, u32, u32)> = BTreeMap::new();
         for r in &runners {
             let e = by_org.entry(r.org.as_str()).or_default();
             e.0 += 1;
-            if r.gh.online() == Some(true) {
+            // A reading we HAVE counts toward `known`; only a positive one
+            // counts toward `online`. `None` is neither — it is the absence the
+            // verdict must not read as a failure.
+            if let Some(online) = r.gh.online() {
                 e.1 += 1;
+                if online {
+                    e.2 += 1;
+                }
             }
         }
         let orgs = by_org
             .into_iter()
-            .map(|(org, (total, github_online))| OrgRollup {
+            .map(|(org, (total, github_known, github_online))| OrgRollup {
                 org: org.to_string(),
                 total,
+                github_known,
                 github_online,
             })
             .collect();

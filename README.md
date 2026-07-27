@@ -1,5 +1,16 @@
 # ghr-stats
 
+```text
+     ___ _  _ ___     ___ _____ _ _____ ___
+    / __| || | _ \___/ __|_   _/_\_   _/ __|
+   | (_ | __ |   /___\__ \ | |/ _ \| | \__ \
+    \___|_||_|_|_\   |___/ |_/_/ \_\_| |___/
+
+   ● ● ○ ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ● ○ ○ ○ ○ ○ ○ ○ ○ ×
+   └               └                             └
+   busy            idle                          offline
+```
+
 [![crates.io](https://img.shields.io/crates/v/fso-ghr-stats.svg?logo=rust)](https://crates.io/crates/fso-ghr-stats)
 [![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue?logo=rust)](https://releases.rs)
 [![License: MIT](https://img.shields.io/crates/l/fso-ghr-stats.svg)](LICENSE)
