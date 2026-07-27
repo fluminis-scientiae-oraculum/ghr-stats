@@ -82,6 +82,13 @@ per-org reconcile health, and a `verdict`. Filtering recomputes the verdict over
 the surviving rows, so `--org healthy-org` does not inherit another org's
 "degraded".
 
+Each entry in `orgs` carries its own `verdict`, judged only from readings we
+actually have. An org with no fresh GitHub reading for any of its runners — no
+PAT, a broken token, a reconcile gap — is `unknown`, never `degraded`: the same
+rule as exit `2` above, applied per org. `reconcile_age_s` is `null` for an org
+that has never reconciled, and is the field to branch on if you need to tell
+"never asked" from "asked recently".
+
 With no collector it falls back to a live local scan, reports
 `mode: "ephemeral"`, and sets every `github_*` field to `null` — a local scan can
 see processes, never GitHub.
