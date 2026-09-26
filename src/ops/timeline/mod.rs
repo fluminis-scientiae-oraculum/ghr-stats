@@ -17,7 +17,7 @@ pub(crate) mod since;
 
 use render::human;
 
-/// Bounds one call's output, not storage (`db prune` keeps 14 days by default).
+/// Bounds one call's output, not storage.
 const MAX_WINDOW_SECS: u64 = 7 * 86_400;
 
 pub(crate) enum Availability {

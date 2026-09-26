@@ -162,7 +162,7 @@ pub enum Command {
         completions.\n\n\
         --since is capped at 7d, --limit applies to each section, and a section that was cut \
         says so. Raw per-tick samples are included only with --samples; a window reaching past \
-        what `db prune` kept reports truncated_at.\n\n\
+        what retention kept reports truncated_at.\n\n\
         History lives only in the collector: with no collector this exits 2 (cannot \
         determine). Exits 0 when the window was answered, 3 on a usage error."
     )]

@@ -128,15 +128,12 @@ fn reconcile_check(s: &FleetStatus, max_age: u64) -> Check {
     }
 }
 
-/// Pruning is manual, so this reports rather than judges.
+/// Reports where the record starts; retention decides that, so nothing here fails.
 fn history_check(client: &mut Client) -> Check {
     let outcome = match client.request(&Request::Query(Query::Retention)) {
         Ok(Response::Retention { earliest_ts }) => Outcome::Pass {
             detail: match earliest_ts {
-                Some(first) => format!(
-                    "the record starts {} — pruning is manual (`ghr-stats db prune --days N`)",
-                    to_rfc3339_utc(first)
-                ),
+                Some(first) => format!("the record starts {}", to_rfc3339_utc(first)),
                 // Not a failure: a fresh install looks like this for its first seconds.
                 None => "no samples retained yet — the collector has not written one".to_string(),
             },
