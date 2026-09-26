@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::shared::error::Result;
 use crate::shared::models::{JobRow, PendingConclusion};
@@ -33,22 +33,26 @@ pub fn ingest_offsets(conn: &Connection) -> Result<HashMap<String, u64>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+const JOB_ROW: &str = "SELECT runner_name, repo, job, started_at, completed_at, conclusion \
+                       FROM job_event";
+
+fn job_row(r: &Row<'_>) -> rusqlite::Result<JobRow> {
+    Ok(JobRow {
+        runner_name: r.get(0)?,
+        repo: r.get(1)?,
+        job: r.get(2)?,
+        started_at: r.get(3)?,
+        completed_at: r.get(4)?,
+        conclusion: r.get(5)?,
+    })
+}
+
 /// Most recent jobs, newest first (by start, falling back to completion).
 pub fn recent_jobs(conn: &Connection, limit: usize) -> Result<Vec<JobRow>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT runner_name, repo, job, started_at, completed_at, conclusion \
-         FROM job_event ORDER BY COALESCE(started_at, completed_at) DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit as i64], |r| {
-        Ok(JobRow {
-            runner_name: r.get(0)?,
-            repo: r.get(1)?,
-            job: r.get(2)?,
-            started_at: r.get(3)?,
-            completed_at: r.get(4)?,
-            conclusion: r.get(5)?,
-        })
-    })?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "{JOB_ROW} ORDER BY COALESCE(started_at, completed_at) DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit as i64], job_row)?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
@@ -93,20 +97,12 @@ pub fn job_counts(conn: &Connection) -> Result<(i64, i64)> {
 /// than a bare "—". Local hook timing — immediate.
 pub fn latest_job(conn: &Connection, runner_name: &str) -> Result<Option<JobRow>> {
     conn.query_row(
-        "SELECT runner_name, repo, job, started_at, completed_at, conclusion \
-         FROM job_event WHERE runner_name = ?1 \
-         ORDER BY COALESCE(started_at, completed_at) DESC LIMIT 1",
+        &format!(
+            "{JOB_ROW} WHERE runner_name = ?1 \
+             ORDER BY COALESCE(started_at, completed_at) DESC LIMIT 1"
+        ),
         params![runner_name],
-        |r| {
-            Ok(JobRow {
-                runner_name: r.get(0)?,
-                repo: r.get(1)?,
-                job: r.get(2)?,
-                started_at: r.get(3)?,
-                completed_at: r.get(4)?,
-                conclusion: r.get(5)?,
-            })
-        },
+        job_row,
     )
     .optional()
     .map_err(Into::into)

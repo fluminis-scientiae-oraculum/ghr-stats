@@ -1,5 +1,5 @@
 ---
-source: src/tui/widgets/wizard.rs
+source: src/tui/overlay/wizard.rs
 expression: render(&mode)
 ---
 "                                                                                "

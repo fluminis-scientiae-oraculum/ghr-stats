@@ -9,33 +9,23 @@ use rusqlite::Connection;
 
 use crate::shared::error::Result;
 
-/// Owns the SQLite connection. Opened in WAL mode so the collector can write
-/// while the TUI reads concurrently, without lock contention.
-pub struct Store {
-    conn: Connection,
-}
-
-impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;
-             PRAGMA foreign_keys=ON;",
-        )?;
-        schema::migrate(&mut conn)?;
-        Ok(Self { conn })
+/// Open the collector's writer connection (WAL, so readers never block it) and
+/// migrate the schema.
+pub fn open_writer(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
-
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
+    let mut conn = Connection::open(path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA foreign_keys=ON;",
+    )?;
+    schema::migrate(&mut conn)?;
+    Ok(conn)
 }
 
 /// Open a second, non-writer WAL connection for a background reader (the metrics

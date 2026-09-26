@@ -52,9 +52,9 @@ use crate::shared::hooks::install::HookStatus;
 use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, Mode};
 use crate::shared::paths::Scope;
-use crate::tui::history::{DataSource, Rings};
 use crate::tui::input::action::{ActionKind, RecycleRunner, RestartRunner};
-use crate::tui::widgets::wizard::WizardMode;
+use crate::tui::overlay::wizard::WizardMode;
+use crate::tui::source::{DataSource, Rings};
 
 mod mutate;
 mod nav;

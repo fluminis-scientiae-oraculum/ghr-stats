@@ -66,7 +66,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("state   "),
             Span::styled(label, Style::new().fg(color)),
             Span::raw(since),
-            Span::raw(format!("    hook {}", r.hook.glyph())),
+            Span::raw(format!("    hook {}", super::fmt::hook_glyph(r.hook))),
         ]),
         Line::from(format!(
             "group   {}",

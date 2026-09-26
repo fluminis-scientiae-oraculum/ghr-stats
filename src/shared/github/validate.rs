@@ -19,7 +19,7 @@ const GUIDANCE: &str = "use a FINE-GRAINED token (github_pat_…) with Organizat
      Self-hosted runners: Read (+ Repository → Actions: Read for job results)";
 
 /// The result of validating a PAT for an org.
-pub(crate) enum Verdict {
+pub(crate) enum PatCheck {
     /// Authenticated; `matched` of `local` discovered runners were confirmed.
     Valid {
         runners: usize,
@@ -43,20 +43,20 @@ pub(crate) fn prefix_check(token: &str) -> Result<(), String> {
 
 /// Full validation: prefix gate, then read the org's runners and agentId-confirm
 /// against the locally-discovered runners.
-pub(crate) fn validate(token: &str, org: &str, local_ids: &HashSet<i64>) -> Verdict {
+pub(crate) fn validate(token: &str, org: &str, local_ids: &HashSet<i64>) -> PatCheck {
     if let Err(g) = prefix_check(token) {
-        return Verdict::Rejected(g);
+        return PatCheck::Rejected(g);
     }
     match list_org_runners(token, org) {
         Ok(api) => {
             let matched = api.iter().filter(|r| local_ids.contains(&r.id)).count();
-            Verdict::Valid {
+            PatCheck::Valid {
                 runners: api.len(),
                 matched,
                 local: local_ids.len(),
             }
         }
-        Err(e) => Verdict::Rejected(e.to_string()),
+        Err(e) => PatCheck::Rejected(e.to_string()),
     }
 }
 

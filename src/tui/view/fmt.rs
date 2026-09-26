@@ -14,6 +14,8 @@
 //! [`liveness_label`] pairs the word with its colour in one place, so the two can
 //! never disagree across views.
 
+use crate::shared::hooks::install::HookStatus;
+pub(crate) use crate::shared::util::fmt_bytes;
 use ratatui::style::Color;
 
 use crate::shared::models::Liveness;
@@ -34,21 +36,6 @@ pub(crate) fn ellipsize_middle(s: &str, max: usize) -> String {
     let h: String = chars[..head].iter().collect();
     let t: String = chars[chars.len() - tail..].iter().collect();
     format!("{h}…{t}")
-}
-
-/// Human-readable byte size (binary units).
-pub(crate) fn fmt_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut v = bytes as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    format!("{v:.1} {}", UNITS[i])
 }
 
 pub(crate) fn fmt_opt_bytes(bytes: Option<u64>) -> String {
@@ -123,15 +110,21 @@ pub(super) fn rel_label(ts: i64, now: i64) -> String {
     }
 }
 
+/// ✓ / ✗ / ? for a runner's hook wiring.
+pub(crate) fn hook_glyph(h: HookStatus) -> &'static str {
+    match h {
+        HookStatus::Ours => "✓",
+        HookStatus::Foreign | HookStatus::Unset => "✗",
+        HookStatus::Unreadable => "?",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn byte_formatting() {
-        assert_eq!(fmt_bytes(512), "512 B");
-        assert_eq!(fmt_bytes(1024), "1.0 KiB");
-        assert_eq!(fmt_bytes(1_572_864), "1.5 MiB");
         assert_eq!(fmt_opt_bytes(None), "—");
     }
 

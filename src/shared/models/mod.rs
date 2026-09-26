@@ -121,7 +121,6 @@ pub struct RunnerSample {
     pub name: String,
     pub org: String,
     pub liveness: Liveness,
-    pub current_run_id: Option<i64>,
     pub cpu_pct: Option<f32>,
     /// Working-set memory (anon+shmem).
     pub mem_bytes: Option<u64>,

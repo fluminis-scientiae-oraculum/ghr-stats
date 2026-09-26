@@ -94,7 +94,7 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     println!("  hook scripts → {}", our_dir.display());
 
     for r in discovered {
-        match install::detect(&r.dir, &our_dir) {
+        match install::detect(&r.dir, std::slice::from_ref(&our_dir)) {
             HookStatus::Ours => repair_event_log(r),
             HookStatus::Unreadable => println!(
                 "  ? {} — .env not readable; re-run as the runner user or root",

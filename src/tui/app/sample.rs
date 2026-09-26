@@ -78,9 +78,7 @@ impl App {
             // liveness edge, and the sparkline ring. Key all per-runner local
             // state by `dirkey`; join GitHub's view by `(org, agent_id)`.
             let dirkey = p.info.dir.to_string_lossy().into_owned();
-            let cpu_pct = self
-                .cpu
-                .rate(p.info.dir.clone(), p.cpu_usage_usec, sampled_at);
+            let cpu_pct = self.cpu.rate(&p.info.dir, p.cpu_usage_usec, sampled_at);
             // Feed the Ephemeral-mode sparkline ring from the same live sample.
             self.rings.push_runner(
                 dirkey.clone(),
@@ -118,7 +116,7 @@ impl App {
                     .copied()
                     .unwrap_or(GhView::Unknown),
                 state_seconds: Some((now - since).max(0)),
-                hook: install::detect_in(&p.info.dir, &our_dirs),
+                hook: install::detect(&p.info.dir, &our_dirs),
                 work_folder: p.info.work_folder,
                 agent_id: id,
                 name: p.info.name,

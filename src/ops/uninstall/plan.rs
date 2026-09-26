@@ -17,9 +17,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::hooks::{self as hook_revert};
 use crate::shared::collectors::runners;
 use crate::shared::hooks::install;
-use crate::shared::hooks::uninstall::{self as hook_revert};
 use crate::shared::paths::{self, Scope};
 
 use super::{ConfigItem, Domains, Plan};

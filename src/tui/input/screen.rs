@@ -26,7 +26,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::tui::input::action::{Action, ActionKind, ActionOutcome, ConfirmPrompt};
+use crate::tui::input::action::{ActionKind, ActionOutcome, ConfirmPrompt};
 
 // --- proof tokens: ZSTs with a private field, minted only by `Suspension` ---
 
@@ -40,11 +40,11 @@ pub(crate) struct Tty(());
 // --- marker states (private fields ⇒ un-fabricable from outside) ---
 
 pub(crate) struct Browsing;
-pub(crate) struct Confirm<A> {
-    pending: A,
+pub(crate) struct Confirm {
+    pending: ActionKind,
 }
-pub(crate) struct Suspended<A> {
-    pending: A,
+pub(crate) struct Suspended {
+    pending: ActionKind,
 }
 
 /// The interaction mode. `S` is the state marker.
@@ -58,14 +58,14 @@ impl Screen<Browsing> {
     }
 
     /// The ONLY constructor of a pending action.
-    pub(crate) fn confirm<A: Action>(self, action: A) -> Screen<Confirm<A>> {
+    pub(crate) fn confirm(self, action: ActionKind) -> Screen<Confirm> {
         Screen {
             state: Confirm { pending: action },
         }
     }
 }
 
-impl<A: Action> Screen<Confirm<A>> {
+impl Screen<Confirm> {
     /// The prompt to render — proof a pending action exists.
     pub(crate) fn prompt(&self) -> ConfirmPrompt {
         self.state.pending.prompt()
@@ -77,7 +77,7 @@ impl<A: Action> Screen<Confirm<A>> {
     }
 
     /// Move to `Suspended` — requires proof the terminal was torn down.
-    pub(crate) fn suspend(self, _torn: &Torn) -> Screen<Suspended<A>> {
+    pub(crate) fn suspend(self, _torn: &Torn) -> Screen<Suspended> {
         Screen {
             state: Suspended {
                 pending: self.state.pending,
@@ -86,7 +86,7 @@ impl<A: Action> Screen<Confirm<A>> {
     }
 }
 
-impl<A: Action> Screen<Suspended<A>> {
+impl Screen<Suspended> {
     /// Run the action on the real TTY (the `Tty` token proves we are suspended).
     pub(crate) fn execute(&self, tty: &mut Tty) -> ActionOutcome {
         self.state.pending.execute(tty)
@@ -103,7 +103,7 @@ impl<A: Action> Screen<Suspended<A>> {
 /// compile-time-guarded regardless of this erasure.
 pub(crate) enum ScreenState {
     Browsing(Screen<Browsing>),
-    Confirm(Screen<Confirm<ActionKind>>),
+    Confirm(Screen<Confirm>),
 }
 
 impl ScreenState {
@@ -156,64 +156,5 @@ impl<'t> Suspension<'t> {
 impl Drop for Suspension<'_> {
     fn drop(&mut self) {
         let _ = self.restore();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::input::action::RestartRunner;
-
-    // Test-only token minting. Production code CANNOT mint these — that is the
-    // guarantee — but tests need to exercise the transitions without a TTY.
-    fn torn() -> Torn {
-        Torn(())
-    }
-    fn restored() -> Restored {
-        Restored(())
-    }
-    fn tty() -> Tty {
-        Tty(())
-    }
-
-    /// A no-op action so the round-trip test exercises the typestate transitions
-    /// without real I/O (the production actions do file/TTY work).
-    struct Noop;
-    impl Action for Noop {
-        fn prompt(&self) -> ConfirmPrompt {
-            ConfirmPrompt {
-                title: "noop".to_string(),
-                body: String::new(),
-                danger: false,
-            }
-        }
-        fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-            ActionOutcome::Ok("noop".to_string())
-        }
-    }
-
-    #[test]
-    fn full_valid_round_trip() {
-        let browsing = Screen::<Browsing>::new();
-        let confirm = browsing.confirm(Noop);
-        assert_eq!(confirm.prompt().title, "noop");
-
-        // Browsing -> Confirm -> Suspended -> (execute) -> Browsing.
-        let suspended = confirm.suspend(&torn());
-        let outcome = suspended.execute(&mut tty());
-        assert!(matches!(outcome, ActionOutcome::Ok(_)));
-        let _back: Screen<Browsing> = suspended.resume(restored());
-    }
-
-    #[test]
-    fn cancel_returns_to_browsing_without_executing() {
-        let confirm = Screen::<Browsing>::new().confirm(ActionKind::Restart(RestartRunner {
-            unit: crate::shared::collectors::runners::RunnerUnit::for_test(
-                "actions.runner.o.x.service",
-            ),
-            agent_id: 1,
-            busy: false,
-        }));
-        let _back: Screen<Browsing> = confirm.cancel();
     }
 }

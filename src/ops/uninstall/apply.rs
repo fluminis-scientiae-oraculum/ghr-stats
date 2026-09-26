@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
+use super::hooks::{self as hook_revert, RunnerHookPlan};
 use crate::ops::systemd;
-use crate::shared::hooks::uninstall::{self as hook_revert, RunnerHookPlan};
 use crate::shared::hooks::{env, install};
 use crate::shared::privileged;
 

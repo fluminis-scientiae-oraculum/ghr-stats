@@ -174,7 +174,7 @@ mod tests {
         let original = "TMPDIR=/var/tmp/runner\n\
                         ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup-started.sh\n\
                         ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup-completed.sh\n";
-        // Install's chain step (mirrors ops::wizard::chain_for).
+        // Install's chain step (mirrors ops::configure::chain_for).
         let (orig_started, orig_completed) = current_hook_paths(original);
         let wrap_started = our().join("chain-runner-01-started.sh");
         let wrap_completed = our().join("chain-runner-01-completed.sh");
@@ -182,7 +182,7 @@ mod tests {
         let wc = render_chain_wrapper(Path::new(&orig_completed.unwrap()), &wrap_completed);
         let event_log = our().join("../runner-01/.ghr-stats-events.ndjson");
         let installed = rewrite_env(original, &wrap_started, &wrap_completed, Some(&event_log));
-        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
+        assert_eq!(classify(&installed, &[our()]), HookStatus::Ours);
 
         // Uninstall reversal: recover the originals from the wrappers, restore.
         // `None` for the event log strips the var we injected, so the operator's

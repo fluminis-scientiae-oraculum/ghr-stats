@@ -1,10 +1,9 @@
+pub mod configure;
 pub mod doctor;
 pub mod explain;
-pub mod poll;
 pub mod status;
 pub mod systemd;
 pub mod tail;
 pub mod timeline;
 pub mod uninstall;
 pub mod wait;
-pub mod wizard;

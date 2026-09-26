@@ -17,7 +17,7 @@ use crate::cli::DoctorArgs;
 use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
-use crate::shared::github::validate::{self, Verdict as PatVerdict};
+use crate::shared::github::validate::{self, PatCheck};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
@@ -207,7 +207,11 @@ fn runner_roots_check(cfg: &Config, found: usize) -> Check {
 fn database_check(cfg: &Config) -> Check {
     let outcome = match std::fs::metadata(&cfg.db_path) {
         Ok(m) => Outcome::Pass {
-            detail: format!("{} — {}", cfg.db_path.display(), human_bytes(m.len())),
+            detail: format!(
+                "{} — {}",
+                cfg.db_path.display(),
+                crate::shared::util::fmt_bytes(m.len())
+            ),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outcome::Fail {
             detail: format!("no database at {}", cfg.db_path.display()),
@@ -238,7 +242,7 @@ fn hooks_check(discovered: &[RunnerInfo]) -> Check {
     let mut unset = Vec::new();
     let mut unreadable = Vec::new();
     for r in discovered {
-        match install::detect_in(&r.dir, &our_dirs) {
+        match install::detect(&r.dir, &our_dirs) {
             HookStatus::Ours => ours += 1,
             HookStatus::Foreign => foreign.push(r.name.clone()),
             HookStatus::Unset => unset.push(r.name.clone()),
@@ -329,11 +333,11 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
             continue;
         };
         match validate::validate(&token, org, &local_ids) {
-            PatVerdict::Valid {
+            PatCheck::Valid {
                 runners, matched, ..
             } => ok.push(format!("{org} ({matched}/{runners} runners confirmed)")),
             // The reason is the API's own — never the token.
-            PatVerdict::Rejected(why) => rejected.push(format!("{org}: {why}")),
+            PatCheck::Rejected(why) => rejected.push(format!("{org}: {why}")),
         }
     }
 
@@ -364,23 +368,6 @@ pub(super) fn org_names(cfg: &Config, discovered: &[RunnerInfo]) -> Vec<String> 
     let mut orgs: BTreeSet<String> = cfg.orgs.iter().cloned().collect();
     orgs.extend(discovered.iter().map(|r| r.org.clone()));
     orgs.into_iter().collect()
-}
-
-/// Bytes at human scale — a database size is read by a person deciding whether
-/// to prune, not parsed.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut v = n as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
-    }
 }
 
 #[cfg(test)]
@@ -436,11 +423,5 @@ mod tests {
             Outcome::Fail { fix, .. } => assert!(fix.contains("ghr-stats config"), "{fix}"),
             other => panic!("expected a failure, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn bytes_render_at_human_scale() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1_213_259_776), "1.1 GiB");
     }
 }

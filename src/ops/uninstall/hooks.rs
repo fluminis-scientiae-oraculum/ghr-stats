@@ -134,7 +134,7 @@ pub(crate) fn plan_runner(r: &RunnerInfo, our_dir: &Path) -> RunnerHookPlan {
 fn plan_action(text: &str, our_dir: &Path) -> RevertAction {
     match classify_revert(text, our_dir) {
         RevertKind::NotManaged => RevertAction::Leave {
-            why: match install::classify(text, our_dir) {
+            why: match install::classify(text, std::slice::from_ref(&our_dir.to_path_buf())) {
                 HookStatus::Unset => "no ghr-stats hook (unset)".to_string(),
                 _ => "foreign hook — left untouched (not ours)".to_string(),
             },

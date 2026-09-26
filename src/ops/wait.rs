@@ -28,7 +28,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::WaitArgs;
-use crate::ops::poll::remaining;
 use crate::ops::status::{Snapshot, Source};
 use crate::shared::config::Config;
 use crate::shared::models::FleetStatus;
@@ -136,7 +135,11 @@ pub fn run(args: &WaitArgs, cfg: &Config) -> Result<Outcome> {
         }
         // Never sleep past the deadline: the remaining wait is the shorter of
         // the poll cadence and the time actually left.
-        std::thread::sleep(remaining(started.elapsed(), interval).min(deadline - now));
+        std::thread::sleep(
+            interval
+                .saturating_sub(started.elapsed())
+                .min(deadline - now),
+        );
     }
 }
 

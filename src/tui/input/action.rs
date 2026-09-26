@@ -42,13 +42,6 @@ impl ActionOutcome {
     }
 }
 
-/// An action with a confirm prompt and an execution that runs on the real TTY.
-/// Object-safe by construction (`&self`, no associated types).
-pub(crate) trait Action {
-    fn prompt(&self) -> ConfirmPrompt;
-    fn execute(&self, tty: &mut Tty) -> ActionOutcome;
-}
-
 /// Bounce a runner's service to reclaim the .NET-runner GC RAM.
 pub(crate) struct RestartRunner {
     pub unit: RunnerUnit,
@@ -126,7 +119,7 @@ impl RecycleRunner {
     }
 }
 
-impl Action for RestartRunner {
+impl RestartRunner {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: format!("Restart {} (#{})", self.unit, self.agent_id),
@@ -141,7 +134,7 @@ impl Action for RestartRunner {
             danger: self.busy,
         }
     }
-    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
+    fn execute(&self) -> ActionOutcome {
         match privileged::run(&self.call()) {
             Outcome::Ok => ActionOutcome::Ok(format!("restarted {}", self.unit)),
             other => ActionOutcome::Failed(other.describe("restart")),
@@ -149,7 +142,7 @@ impl Action for RestartRunner {
     }
 }
 
-impl Action for RecycleRunner {
+impl RecycleRunner {
     fn prompt(&self) -> ConfirmPrompt {
         let (temp, diag) = self.scoped_paths();
         ConfirmPrompt {
@@ -163,7 +156,7 @@ impl Action for RecycleRunner {
             danger: true,
         }
     }
-    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
+    fn execute(&self) -> ActionOutcome {
         match self.recycle() {
             Ok(()) => ActionOutcome::Ok(format!("recycled {}", self.unit)),
             Err(why) => ActionOutcome::Failed(format!("recycle: {why}")),
@@ -180,7 +173,7 @@ pub(crate) struct InstallHooks {
     pub roots: Vec<PathBuf>,
 }
 
-impl Action for InstallHooks {
+impl InstallHooks {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: "Install runner hooks".to_string(),
@@ -191,8 +184,8 @@ impl Action for InstallHooks {
             danger: false,
         }
     }
-    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
-        match crate::ops::wizard::install_hooks_for_tui(&self.roots) {
+    fn execute(&self) -> ActionOutcome {
+        match crate::ops::configure::install_hooks_for_tui(&self.roots) {
             Ok(()) => ActionOutcome::Ok("hook install/repair finished (see terminal)".to_string()),
             Err(e) => ActionOutcome::Failed(e.to_string()),
         }
@@ -204,7 +197,7 @@ pub(crate) struct OpenConfig {
     pub path: PathBuf,
 }
 
-impl Action for OpenConfig {
+impl OpenConfig {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: "Open config".to_string(),
@@ -215,7 +208,7 @@ impl Action for OpenConfig {
             danger: false,
         }
     }
-    fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
+    fn execute(&self) -> ActionOutcome {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         match std::process::Command::new(&editor).arg(&self.path).status() {
             Ok(s) if s.success() => ActionOutcome::Ok(format!("edited {}", self.path.display())),
@@ -227,10 +220,8 @@ impl Action for OpenConfig {
     }
 }
 
-/// Closed erasure of the suspend-to-TTY action set for the loop's `ScreenState`
-/// — zero heap, zero vtable, exhaustive. (`Box<dyn Action>` is a drop-in if it
-/// opens.) Adding an org / toggling metrics are NOT here: those are native,
-/// no-teardown surfaces (see `tui::widgets::wizard` and `App::toggle_metrics`).
+/// The actions that suspend the TUI to run on the real terminal. Adding an org
+/// and toggling metrics are not here: they run without leaving the dashboard.
 pub(crate) enum ActionKind {
     Restart(RestartRunner),
     Recycle(RecycleRunner),
@@ -238,8 +229,8 @@ pub(crate) enum ActionKind {
     OpenConfig(OpenConfig),
 }
 
-impl Action for ActionKind {
-    fn prompt(&self) -> ConfirmPrompt {
+impl ActionKind {
+    pub(crate) fn prompt(&self) -> ConfirmPrompt {
         match self {
             ActionKind::Restart(a) => a.prompt(),
             ActionKind::Recycle(a) => a.prompt(),
@@ -247,12 +238,14 @@ impl Action for ActionKind {
             ActionKind::OpenConfig(a) => a.prompt(),
         }
     }
-    fn execute(&self, tty: &mut Tty) -> ActionOutcome {
+
+    /// Runs on the real terminal; the `Tty` token proves the TUI is suspended.
+    pub(crate) fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
         match self {
-            ActionKind::Restart(a) => a.execute(tty),
-            ActionKind::Recycle(a) => a.execute(tty),
-            ActionKind::InstallHooks(a) => a.execute(tty),
-            ActionKind::OpenConfig(a) => a.execute(tty),
+            ActionKind::Restart(a) => a.execute(),
+            ActionKind::Recycle(a) => a.execute(),
+            ActionKind::InstallHooks(a) => a.execute(),
+            ActionKind::OpenConfig(a) => a.execute(),
         }
     }
 }

@@ -179,30 +179,14 @@ fn the_handshake_reports_both_the_wire_and_the_build_version() {
     assert!(!version.is_empty(), "no collector build version: {reply}");
 }
 
-/// The handshake REPORTS; it does not negotiate.
-///
-/// The collector answers with its own version whatever the client claims, and
-/// deciding whether that is acceptable is the client's job. Worth pinning
-/// because the opposite is the natural assumption — this test was first written
-/// expecting a `VersionMismatch` reply, which the collector never sends. The
-/// design is deliberate: the server cannot know which request shapes a differing
-/// client will actually use, and reporting its version unconditionally is what
-/// lets the client produce `version-drift` with the server's number in it
-/// rather than a bare failure.
+/// The handshake reports the collector's version to any client; judging a
+/// mismatch is the client's job.
 #[test]
 fn the_handshake_reports_the_servers_version_rather_than_negotiating() {
     let c = Collector::start("mismatch");
     let mut s = c.connect();
     let reply = round_trip(&mut s, &json!({"Hello": {"client": WIRE + 1}}));
-
-    assert_eq!(
-        reply["Hello"]["server"], WIRE,
-        "the collector must report its own version to a differing client: {reply}"
-    );
-    assert!(
-        reply.get("VersionMismatch").is_none(),
-        "this collector does not send VersionMismatch: {reply}"
-    );
+    assert_eq!(reply["Hello"]["server"], WIRE, "{reply}");
 }
 
 /// Reads are unauthenticated BY CONSTRUCTION — `Query` is a separate arm of

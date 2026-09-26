@@ -182,11 +182,7 @@ fn ephemeral_status(cfg: &Config) -> FleetStatus {
 pub(crate) fn human(s: &FleetStatus) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let verdict = match s.verdict {
-        Verdict::Ok => "ok",
-        Verdict::Degraded => "degraded",
-        Verdict::Unknown => "unknown",
-    };
+    let verdict = s.verdict.as_str();
     let _ = writeln!(
         out,
         "ghr-stats {BUILD_VERSION}  ·  {}  ·  {}  ·  {verdict}",

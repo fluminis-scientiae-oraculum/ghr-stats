@@ -33,7 +33,6 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::cli::TailArgs;
-use crate::ops::poll::remaining;
 use crate::shared::config::Config;
 use crate::shared::ipc::client::Client;
 use crate::shared::ipc::{Query, Request, Response};
@@ -184,7 +183,7 @@ pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
         transitions.prune(since);
         jobs.prune(since);
 
-        std::thread::sleep(remaining(started.elapsed(), interval));
+        std::thread::sleep(interval.saturating_sub(started.elapsed()));
     }
 }
 

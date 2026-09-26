@@ -237,5 +237,5 @@ fn hook_span(h: HookStatus) -> Span<'static> {
         HookStatus::Unset => Color::Red,
         HookStatus::Unreadable => Color::DarkGray,
     };
-    Span::styled(h.glyph(), Style::new().fg(color))
+    Span::styled(super::fmt::hook_glyph(h), Style::new().fg(color))
 }

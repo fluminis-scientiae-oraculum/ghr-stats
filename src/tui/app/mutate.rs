@@ -18,8 +18,8 @@ use ratatui::crossterm::event::KeyEvent;
 
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
-use crate::tui::history::MutateOutcome;
-use crate::tui::widgets::wizard::{self, WizardMode};
+use crate::tui::overlay::wizard::{self, WizardMode};
+use crate::tui::source::MutateOutcome;
 
 use super::{App, Overlay};
 

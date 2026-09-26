@@ -45,8 +45,8 @@ pub fn write_local(
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO runner_sample \
-             (ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (ts, agent_id, name, org, liveness, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for r in runners {
             stmt.execute(params![
@@ -55,7 +55,6 @@ pub fn write_local(
                 r.name,
                 r.org,
                 r.liveness.as_str(),
-                r.current_run_id,
                 r.cpu_pct.map(|v| v as f64),
                 r.mem_bytes.map(|v| v as i64),
                 r.uptime_s.map(|v| v as i64),
@@ -193,7 +192,6 @@ mod tests {
             name: "r".into(),
             org: "o".into(),
             liveness: live,
-            current_run_id: None,
             cpu_pct: None,
             mem_bytes: None,
             mem_current_bytes: None,

@@ -35,7 +35,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::shared::github::validate::{self, Verdict};
+use crate::shared::github::validate::{self, PatCheck};
 
 mod draw;
 
@@ -197,7 +197,7 @@ impl Wizard<PatInput> {
     fn validate(self, local_ids: &HashSet<i64>) -> PatNext {
         let pat = self.state.pat.value().to_string();
         match validate::validate(&pat, &self.state.org, local_ids) {
-            Verdict::Valid { matched, local, .. } => PatNext::Confirm(Wizard {
+            PatCheck::Valid { matched, local, .. } => PatNext::Confirm(Wizard {
                 state: Confirmed {
                     org: self.state.org,
                     pat,
@@ -205,7 +205,7 @@ impl Wizard<PatInput> {
                     local,
                 },
             }),
-            Verdict::Rejected(why) => PatNext::Reject(Wizard {
+            PatCheck::Rejected(why) => PatNext::Reject(Wizard {
                 state: PatInput {
                     org: self.state.org,
                     pat: Input::default(),

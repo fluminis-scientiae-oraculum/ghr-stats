@@ -8,11 +8,11 @@
 //! the suspend window an action needs.
 
 mod app;
-mod history;
 mod input;
+mod overlay;
+mod source;
 mod view;
 mod viewmodel;
-mod widgets;
 
 use std::io::stdout;
 use std::path::Path;
@@ -77,7 +77,7 @@ enum Next {
     /// Stay in the TUI in this mode.
     Mode(ScreenState),
     /// The user accepted: the loop must suspend, run the action, and resume.
-    Execute(Screen<Confirm<ActionKind>>),
+    Execute(Screen<Confirm>),
 }
 
 fn event_loop(
@@ -156,10 +156,7 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
                             });
                             return Next::Mode(ScreenState::Confirm(scr.confirm(action)));
                         }
-                        app.open_info(
-                            "Hook install needs root",
-                            crate::shared::privileged::root_guidance(),
-                        );
+                        app.open_info("Hook install needs root", overlay::help::root_guidance());
                         return Next::Mode(ScreenState::Browsing(scr));
                     }
                     _ => {}
@@ -210,7 +207,7 @@ fn route_mouse(mode: ScreenState, app: &mut App, m: MouseEvent) -> Next {
 /// this — it owns the terminal. The `Suspension` guard couples teardown to the
 /// typestate transition via proof tokens and restores on any error path.
 fn run_suspended(
-    confirm: Screen<Confirm<ActionKind>>,
+    confirm: Screen<Confirm>,
     app: &mut App,
     terminal: &mut DefaultTerminal,
 ) -> Result<ScreenState> {
@@ -232,9 +229,9 @@ fn render(f: &mut Frame, app: &App, mode: &ScreenState) {
     // popup. (In practice they are mutually exclusive — overlays open only from
     // Browsing.)
     match app.overlay() {
-        Some(Overlay::Wizard(w)) => widgets::wizard::draw(f, w),
-        Some(Overlay::Help) => widgets::help::draw_help(f),
-        Some(Overlay::Info { title, body }) => widgets::help::draw_info(f, title, body),
+        Some(Overlay::Wizard(w)) => overlay::wizard::draw(f, w),
+        Some(Overlay::Help) => overlay::help::draw_help(f),
+        Some(Overlay::Info { title, body }) => overlay::help::draw_info(f, title, body),
         None => {}
     }
 }

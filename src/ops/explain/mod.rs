@@ -69,6 +69,27 @@ pub(crate) enum Severity {
     Info,
 }
 
+impl Severity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Info => "info",
+        }
+    }
+}
+
+impl Boundary {
+    fn as_str(self) -> &'static str {
+        match self {
+            Boundary::Local => "local",
+            Boundary::Github => "github",
+            Boundary::Network => "network",
+            Boundary::Config => "config",
+        }
+    }
+}
+
 /// One thing worth telling the caller.
 ///
 /// `id` is `&'static str` rather than `String` because the set of findings is
@@ -165,7 +186,7 @@ fn human(e: &Explanation) -> String {
         "ghr-stats {BUILD_VERSION}  ·  {}  ·  {}  ·  {}",
         e.mode.as_str(),
         e.generated_at,
-        verdict_word(e.verdict)
+        e.verdict.as_str()
     );
     if e.findings.is_empty() {
         let _ = writeln!(out, "no findings");
@@ -180,9 +201,9 @@ fn human(e: &Explanation) -> String {
         let _ = writeln!(
             out,
             "[{}] {} · investigate: {}{since}",
-            severity_word(f.severity),
+            f.severity.as_str(),
             f.id,
-            boundary_word(f.boundary)
+            f.boundary.as_str()
         );
         let _ = writeln!(out, "  {}", f.claim);
         for e in &f.evidence {
@@ -193,31 +214,6 @@ fn human(e: &Explanation) -> String {
         }
     }
     out
-}
-
-fn verdict_word(v: Verdict) -> &'static str {
-    match v {
-        Verdict::Ok => "ok",
-        Verdict::Degraded => "degraded",
-        Verdict::Unknown => "unknown",
-    }
-}
-
-fn severity_word(s: Severity) -> &'static str {
-    match s {
-        Severity::High => "high",
-        Severity::Medium => "medium",
-        Severity::Info => "info",
-    }
-}
-
-fn boundary_word(b: Boundary) -> &'static str {
-    match b {
-        Boundary::Local => "local",
-        Boundary::Github => "github",
-        Boundary::Network => "network",
-        Boundary::Config => "config",
-    }
 }
 
 /// Snapshot builders shared by all three test modules.

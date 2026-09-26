@@ -216,44 +216,32 @@ impl SharedConfig {
     }
 }
 
-/// Count the read-only PATs in a config file's TEXT without exposing any value —
-/// a lenient peek that ignores every other field (so it survives schema drift).
-/// `None` if the text doesn't parse. Shared by the teardown plan's redacted
-/// preview and the TUI's host-inventory line. Pure.
+/// The PATs a config file's text declares, read leniently (every other field is
+/// ignored, so it survives schema drift) and never exposing a value.
+#[derive(Deserialize, Default)]
+struct TokenPeek {
+    #[serde(default)]
+    github: GithubPeek,
+}
+
+#[derive(Deserialize, Default)]
+struct GithubPeek {
+    #[serde(default)]
+    tokens: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    token: Option<toml::Value>,
+}
+
+/// How many PATs the config text declares; `None` if it does not parse.
 pub(crate) fn count_tokens(config_text: &str) -> Option<usize> {
-    #[derive(Deserialize, Default)]
-    struct Peek {
-        #[serde(default)]
-        github: Gh,
-    }
-    #[derive(Deserialize, Default)]
-    struct Gh {
-        #[serde(default)]
-        tokens: BTreeMap<String, toml::Value>,
-        #[serde(default)]
-        token: Option<toml::Value>,
-    }
-    let peek: Peek = toml::from_str(config_text).ok()?;
+    let peek: TokenPeek = toml::from_str(config_text).ok()?;
     Some(peek.github.tokens.len() + usize::from(peek.github.token.is_some()))
 }
 
-/// The org logins that have a configured per-org read-only PAT — presence only,
-/// no token value — parsed leniently from a config file's TEXT (ignoring every
-/// other field, so it survives schema drift). Empty if the text doesn't parse.
-/// Lets the root collector report which orgs are configured to a non-root TUI
-/// over the IPC socket without ever exposing a secret. Sorted (BTreeMap). Pure.
+/// The orgs with a per-org PAT in the config text, sorted; empty if it does not
+/// parse.
 pub(crate) fn token_orgs(config_text: &str) -> Vec<String> {
-    #[derive(Deserialize, Default)]
-    struct Peek {
-        #[serde(default)]
-        github: Gh,
-    }
-    #[derive(Deserialize, Default)]
-    struct Gh {
-        #[serde(default)]
-        tokens: BTreeMap<String, toml::Value>,
-    }
-    toml::from_str::<Peek>(config_text)
+    toml::from_str::<TokenPeek>(config_text)
         .map(|p| p.github.tokens.into_keys().collect())
         .unwrap_or_default()
 }

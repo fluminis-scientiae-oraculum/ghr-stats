@@ -86,7 +86,7 @@ fn run() -> Result<std::process::ExitCode> {
     // verb exits 0 on success.
     let ok = std::process::ExitCode::SUCCESS;
     match args.command {
-        Some(Command::Config) => crate::ops::wizard::run(config_path.as_deref()).map(|()| ok),
+        Some(Command::Config) => crate::ops::configure::run(config_path.as_deref()).map(|()| ok),
         // Default (no subcommand) launches the TUI.
         None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()).map(|()| ok),
         Some(Command::Status(a)) => {
@@ -128,10 +128,10 @@ fn run() -> Result<std::process::ExitCode> {
 fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
     match action {
         DbAction::Prune { days } => {
-            let mut store = crate::service::store::Store::open(&cfg.db_path)
+            let mut db = crate::service::store::open_writer(&cfg.db_path)
                 .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;
             let cutoff = crate::shared::util::now_epoch() - (days as i64) * 86_400;
-            let removed = crate::service::store::writer::prune(store.conn_mut(), cutoff)?;
+            let removed = crate::service::store::writer::prune(&mut db, cutoff)?;
             println!("pruned {removed} sample rows older than {days}d");
             Ok(())
         }

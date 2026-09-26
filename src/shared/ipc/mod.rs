@@ -195,17 +195,6 @@ pub enum Response {
         #[serde(default)]
         version: String,
     },
-    /// A peer refusing our version outright.
-    ///
-    /// **This collector never sends it** — its handshake reports rather than
-    /// negotiates, answering [`Response::Hello`] with its own version whatever
-    /// the client claims, because it cannot know which request shapes a
-    /// differing client will actually use. The variant exists so a client can
-    /// still understand a peer that does refuse, and `client.rs` reads `server`
-    /// out of either reply identically. Pinned by an integration test.
-    VersionMismatch {
-        server: u16,
-    },
     HostSeries(Vec<HostPoint>),
     BusySeries(Vec<BusyPoint>),
     RunnerHistory(Vec<HistPoint>),

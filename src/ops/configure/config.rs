@@ -23,7 +23,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
 
 use crate::shared::config::persist;
-use crate::shared::github::validate::{self, Verdict};
+use crate::shared::github::validate::{self, PatCheck};
 use crate::shared::models::RunnerInfo;
 
 use super::confirm;
@@ -124,7 +124,7 @@ fn prompt_validated_pat(
             return Ok(None);
         }
         match validate::validate(&token, org, local_ids) {
-            Verdict::Valid {
+            PatCheck::Valid {
                 runners,
                 matched,
                 local,
@@ -132,7 +132,7 @@ fn prompt_validated_pat(
                 println!("    ✓ valid — {runners} runners, matched {matched}/{local} local");
                 return Ok(Some(token));
             }
-            Verdict::Rejected(why) => {
+            PatCheck::Rejected(why) => {
                 println!("    ✗ {why}");
                 if !confirm(theme, "    try again?", true)? {
                     return Ok(None);

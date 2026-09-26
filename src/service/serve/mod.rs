@@ -49,7 +49,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::bounded;
 use nix::fcntl::{Flock, FlockArg};
 
-use crate::service::store::{Store, open_reader, writer};
+use crate::service::store::{open_reader, open_writer, writer};
 use crate::shared::collectors::{self};
 use crate::shared::config::{Config, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
@@ -132,7 +132,7 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     // lifetime, so a second `serve` fails fast rather than double-writing the DB.
     // flock releases the instant the process dies — no stale lock.
     let _serve_lock = acquire_lock(cfg)?;
-    let mut store = Store::open(&cfg.db_path)?;
+    let mut db = open_writer(&cfg.db_path)?;
     let sock = crate::service::ipc_server::socket_path();
     let listener = crate::service::ipc_server::bind(&sock)
         .with_context(|| format!("binding the IPC socket {}", sock.display()))?;
@@ -213,13 +213,13 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     for msg in rx.iter() {
         match msg {
             Sample::Local { runners, host } => {
-                match writer::write_local(store.conn_mut(), &runners, &host) {
+                match writer::write_local(&mut db, &runners, &host) {
                     Ok(()) => tracing::debug!(runners = runners.len(), "local sample persisted"),
                     Err(e) => tracing::error!(error = %e, "local write failed"),
                 }
             }
             Sample::Api { ts, outcomes } => {
-                match writer::write_api_runners(store.conn_mut(), ts, &outcomes) {
+                match writer::write_api_runners(&mut db, ts, &outcomes) {
                     Ok(()) => {
                         tracing::debug!(orgs = outcomes.len(), "api reconcile persisted")
                     }
@@ -231,17 +231,14 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
                 runner,
                 events,
                 offset,
-            } => {
-                match writer::apply_hook_events(store.conn_mut(), &stream, &runner, &events, offset)
-                {
-                    Ok(()) => {
-                        tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
-                    }
-                    Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
+            } => match writer::apply_hook_events(&mut db, &stream, &runner, &events, offset) {
+                Ok(()) => {
+                    tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
                 }
-            }
+                Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
+            },
             Sample::JobConclusions { updates } => {
-                match writer::apply_job_conclusions(store.conn_mut(), &updates) {
+                match writer::apply_job_conclusions(&mut db, &updates) {
                     Ok(()) => tracing::debug!(n = updates.len(), "job conclusions reconciled"),
                     Err(e) => tracing::error!(error = %e, "job conclusion write failed"),
                 }

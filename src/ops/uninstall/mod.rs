@@ -7,7 +7,7 @@
 //!
 //! Nothing sensitive is ever printed: config tokens are shown as a COUNT, never a
 //! value, and runner `.env` contents are never echoed. Hooks are reverted
-//! detect-first (see [`crate::shared::hooks::uninstall`]) so a foreign hook is never
+//! detect-first (see [`hooks`]) so a foreign hook is never
 //! stranded. The receipt is stdout-only — uninstall leaves nothing behind.
 //!
 //! Those two phases are the seam, and it is a SAFETY boundary rather than a
@@ -29,12 +29,14 @@ use anyhow::{Result, bail};
 
 use crate::cli::{UninstallArgs, UninstallDomain};
 use crate::ops::systemd;
-use crate::shared::hooks::uninstall::{RevertAction, RunnerHookPlan};
 use crate::shared::paths::Scope;
 use crate::shared::privileged;
 
 mod apply;
+mod hooks;
 mod plan;
+
+use hooks::{RevertAction, RunnerHookPlan};
 
 use plan::BinaryAction;
 

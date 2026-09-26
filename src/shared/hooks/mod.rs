@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 pub mod env;
 pub mod ingest;
 pub mod install;
-pub mod uninstall;
 
 /// Filename of a runner's own append-only job-event log. It lives in the runner's
 /// install-dir root — which the runner *user* owns — so the hook (running as that

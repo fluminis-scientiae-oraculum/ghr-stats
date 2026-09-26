@@ -146,9 +146,7 @@ impl Client {
                 client.version = version;
                 Ok(client)
             }
-            Response::Hello { server, .. } | Response::VersionMismatch { server } => {
-                Err(ConnectErr::Version { server })
-            }
+            Response::Hello { server, .. } => Err(ConnectErr::Version { server }),
             _ => Err(ConnectErr::Io(io::Error::other(
                 "unexpected handshake reply",
             ))),

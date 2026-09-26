@@ -34,6 +34,14 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Ok => "ok",
+            Verdict::Degraded => "degraded",
+            Verdict::Unknown => "unknown",
+        }
+    }
+
     /// The documented exit code. `3` (usage/config error) is not reachable from
     /// a verdict — it is a CLI-argument failure, raised before any status is
     /// computed.

@@ -69,11 +69,10 @@ fn to_samples(
             name: p.info.name,
             org: p.info.org,
             liveness: p.liveness,
-            current_run_id: None,
             // Key CPU rate by the install dir (locally unique), NOT agent_id —
             // agentId is unique only within an org, so two runners in different
             // orgs sharing one would cross-contaminate their cgroup counters.
-            cpu_pct: cpu.rate(p.info.dir.clone(), p.cpu_usage_usec, sampled_at),
+            cpu_pct: cpu.rate(&p.info.dir, p.cpu_usage_usec, sampled_at),
             mem_bytes: p.mem_bytes,
             mem_current_bytes: p.mem_current_bytes,
             uptime_s: p.uptime_s,

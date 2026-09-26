@@ -54,51 +54,25 @@ pub(crate) enum HookStatus {
     Unreadable,
 }
 
-impl HookStatus {
-    /// ✓ / ✗ / ? glyph for the dashboard.
-    pub(crate) fn glyph(self) -> &'static str {
-        match self {
-            HookStatus::Ours => "✓",
-            HookStatus::Foreign | HookStatus::Unset => "✗",
-            HookStatus::Unreadable => "?",
-        }
-    }
-}
-
 /// Where ghr-stats installs its hook scripts (outside any runner `_work`, which
 /// a checkout would overwrite). `data_dir` already ends in `ghr-stats`.
 pub(crate) fn hooks_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("hooks")
 }
 
-/// Read + classify a runner's `.env`. `Unreadable` if it can't be read.
-pub(crate) fn detect(install_dir: &Path, our_dir: &Path) -> HookStatus {
-    detect_in(install_dir, std::slice::from_ref(&our_dir.to_path_buf()))
-}
-
-/// Like [`detect`] but classifies "ours" against SEVERAL candidate hooks dirs.
-///
-/// Detection must be independent of the euid the caller runs under: hooks are
-/// always installed by a root process (System scope, `/var/lib/ghr-stats/hooks`),
-/// but the read-only TUI is normally run non-root — so a status probe has to
-/// consider EVERY scope's hooks dir, not just `Scope::detect()`'s. Passing the
-/// current euid's single dir is what made a System-scoped hook read as `Foreign`
-/// (or a fresh install read as absent) in a plain `ghr-stats` dashboard.
-pub(crate) fn detect_in(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
+/// Read and classify a runner's `.env` against every candidate hooks dir: the
+/// TUI usually runs non-root while hooks live in the system scope, so a probe
+/// must accept any scope's dir, not just its own.
+pub(crate) fn detect(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
     match super::env::read(install_dir) {
-        Ok(env) => classify_in(&env.text, our_dirs),
+        Ok(env) => classify(&env.text, our_dirs),
         Err(_) => HookStatus::Unreadable,
     }
 }
 
-/// Classify hook state from `.env` text + our hooks dir. Pure.
-pub(crate) fn classify(env: &str, our_dir: &Path) -> HookStatus {
-    classify_in(env, std::slice::from_ref(&our_dir.to_path_buf()))
-}
-
 /// Classify against several candidate hooks dirs: a hook is ours if it is a file
 /// directly inside any of them.
-pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
+pub(crate) fn classify(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
     let is_ours = |v: &str| is_directly_in(Path::new(v), our_dirs);
     match (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR)) {
         (None, None) => HookStatus::Unset,
@@ -302,16 +276,16 @@ mod tests {
 
     #[test]
     fn classify_unset_ours_foreign() {
-        assert_eq!(classify("", &our()), HookStatus::Unset);
+        assert_eq!(classify("", &[our()]), HookStatus::Unset);
         let ours = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
                     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh\n";
-        assert_eq!(classify(ours, &our()), HookStatus::Ours);
+        assert_eq!(classify(ours, &[our()]), HookStatus::Ours);
         let foreign = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup-started.sh\n\
                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup-completed.sh\n";
-        assert_eq!(classify(foreign, &our()), HookStatus::Foreign);
+        assert_eq!(classify(foreign, &[our()]), HookStatus::Foreign);
         // one ours + one missing ⇒ not fully ours
         let half = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n";
-        assert_eq!(classify(half, &our()), HookStatus::Foreign);
+        assert_eq!(classify(half, &[our()]), HookStatus::Foreign);
     }
 
     #[test]
@@ -325,20 +299,20 @@ mod tests {
         let dirs = [usr.clone(), sys.clone()];
         let clean = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
                      ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh\n";
-        assert_eq!(classify_in(clean, &dirs), HookStatus::Ours);
+        assert_eq!(classify(clean, &dirs), HookStatus::Ours);
         // Chained: `.env` points at the wrappers, which live inside our hooks dir.
         let chained = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/chain-r1-started.sh\n\
              ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/chain-r1-completed.sh\n";
-        assert_eq!(classify_in(chained, &dirs), HookStatus::Ours);
+        assert_eq!(classify(chained, &dirs), HookStatus::Ours);
         // Documents the pre-fix failure: against ONLY the User dir it reads Foreign.
         assert_eq!(
-            classify_in(clean, std::slice::from_ref(&usr)),
+            classify(clean, std::slice::from_ref(&usr)),
             HookStatus::Foreign
         );
         // A genuinely foreign hook is still Foreign against both dirs.
         let foreign = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup.sh\n\
                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup.sh\n";
-        assert_eq!(classify_in(foreign, &[usr, sys]), HookStatus::Foreign);
+        assert_eq!(classify(foreign, &[usr, sys]), HookStatus::Foreign);
     }
 
     #[test]
@@ -478,7 +452,7 @@ mod tests {
                 "/srv/actions-runner/runner-01/.ghr-stats-events.ndjson",
             )),
         );
-        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
+        assert_eq!(classify(&installed, &[our()]), HookStatus::Ours);
         assert!(installed.contains("GHR_STATS_EVENT_LOG="));
         assert_eq!(remove_hook_vars(&installed), original);
     }
