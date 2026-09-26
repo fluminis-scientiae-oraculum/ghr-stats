@@ -1,25 +1,43 @@
-//! Privileged writes to a runner's own `.env` — shared by the config wizard
-//! (which *wires* the hook vars) and `uninstall` (which *reverts* them).
-//!
-//! A runner's `.env` is owned by the runner user and lives on a root-owned
-//! install dir, so both writing and reverting go through `privileged::run` with
-//! `install(1)` to preserve ownership + mode. Keeping this in one place means the
-//! two directions can never drift on ownership/mode (they must stay symmetric).
+//! A runner's `.env`: reading it safely, rewriting it with the ownership and mode
+//! it already had, and restarting the runner so the change takes effect.
 
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use crate::shared::privileged::{self, Outcome, PrivilegedCall};
+use crate::shared::collectors::runners;
+use crate::shared::models::Liveness;
+use crate::shared::privileged::{self, Outcome, PrivilegedCall, UnitVerb};
+use crate::shared::runner_files::{self, Ownership};
 
-/// Install `content` as `env_path`, owned by `user`, mode `0644` — via the
-/// privileged path (direct when root, else `sudo`). Returns the [`Outcome`] so
-/// each caller renders its own message.
-///
-/// SECURITY: this runs as root, so the staging file must not be a predictable
-/// path in a shared directory — a local user could pre-plant a symlink there and
-/// redirect the root write (CWE-59/CWE-377). `NamedTempFile` creates the staging
-/// file with `O_CREAT|O_EXCL` and a random name, defeating that. It is removed on
-/// drop (including every early return).
-pub(crate) fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> Outcome {
+const ENV_CAP: u64 = 1024 * 1024;
+
+/// A runner's `.env` as read, with the ownership a rewrite must keep.
+pub(crate) struct EnvFile {
+    pub path: PathBuf,
+    pub text: String,
+    pub ownership: Ownership,
+}
+
+/// Read `dir/.env`. A missing file reads as empty, owned like the install dir.
+pub(crate) fn read(dir: &Path) -> io::Result<EnvFile> {
+    let (text, ownership) = match runner_files::read_text(dir, ".env", ENV_CAP) {
+        Ok(read) => read,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            (String::new(), Ownership::default_in(dir)?)
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(EnvFile {
+        path: dir.join(".env"),
+        text,
+        ownership,
+    })
+}
+
+/// Replace `env` with `content` via the privileged path. The staging file is a
+/// `NamedTempFile` (`O_EXCL`, random name), so no pre-planted symlink can redirect
+/// the root write.
+pub(crate) fn write_env_as_root(env: &EnvFile, content: &str) -> Outcome {
     use std::io::Write;
     let mut tmp = match tempfile::NamedTempFile::new() {
         Ok(t) => t,
@@ -29,16 +47,39 @@ pub(crate) fn write_env_as_root(env_path: &Path, content: &str, user: &str) -> O
         return stage_failed();
     }
     privileged::run(&PrivilegedCall::InstallEnvFile {
-        owner: user.to_string(),
         src: tmp.path().to_path_buf(),
-        dst: env_path.to_path_buf(),
+        dst: env.path.clone(),
+        ownership: env.ownership,
     })
-    // `tmp` drops here, unlinking the staging file.
 }
 
 fn stage_failed() -> Outcome {
     Outcome::Failed {
         code: None,
         stderr: "could not stage .env update".to_string(),
+    }
+}
+
+/// Restart the runner at `dir` so a rewritten `.env` takes effect, unless it is
+/// running a job or not running at all. Returns a suffix for the receipt line.
+pub(crate) fn restart_if_idle(dir: &Path) -> String {
+    let unit = match runners::unit_for(dir) {
+        Ok(unit) => unit,
+        Err(why) => return format!(" (not restarted: {why})"),
+    };
+    match runners::liveness_in(dir, &crate::shared::collectors::procscan::scan()) {
+        Liveness::Busy => " (busy, applies on its next restart)".to_string(),
+        Liveness::Offline => " (not running, applies when it starts)".to_string(),
+        Liveness::Idle => {
+            let o = privileged::run(&PrivilegedCall::Systemctl {
+                verb: UnitVerb::Restart,
+                unit: unit.clone(),
+            });
+            if o.is_ok() {
+                format!(" (restarted {unit})")
+            } else {
+                format!(" ({})", o.describe(&format!("restart {unit}")))
+            }
+        }
     }
 }

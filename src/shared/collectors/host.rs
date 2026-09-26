@@ -84,8 +84,12 @@ fn fs_used_bytes(path: &Path) -> Option<u64> {
     Some(used_blocks * s.fragment_size() as u64)
 }
 
+/// Bytes in regular files under `path`. The work folder is runner-controlled, so
+/// the walk never follows a link (not even `path` itself) or leaves its filesystem.
 fn dir_size(path: &Path) -> u64 {
     WalkDir::new(path)
+        .follow_root_links(false)
+        .same_file_system(true)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter_map(|e| e.metadata().ok())

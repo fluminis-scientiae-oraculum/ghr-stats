@@ -16,9 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::shared::collectors::runners;
+use crate::shared::hooks::env::{self, EnvFile};
 use crate::shared::hooks::install::{self, HookStatus};
-use crate::shared::models::{Liveness, RunnerInfo};
+use crate::shared::models::RunnerInfo;
 
 /// What a runner's `.env` reveals about *our* footprint on it. Pure result of
 /// [`classify_revert`]; the paths carried by `Chained` are the wrapper scripts to
@@ -41,7 +41,8 @@ pub(crate) enum RevertKind {
 /// Classify how (if at all) to revert a runner from its `.env` text + our hooks
 /// dir. Pure. Only a state where BOTH vars point at our scripts is ever touched.
 pub(crate) fn classify_revert(env: &str, our_dir: &Path) -> RevertKind {
-    let inside = |p: &Path| p.starts_with(our_dir);
+    let inside =
+        |p: &Path| install::is_directly_in(p, std::slice::from_ref(&our_dir.to_path_buf()));
     let is_chain =
         |p: &Path| file_name_str(p).is_some_and(|n| n.starts_with("chain-") && n.ends_with(".sh"));
     let is_fresh = |p: &Path| {
@@ -97,30 +98,32 @@ pub(crate) enum RevertAction {
 }
 
 /// A per-runner reversal plan (no mutation performed).
-#[derive(Debug, Clone)]
 pub(crate) struct RunnerHookPlan {
     pub name: String,
-    pub env_path: PathBuf,
-    pub user: String,
-    pub uid: u32,
+    pub dir: PathBuf,
+    env: Option<EnvFile>,
     pub action: RevertAction,
 }
 
 /// Build the reversal plan for one runner by reading its live `.env` (+ any of
 /// our wrappers it points at). No mutation — safe to call for the dry-run.
 pub(crate) fn plan_runner(r: &RunnerInfo, our_dir: &Path) -> RunnerHookPlan {
-    let env_path = r.dir.join(".env");
-    let action = match std::fs::read_to_string(&env_path) {
-        Err(_) => RevertAction::Leave {
-            why: ".env unreadable — re-run as root/the runner user".to_string(),
-        },
-        Ok(text) => plan_action(&text, our_dir),
+    let (env, action) = match env::read(&r.dir) {
+        Err(e) => (
+            None,
+            RevertAction::Leave {
+                why: format!(".env unreadable ({e})"),
+            },
+        ),
+        Ok(env) => {
+            let action = plan_action(&env.text, our_dir);
+            (Some(env), action)
+        }
     };
     RunnerHookPlan {
         name: r.name.clone(),
-        env_path,
-        user: r.user.clone(),
-        uid: r.uid,
+        dir: r.dir.clone(),
+        env,
         action,
     }
 }
@@ -171,77 +174,39 @@ fn read_wrapped_original(wrapper: &Path) -> Option<PathBuf> {
     install::original_from_wrapper(&text)
 }
 
-/// Apply a runner's reversal plan (privileged); returns a ready-to-print receipt
-/// line. `idle` gates the restart: a busy runner keeps its listener (the reverted
-/// `.env` takes effect on its next restart) rather than interrupting a job.
-/// Deletes the chain wrappers we own.
-pub(crate) fn apply_runner(plan: &RunnerHookPlan, idle: bool) -> String {
-    match &plan.action {
-        RevertAction::Leave { why } => format!("  · {} — {why}", plan.name),
-        RevertAction::Manual { why } => format!("  ⚠ {} — {why}", plan.name),
-        RevertAction::Strip { new_env } => {
-            let out =
-                crate::shared::hooks::env::write_env_as_root(&plan.env_path, new_env, &plan.user);
-            if out.is_ok() {
-                format!(
-                    "  ✓ {} — hook removed{}",
-                    plan.name,
-                    restart_note(plan, idle)
-                )
-            } else {
-                format!("  ✗ {} — {}", plan.name, out.describe("revert .env"))
-            }
-        }
+/// Apply a runner's reversal plan (privileged); returns a receipt line.
+pub(crate) fn apply_runner(plan: &RunnerHookPlan) -> String {
+    let (new_env, restored) = match &plan.action {
+        RevertAction::Leave { why } => return format!("  · {} — {why}", plan.name),
+        RevertAction::Manual { why } => return format!("  ⚠ {} — {why}", plan.name),
+        RevertAction::Strip { new_env } => (new_env, None),
         RevertAction::Restore {
             new_env,
             originals,
             wrappers,
-        } => {
-            let out =
-                crate::shared::hooks::env::write_env_as_root(&plan.env_path, new_env, &plan.user);
-            if !out.is_ok() {
-                return format!("  ✗ {} — {}", plan.name, out.describe("restore .env"));
-            }
+        } => (new_env, Some((originals, wrappers))),
+    };
+    let Some(env) = &plan.env else {
+        return format!("  · {} — .env unreadable", plan.name);
+    };
+    let out = env::write_env_as_root(env, new_env);
+    if !out.is_ok() {
+        return format!("  ✗ {} — {}", plan.name, out.describe("write .env"));
+    }
+    let done = match restored {
+        None => "hook removed".to_string(),
+        Some((originals, wrappers)) => {
             for w in wrappers {
-                let _ = std::fs::remove_file(w); // best-effort; the .env no longer points here
+                let _ = std::fs::remove_file(w);
             }
-            format!(
-                "  ✓ {} — restored your hook ({}){}",
-                plan.name,
-                originals.0.display(),
-                restart_note(plan, idle),
-            )
+            format!("restored your hook ({})", originals.0.display())
         }
-    }
-}
-
-/// Restart the runner's unit if idle (so the reverted `.env` takes effect now);
-/// return the suffix noting what happened.
-fn restart_note(plan: &RunnerHookPlan, idle: bool) -> String {
-    if !idle {
-        return " (busy — applies on next restart)".to_string();
-    }
-    match runners::unit_name(plan.env_path.parent().unwrap_or(Path::new("/"))) {
-        Some(unit) => {
-            let o = crate::shared::privileged::run(
-                &crate::shared::privileged::PrivilegedCall::Systemctl {
-                    verb: crate::shared::privileged::UnitVerb::Restart,
-                    unit: unit.clone(),
-                },
-            );
-            if o.is_ok() {
-                format!(" (restarted {unit})")
-            } else {
-                format!(" ({})", o.describe(&format!("restart {unit}")))
-            }
-        }
-        None => " (no unit file — restart the runner manually)".to_string(),
-    }
-}
-
-/// Idle-gate helper: liveness for a runner from a shared process snapshot.
-pub(crate) fn is_idle(uid: u32, procs: &[crate::shared::collectors::procscan::ProcInfo]) -> bool {
-    runners::liveness_for(uid, procs) == Liveness::Idle
+    };
+    format!(
+        "  ✓ {} — {done}{}",
+        plan.name,
+        env::restart_if_idle(&plan.dir)
+    )
 }
 
 fn file_name_str(p: &Path) -> Option<&str> {

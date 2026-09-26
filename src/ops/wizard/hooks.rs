@@ -20,6 +20,7 @@ use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 
 use crate::shared::collectors::runners;
+use crate::shared::hooks::env;
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::Scope;
@@ -70,15 +71,12 @@ pub(crate) fn install_hooks_for_tui(roots: &[PathBuf]) -> Result<()> {
 /// (foreign) / no-op (ours). No initial confirm — the caller already consented
 /// (the CLI wizard's prompt or the TUI's confirm popup).
 fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
-    // Hooks are a shared *system* resource: the scripts must live where every
-    // runner user can read them, and each runner's `.env` is root-owned — so
-    // this needs a root *process* (System scope). `require_root` gates once here
-    // (per-op sudo can't relocate our own scope); the privileged steps below run
-    // via `privileged::run`. Same requirement as `systemd install --system`.
+    // A root process: the scripts go in the system hooks dir every runner user
+    // reads, and each runner's `.env` belongs to another user.
     if let Err(hint) = privileged::require_root("config") {
         println!(
-            "  runner hooks need root — the scripts must be readable by the \
-             runner users, and each runner's .env is root-owned.\n  Re-run:  {hint}"
+            "  runner hooks need root — the scripts go in the system hooks dir, and \
+             each runner's .env belongs to its runner user.\n  Re-run:  {hint}"
         );
         return Ok(());
     }
@@ -135,62 +133,38 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     Ok(())
 }
 
-/// Already wired to us: ensure the runner's `.env` also carries its per-runner
-/// event-log path, then restart if we had to add it. This makes `config` a
-/// self-healing upgrade path — a runner wired by a version that predates
-/// `GHR_STATS_EVENT_LOG` (detected `Ours`, so install/chain are skipped) would
-/// otherwise never emit events.
+/// Already wired to us: add the per-runner event-log path if an older install
+/// never set it.
 fn repair_event_log(r: &RunnerInfo) {
-    let env_path = r.dir.join(".env");
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let Some(env) = read_env(r) else { return };
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
-    match install::ensure_event_log(&existing, &event_log) {
+    match install::ensure_event_log(&env.text, &event_log) {
         None => println!("  ✓ {} already wired to ghr-stats", r.name),
-        Some(new) => {
-            let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
-            if out.is_ok() {
-                println!("  ✓ {} — added missing event-log path", r.name);
-                restart_runner(r);
-            } else {
-                println!("    ✗ {}", out.describe("repair .env"));
-            }
-        }
+        Some(new) => write_and_restart(r, &env, &new, "added missing event-log path"),
     }
 }
 
-/// Clean install: point the runner's `.env` hook vars at our scripts, restart.
+/// Clean install: point the runner's `.env` hook vars at our scripts.
 fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
-    let env_path = r.dir.join(".env");
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let Some(env) = read_env(r) else { return };
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
-    let new = install::rewrite_env(&existing, started, completed, Some(&event_log));
-    let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
-    if out.is_ok() {
-        restart_runner(r);
-    } else {
-        println!("    ✗ {}", out.describe("wire .env"));
-    }
+    let new = install::rewrite_env(&env.text, started, completed, Some(&event_log));
+    write_and_restart(r, &env, &new, "hooks installed");
 }
 
-/// Chain: wrap the existing hook (keep it) + append ours, repoint `.env`, restart.
-/// Per-slot: a slot with a foreign original gets a wrapper; a slot with no
-/// original (a `Foreign` runner with only ONE hook var set) is wired to our plain
-/// script directly — never to a wrapper we didn't write. Any wrapper write must
-/// succeed before we touch `.env`, so we can't point a runner at a missing script.
+/// Chain: a slot with a foreign original gets a wrapper that runs it then ours; an
+/// empty slot gets our plain script. Wrappers are written before `.env`, so a
+/// runner never points at a missing script.
 fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: &Path) {
-    let env_path = r.dir.join(".env");
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-    let (orig_started, orig_completed) = install::current_hook_paths(&existing);
-    let wrap_started = our_dir.join(format!("chain-{}-started.sh", r.name));
-    let wrap_completed = our_dir.join(format!("chain-{}-completed.sh", r.name));
+    let Some(env) = read_env(r) else { return };
+    let (orig_started, orig_completed) = install::current_hook_paths(&env.text);
+    let [wrap_started, wrap_completed] = install::chain_wrapper_paths(our_dir, &r.dir);
 
     let (started_target, started_wrapper) =
         install::plan_chain_slot(orig_started.as_deref(), our_started, &wrap_started);
     let (completed_target, completed_wrapper) =
         install::plan_chain_slot(orig_completed.as_deref(), our_completed, &wrap_completed);
 
-    // Write any wrappers FIRST; abort without touching `.env` if a write fails —
-    // never leave a runner pointed at a wrapper that isn't on disk.
     for (path, content) in [started_wrapper, completed_wrapper].into_iter().flatten() {
         if let Err(e) = write_script(&path, &content) {
             println!(
@@ -204,16 +178,30 @@ fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: 
 
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
     let new = install::rewrite_env(
-        &existing,
+        &env.text,
         &started_target,
         &completed_target,
         Some(&event_log),
     );
-    let out = crate::shared::hooks::env::write_env_as_root(&env_path, &new, &r.user);
+    write_and_restart(r, &env, &new, "hooks chained");
+}
+
+fn read_env(r: &RunnerInfo) -> Option<env::EnvFile> {
+    match env::read(&r.dir) {
+        Ok(env) => Some(env),
+        Err(e) => {
+            println!("    ✗ {} — .env not rewritten: {e}", r.name);
+            None
+        }
+    }
+}
+
+fn write_and_restart(r: &RunnerInfo, env: &env::EnvFile, new: &str, done: &str) {
+    let out = env::write_env_as_root(env, new);
     if out.is_ok() {
-        restart_runner(r);
+        println!("  ✓ {} — {done}{}", r.name, env::restart_if_idle(&r.dir));
     } else {
-        println!("    ✗ {}", out.describe("wire .env"));
+        println!("    ✗ {}", out.describe("write .env"));
     }
 }
 
@@ -225,20 +213,4 @@ fn write_script(path: &Path, content: &str) -> std::io::Result<()> {
         .mode(0o755)
         .open(path)?;
     f.write_all(content.as_bytes())
-}
-
-fn restart_runner(r: &RunnerInfo) {
-    match runners::unit_name(&r.dir) {
-        Some(unit) => {
-            let o = privileged::run(&privileged::PrivilegedCall::Systemctl {
-                verb: privileged::UnitVerb::Restart,
-                unit: unit.clone(),
-            });
-            println!("    {}", o.describe(&format!("restart {unit}")));
-        }
-        None => println!(
-            "    ⚠ no .service file under {} — restart the runner manually to apply",
-            r.dir.display()
-        ),
-    }
 }

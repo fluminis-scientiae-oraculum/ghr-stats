@@ -49,7 +49,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::bounded;
 use nix::fcntl::{Flock, FlockArg};
 
-use crate::service::store::{Store, open_reader, reader, writer};
+use crate::service::store::{Store, open_reader, writer};
 use crate::shared::collectors::{self};
 use crate::shared::config::{Config, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
@@ -105,8 +105,9 @@ enum Sample {
         outcomes: Vec<ApiOrgOutcome>,
     },
     Hook {
-        /// The tailed log's stream id (the per-runner event-log path).
+        /// The tailed log's path, which keys its offset.
         stream: String,
+        runner: String,
         events: Vec<HookEvent>,
         offset: u64,
     },
@@ -132,6 +133,9 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     // flock releases the instant the process dies — no stale lock.
     let _serve_lock = acquire_lock(cfg)?;
     let mut store = Store::open(&cfg.db_path)?;
+    let sock = crate::service::ipc_server::socket_path();
+    let listener = crate::service::ipc_server::bind(&sock)
+        .with_context(|| format!("binding the IPC socket {}", sock.display()))?;
 
     // SIGINT/SIGTERM/SIGHUP flip the flag; producers exit at the next check.
     let term = Arc::new(AtomicBool::new(false));
@@ -170,13 +174,11 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
             .context("spawning api-reconcile")?
     };
     let hooks = {
-        // Resume tailing each runner's log from its last persisted offset. A
-        // runner absent from this map (a new runner) is tailed from 0.
-        let start_offsets = reader::ingest_offsets(store.conn()).unwrap_or_default();
+        let reader = open_reader(&cfg.db_path);
         let (cfg, term, tx) = (shared.clone(), Arc::clone(&term), tx.clone());
         thread::Builder::new()
             .name("hooks-tail".into())
-            .spawn(move || hooks_loop(&cfg, &term, &tx, start_offsets))
+            .spawn(move || hooks_loop(&cfg, &term, &tx, reader))
             .context("spawning hooks-tail")?
     };
     // Metrics exporter threads (pull/push): always spawned, each reconciles its
@@ -192,7 +194,7 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     // an authorized mutation writes (and reloads) the SAME file `serve` loaded,
     // not a hardcoded `/etc` that a `--config` run never touched.
     let config_path = crate::shared::paths::config_write_target(config_override);
-    let ipc = crate::service::ipc_server::spawn(&shared, Arc::clone(&term), config_path);
+    let ipc = crate::service::ipc_server::spawn(listener, &shared, Arc::clone(&term), config_path);
 
     // The writer holds only `rx`; once the producers exit and drop their
     // senders, `rx` disconnects and the loop below ends.
@@ -226,14 +228,18 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
             }
             Sample::Hook {
                 stream,
+                runner,
                 events,
                 offset,
-            } => match writer::apply_hook_events(store.conn_mut(), &stream, &events, offset) {
-                Ok(()) => {
-                    tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
+            } => {
+                match writer::apply_hook_events(store.conn_mut(), &stream, &runner, &events, offset)
+                {
+                    Ok(()) => {
+                        tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
+                    }
+                    Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
                 }
-                Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
-            },
+            }
             Sample::JobConclusions { updates } => {
                 match writer::apply_job_conclusions(store.conn_mut(), &updates) {
                     Ok(()) => tracing::debug!(n = updates.len(), "job conclusions reconciled"),

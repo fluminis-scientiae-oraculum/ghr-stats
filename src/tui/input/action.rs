@@ -11,9 +11,11 @@
 //! BOTH `prompt` and `execute`, so a confirm popup always names the command that
 //! will actually run.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use crate::shared::privileged::{self, Outcome, PrivilegedCall, UnitVerb};
+use crate::shared::collectors::runners::{self, RunnerUnit};
+use crate::shared::privileged::{self, Outcome, PrivilegedCall, RunAs, UnitVerb};
 use crate::tui::input::screen::Tty;
 
 /// What the confirm popup shows for a pending action.
@@ -49,8 +51,10 @@ pub(crate) trait Action {
 
 /// Bounce a runner's service to reclaim the .NET-runner GC RAM.
 pub(crate) struct RestartRunner {
-    pub unit: String,
+    pub unit: RunnerUnit,
     pub agent_id: i64,
+    /// Busy when armed: restarting cancels its job.
+    pub busy: bool,
 }
 
 impl RestartRunner {
@@ -64,10 +68,10 @@ impl RestartRunner {
     }
 }
 
-/// Restart + purge the runner's OWN `_work/_temp` + trim `_diag` — idle-only,
-/// scoped to its install dir from `.runner`, NEVER global `/tmp` or docker.
+/// Stop, empty the runner's own `_temp` and `_diag` as the runner user, start.
+/// Idle only, re-checked just before stopping.
 pub(crate) struct RecycleRunner {
-    pub unit: String,
+    pub unit: RunnerUnit,
     pub agent_id: i64,
     pub install_dir: PathBuf,
     pub work_folder: String,
@@ -84,21 +88,34 @@ impl RecycleRunner {
         (temp, diag)
     }
 
-    /// stop → purge → start. Separate from `execute` so the abort-on-stop path
-    /// stays a single `Outcome` return rather than being duplicated into the
-    /// `ActionOutcome` rendering.
-    fn recycle(&self) -> Outcome {
-        let (temp, diag) = self.scoped_paths();
-
-        // Stop first; abort before touching anything if that fails.
-        let stop = privileged::run(&self.unit_call(UnitVerb::Stop));
-        if !stop.is_ok() {
-            return stop;
+    /// stop → purge → start; the first failing step ends it.
+    fn recycle(&self) -> Result<(), String> {
+        if !runners::is_idle_now(&self.install_dir) {
+            return Err("runner is no longer idle; not recycled".to_string());
         }
-        // Scoped purge — ONLY this runner's own dirs under its install dir.
-        let _ = privileged::run(&PrivilegedCall::PurgeDir { dir: temp });
-        let _ = privileged::run(&PrivilegedCall::TrimFilesIn { dir: diag });
-        privileged::run(&self.unit_call(UnitVerb::Start))
+        let owner = std::fs::metadata(&self.install_dir)
+            .map(|m| RunAs {
+                uid: m.uid(),
+                gid: m.gid(),
+            })
+            .map_err(|e| format!("{}: {e}", self.install_dir.display()))?;
+        let (temp, diag) = self.scoped_paths();
+        let steps = [
+            ("stop", self.unit_call(UnitVerb::Stop)),
+            ("purge _temp", PrivilegedCall::PurgeDir { dir: temp, owner }),
+            (
+                "trim _diag",
+                PrivilegedCall::TrimFilesIn { dir: diag, owner },
+            ),
+            ("start", self.unit_call(UnitVerb::Start)),
+        ];
+        for (what, call) in steps {
+            let out = privileged::run(&call);
+            if !out.is_ok() {
+                return Err(out.describe(what));
+            }
+        }
+        Ok(())
     }
 
     fn unit_call(&self, verb: UnitVerb) -> PrivilegedCall {
@@ -113,8 +130,15 @@ impl Action for RestartRunner {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: format!("Restart {} (#{})", self.unit, self.agent_id),
-            body: format!("sudo {}\nReclaims the runner agent's GC RAM.", self.call()),
-            danger: false,
+            body: if self.busy {
+                format!(
+                    "sudo {}\nThe runner is busy: restarting cancels its job.",
+                    self.call()
+                )
+            } else {
+                format!("sudo {}\nReclaims the runner agent's GC RAM.", self.call())
+            },
+            danger: self.busy,
         }
     }
     fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
@@ -132,7 +156,7 @@ impl Action for RecycleRunner {
             title: format!("Recycle {} (#{})", self.unit, self.agent_id),
             body: format!(
                 "stop · purge {temp} · trim {diag} · start\n\
-                 (scoped to THIS runner only — never global /tmp or docker; idle-only)",
+                 (as the runner user; idle only)",
                 temp = temp.display(),
                 diag = diag.display()
             ),
@@ -141,8 +165,8 @@ impl Action for RecycleRunner {
     }
     fn execute(&self, _tty: &mut Tty) -> ActionOutcome {
         match self.recycle() {
-            Outcome::Ok => ActionOutcome::Ok(format!("recycled {}", self.unit)),
-            other => ActionOutcome::Failed(other.describe("recycle")),
+            Ok(()) => ActionOutcome::Ok(format!("recycled {}", self.unit)),
+            Err(why) => ActionOutcome::Failed(format!("recycle: {why}")),
         }
     }
 }
@@ -240,7 +264,7 @@ mod tests {
     #[test]
     fn recycle_scopes_temp_under_work_and_diag_at_install_root() {
         let r = RecycleRunner {
-            unit: "x.service".to_string(),
+            unit: RunnerUnit::for_test("actions.runner.o.x.service"),
             agent_id: 1,
             install_dir: PathBuf::from("/srv/runners/r0"),
             work_folder: "_work".to_string(),

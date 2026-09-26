@@ -17,9 +17,8 @@
 use std::path::Path;
 
 use crate::ops::systemd;
-use crate::shared::collectors::procscan;
-use crate::shared::hooks::install;
 use crate::shared::hooks::uninstall::{self as hook_revert, RunnerHookPlan};
+use crate::shared::hooks::{env, install};
 use crate::shared::privileged;
 
 use super::Plan;
@@ -33,13 +32,11 @@ impl Plan {
             if !privileged::is_root() {
                 println!(
                     "  ⚠ skipped — reverting hooks needs root; re-run `{}`",
-                    privileged::sudo_hint("uninstall --hooks")
+                    privileged::sudo_hint("uninstall hooks")
                 );
             } else {
-                let procs = procscan::scan();
                 for rp in &self.runners {
-                    let idle = hook_revert::is_idle(rp.uid, &procs);
-                    println!("{}", hook_revert::apply_runner(rp, idle));
+                    println!("{}", hook_revert::apply_runner(rp));
                 }
                 gc_shared_scripts(&self.our_dir, &self.runners);
             }
@@ -81,12 +78,10 @@ impl Plan {
     }
 }
 
-/// Remove the shared `job-*.sh` scripts + the hooks dir — but only once no
-/// runner's live `.env` still points into it (a foreign/unreverted runner might).
+/// Remove the shared `job-*.sh` scripts + the hooks dir, but only once no
+/// runner's live `.env` may still point into it.
 fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
-    let still_referenced = plans
-        .iter()
-        .any(|rp| env_points_into(&rp.env_path, our_dir));
+    let still_referenced = plans.iter().any(|rp| env_may_point_into(&rp.dir, our_dir));
     if still_referenced {
         println!(
             "  · kept {} — still referenced by a runner not managed by ghr-stats",
@@ -101,12 +96,13 @@ fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
     }
 }
 
-/// Whether a runner's current `.env` still points a hook var inside `our_dir`.
-fn env_points_into(env_path: &Path, our_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(env_path) else {
-        return false;
+/// Whether a runner's current `.env` points a hook var inside `our_dir`; an
+/// unreadable `.env` might, so it counts.
+fn env_may_point_into(runner_dir: &Path, our_dir: &Path) -> bool {
+    let Ok(env) = env::read(runner_dir) else {
+        return true;
     };
-    let (s, c) = install::current_hook_paths(&text);
+    let (s, c) = install::current_hook_paths(&env.text);
     [s, c]
         .into_iter()
         .flatten()

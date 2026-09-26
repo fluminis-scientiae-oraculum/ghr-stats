@@ -85,8 +85,8 @@ pub(crate) fn detect(install_dir: &Path, our_dir: &Path) -> HookStatus {
 /// current euid's single dir is what made a System-scoped hook read as `Foreign`
 /// (or a fresh install read as absent) in a plain `ghr-stats` dashboard.
 pub(crate) fn detect_in(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
-    match std::fs::read_to_string(install_dir.join(".env")) {
-        Ok(text) => classify_in(&text, our_dirs),
+    match super::env::read(install_dir) {
+        Ok(env) => classify_in(&env.text, our_dirs),
         Err(_) => HookStatus::Unreadable,
     }
 }
@@ -96,11 +96,10 @@ pub(crate) fn classify(env: &str, our_dir: &Path) -> HookStatus {
     classify_in(env, std::slice::from_ref(&our_dir.to_path_buf()))
 }
 
-/// Classify against MULTIPLE candidate hooks dirs — a hook is "ours" if it points
-/// under ANY of them (see [`detect_in`] for why every scope must be considered).
-/// Pure.
+/// Classify against several candidate hooks dirs: a hook is ours if it is a file
+/// directly inside any of them.
 pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
-    let is_ours = |v: &str| our_dirs.iter().any(|d| Path::new(v).starts_with(d));
+    let is_ours = |v: &str| is_directly_in(Path::new(v), our_dirs);
     match (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR)) {
         (None, None) => HookStatus::Unset,
         (s, c) => {
@@ -112,6 +111,32 @@ pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
             }
         }
     }
+}
+
+/// Whether `path` names a file directly inside one of `dirs` (so no `..` escape).
+pub(crate) fn is_directly_in(path: &Path, dirs: &[PathBuf]) -> bool {
+    path.parent().is_some_and(|p| dirs.iter().any(|d| p == d))
+}
+
+/// Where the chain wrappers for the runner at `runner_dir` live, named after
+/// its install dir (runner names repeat across orgs; dirs do not).
+pub(crate) fn chain_wrapper_paths(our_dir: &Path, runner_dir: &Path) -> [PathBuf; 2] {
+    let slug: String = runner_dir
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    [
+        our_dir.join(format!("chain-{slug}-started.sh")),
+        our_dir.join(format!("chain-{slug}-completed.sh")),
+    ]
 }
 
 /// The three vars ghr-stats owns in a runner's `.env`. Every other line in that

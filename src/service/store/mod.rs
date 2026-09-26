@@ -33,10 +33,6 @@ impl Store {
         Ok(Self { conn })
     }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
-    }
-
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
