@@ -144,7 +144,10 @@ fn read_wrapped_original(wrapper: &Path) -> Option<PathBuf> {
     install::original_from_wrapper(&text)
 }
 
-pub(crate) fn apply_runner(plan: &RunnerHookPlan) -> String {
+pub(crate) fn apply_runner(
+    plan: &RunnerHookPlan,
+    _root: &crate::shared::privileged::Root,
+) -> String {
     let (new_env, restored) = match &plan.action {
         RevertAction::Leave { why } => return format!("  · {} — {why}", plan.name),
         RevertAction::Manual { why } => return format!("  ⚠ {} — {why}", plan.name),

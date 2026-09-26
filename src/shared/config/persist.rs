@@ -2,6 +2,7 @@
 //! Other settings survive; comments and formatting do not.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,8 @@ use nix::fcntl::{Flock, FlockArg};
 use toml::{Table, Value};
 
 use crate::shared::error::{Error, Result};
+use crate::shared::github::TokenKey;
+use crate::shared::github::validate::FineGrainedPat;
 
 /// Load-modify-write under an exclusive flock, since the CLI wizard, the TUI and the
 /// collector's IPC handler edit the same file from separate processes. The lock is
@@ -61,6 +64,7 @@ fn write_table(target: &Path, doc: &Table) -> Result<()> {
         .map_err(|e| stage_err(target, &e))?;
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600)).ok();
     tmp.write_all(body.as_bytes())
+        .and_then(|()| tmp.as_file().sync_all())
         .map_err(|e| Error::Config(format!("writing staged config: {e}")))?;
     tmp.persist(target)
         .map_err(|e| Error::Config(format!("installing {}: {}", target.display(), e.error)))?;
@@ -95,12 +99,19 @@ fn nested_table<'a>(doc: &'a mut Table, path: &[&str]) -> Result<&'a mut Table> 
     Ok(cur)
 }
 
-pub(crate) fn set_org_token(target: &Path, org: &str, token: &str) -> Result<()> {
+/// Add or replace the PAT for `key`, replacing any key spelled differently for the same
+/// login and host.
+pub(crate) fn set_org_token(target: &Path, key: &TokenKey, token: &FineGrainedPat) -> Result<()> {
     edit(target, |doc| {
-        nested_table(doc, &["github", "tokens"])?
-            .insert(org.to_string(), Value::String(token.to_string()));
+        let tokens = nested_table(doc, &["github", "tokens"])?;
+        tokens.retain(|k, _| !same_key(k, key));
+        tokens.insert(key.to_string(), Value::String(token.expose().to_string()));
         Ok(())
     })
+}
+
+fn same_key(k: &str, key: &TokenKey) -> bool {
+    TokenKey::parse(k).is_ok_and(|k| k.matches(key.host(), key.login()))
 }
 
 pub(crate) fn set_runner_roots(target: &Path, roots: &[PathBuf]) -> Result<()> {
@@ -114,11 +125,15 @@ pub(crate) fn set_runner_roots(target: &Path, roots: &[PathBuf]) -> Result<()> {
     })
 }
 
-pub(crate) fn remove_org_token(target: &Path, org: &str) -> Result<()> {
+/// Remove `key`'s PAT and drop its login from `orgs`; an error if neither was there.
+pub(crate) fn remove_org_token(target: &Path, key: &TokenKey) -> Result<()> {
     edit(target, |doc| {
+        let mut removed = false;
         if let Some(github) = doc.get_mut("github").and_then(Value::as_table_mut) {
             if let Some(tokens) = github.get_mut("tokens").and_then(Value::as_table_mut) {
-                tokens.remove(org);
+                let before = tokens.len();
+                tokens.retain(|k, _| !same_key(k, key));
+                removed |= tokens.len() < before;
                 if tokens.is_empty() {
                     github.remove("tokens");
                 }
@@ -127,18 +142,36 @@ pub(crate) fn remove_org_token(target: &Path, org: &str) -> Result<()> {
                 doc.remove("github");
             }
         }
-        if let Some(Value::Array(orgs)) = doc.get_mut("orgs") {
-            orgs.retain(|v| v.as_str() != Some(org));
+        if key.host().is_dotcom()
+            && let Some(Value::Array(orgs)) = doc.get_mut("orgs")
+        {
+            let before = orgs.len();
+            orgs.retain(|v| {
+                !v.as_str()
+                    .is_some_and(|o| o.eq_ignore_ascii_case(key.login()))
+            });
+            removed |= orgs.len() < before;
         }
-        Ok(())
+        if removed {
+            Ok(())
+        } else {
+            Err(Error::Config(format!("no PAT is configured for {key}")))
+        }
     })
 }
 
-pub(crate) fn set_metrics_pull(target: &Path, enabled: bool, addr: &str) -> Result<()> {
+/// Turn `/metrics` on or off; `addr` also moves it, otherwise its address is kept.
+pub(crate) fn set_metrics_pull(
+    target: &Path,
+    enabled: bool,
+    addr: Option<SocketAddr>,
+) -> Result<()> {
     edit(target, |doc| {
         let pull = nested_table(doc, &["metrics", "pull"])?;
         pull.insert("enabled".to_string(), Value::Boolean(enabled));
-        pull.insert("addr".to_string(), Value::String(addr.to_string()));
+        if let Some(addr) = addr {
+            pull.insert("addr".to_string(), Value::String(addr.to_string()));
+        }
         Ok(())
     })
 }
@@ -146,6 +179,14 @@ pub(crate) fn set_metrics_pull(target: &Path, enabled: bool, addr: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(s: &str) -> TokenKey {
+        TokenKey::parse(s).unwrap()
+    }
+
+    fn pat(s: &str) -> FineGrainedPat {
+        FineGrainedPat::parse(s).unwrap()
+    }
     use crate::shared::config::Config;
 
     #[test]
@@ -160,7 +201,7 @@ mod tests {
         )
         .unwrap();
 
-        set_org_token(&path, "acme", "github_pat_ABC").unwrap();
+        set_org_token(&path, &key("acme"), &pat("github_pat_ABC")).unwrap();
 
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_ABC"));
@@ -206,7 +247,7 @@ mod tests {
         )
         .unwrap();
 
-        remove_org_token(&path, "acme").unwrap();
+        remove_org_token(&path, &key("acme")).unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -226,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_last_org_token_cleans_the_empty_github_table_and_is_idempotent() {
+    fn remove_last_org_token_cleans_the_empty_github_table_and_rejects_an_unknown_org() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -235,15 +276,13 @@ mod tests {
         )
         .unwrap();
 
-        remove_org_token(&path, "acme").unwrap();
+        remove_org_token(&path, &key("acme")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("github"),
             "empty github table should be gone:\n{text}"
         );
-        remove_org_token(&path, "acme").unwrap();
-        let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(cfg.github.tokens.is_empty());
+        assert!(remove_org_token(&path, &key("acme")).is_err());
     }
 
     #[test]
@@ -259,7 +298,12 @@ mod tests {
             .map(|i| {
                 let p = Arc::clone(&path);
                 thread::spawn(move || {
-                    set_org_token(&p, &format!("org{i}"), &format!("github_pat_{i}")).unwrap();
+                    set_org_token(
+                        &p,
+                        &key(&format!("org{i}")),
+                        &pat(&format!("github_pat_{i}")),
+                    )
+                    .unwrap();
                 })
             })
             .collect();
@@ -281,7 +325,7 @@ mod tests {
     fn creates_a_fresh_file_0600_making_parents() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("etc").join("ghr-stats").join("config.toml");
-        set_org_token(&path, "acme", "github_pat_ABC").unwrap();
+        set_org_token(&path, &key("acme"), &pat("github_pat_ABC")).unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_ABC"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

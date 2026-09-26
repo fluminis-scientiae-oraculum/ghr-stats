@@ -10,13 +10,16 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+use crate::shared::github::TokenKey;
+use crate::shared::github::validate::FineGrainedPat;
+
 use crate::shared::models::timeline::{Timeline, TimelineQuery};
 use crate::shared::models::{
     BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
 };
 
 /// Wire protocol version; client and collector must match (checked by `Hello`).
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 
 const MAX_FRAME: u32 = 1 << 20;
 
@@ -65,12 +68,15 @@ pub enum Query {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Mutation {
-    /// Toggle the Prometheus pull endpoint.
-    SetMetricsPull { enabled: bool, addr: String },
-    /// Add or replace an org's PAT; never returned in any response.
-    AddOrgToken { org: String, token: String },
-    /// Remove an org's PAT and forget the org.
-    RemoveOrgToken { org: String },
+    /// Toggle the Prometheus pull endpoint at its configured address.
+    SetMetricsPull { enabled: bool },
+    /// Add or replace a PAT; never returned in any response.
+    AddOrgToken {
+        org: TokenKey,
+        token: FineGrainedPat,
+    },
+    /// Remove a PAT and forget its org.
+    RemoveOrgToken { org: TokenKey },
 }
 
 impl Mutation {

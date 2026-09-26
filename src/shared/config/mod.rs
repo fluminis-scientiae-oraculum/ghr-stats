@@ -4,6 +4,7 @@ pub(crate) mod persist;
 mod secret;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -13,7 +14,7 @@ use serde::Deserialize;
 pub use secret::Secret;
 
 use crate::shared::error::{Error, Result};
-use crate::shared::github::GitHubHost;
+use crate::shared::github::{GitHubHost, TokenKey};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +42,20 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    #[serde(skip)]
+    pub provenance: Provenance,
+}
+
+/// Where a loaded config's values came from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Provenance {
+    File(PathBuf),
+    /// No config file exists; every value is a default.
+    #[default]
+    Absent,
+    /// The file exists but this user cannot read it; every value is a default.
+    Unreadable(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -141,7 +156,7 @@ pub struct PullConfig {
     /// SECURITY: loopback by default; never bind wider without intent.
     /// Always `127.0.0.1`, never `localhost`.
     #[serde(default = "defaults::metrics_addr")]
-    pub addr: String,
+    pub addr: SocketAddr,
 }
 
 impl Default for PullConfig {
@@ -181,22 +196,34 @@ impl Default for PushConfig {
 
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        match crate::shared::paths::resolve_config(explicit) {
-            Some(p) => match std::fs::read_to_string(&p) {
-                Ok(text) => toml::from_str(&text)
-                    .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display()))),
-                // Non-root can't read the 0600 root-owned /etc config; defaults let
-                // the TUI still launch and read data over the socket.
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    tracing::warn!(
-                        path = %p.display(),
-                        "config not readable without root — using defaults (run `sudo ghr-stats` for local config)"
-                    );
-                    Ok(Config::default())
-                }
-                Err(e) => Err(Error::Config(format!("reading {}: {e}", p.display()))),
-            },
-            None => Ok(Config::default()),
+        let Some(p) = crate::shared::paths::resolve_config(explicit) else {
+            return Ok(Config::default());
+        };
+        match std::fs::read_to_string(&p) {
+            Ok(text) => {
+                let mut cfg: Config = toml::from_str(&text)
+                    .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display())))?;
+                cfg.provenance = Provenance::File(p);
+                Ok(cfg)
+            }
+            // Non-root can't read the 0600 root-owned /etc config; defaults let the TUI
+            // and read verbs still run against the collector.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(Config {
+                provenance: Provenance::Unreadable(p),
+                ..Config::default()
+            }),
+            Err(e) => Err(Error::Config(format!("reading {}: {e}", p.display()))),
+        }
+    }
+
+    /// An error naming the unreadable file, for operations that must not act on defaults.
+    pub fn require_readable(&self) -> Result<()> {
+        match &self.provenance {
+            Provenance::Unreadable(p) => Err(Error::Config(format!(
+                "{} is not readable by this user, so its settings are unknown — re-run with sudo",
+                p.display()
+            ))),
+            Provenance::File(_) | Provenance::Absent => Ok(()),
         }
     }
 
@@ -210,13 +237,11 @@ impl Config {
     /// or `host/owner`, else — for github.com only — `GHR_STATS_GITHUB_TOKEN` or
     /// `github.token`. A github.com token is never sent to another host.
     pub fn github_token_for(&self, host: &GitHubHost, owner: &str) -> Option<Secret> {
-        let keyed = self.github.tokens.iter().find(|(key, _)| {
-            let (key_host, key_owner) = match key.split_once('/') {
-                Some((h, o)) => (GitHubHost::parse(h).ok(), o),
-                None => (Some(GitHubHost::dotcom()), key.as_str()),
-            };
-            key_host.as_ref() == Some(host) && key_owner.eq_ignore_ascii_case(owner)
-        });
+        let keyed = self
+            .github
+            .tokens
+            .iter()
+            .find(|(key, _)| TokenKey::parse(key).is_ok_and(|k| k.matches(host, owner)));
         if let Some((_, t)) = keyed {
             return Some(t.clone());
         }
@@ -283,6 +308,7 @@ impl Default for Config {
             runner_roots: defaults::runner_roots(),
             orgs: Vec::new(),
             retention_days: Retention::default(),
+            provenance: Provenance::Absent,
             intervals: Intervals::default(),
             github: GithubConfig::default(),
             metrics: MetricsConfig::default(),
@@ -321,8 +347,8 @@ mod defaults {
         60
     }
 
-    pub fn metrics_addr() -> String {
-        "127.0.0.1:9477".to_string()
+    pub fn metrics_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 9477))
     }
 
     pub fn push_interval() -> u64 {

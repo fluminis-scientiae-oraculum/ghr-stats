@@ -77,7 +77,7 @@ pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
     // Edges are derived with `LAG` inside the query window, so the window must be
     // several ticks deep to hold each edge's predecessor sample. The cursor stops repeats.
     let lookback = (secs * 4).max(60) as i64;
-    let mut since = now_epoch() - lookback.max(args.since_secs() as i64);
+    let mut since = now_epoch() - lookback.max(i64::from(args.backfill));
     let mut transitions = Cursor::default();
     let mut jobs = Cursor::default();
     let mut out = std::io::stdout();

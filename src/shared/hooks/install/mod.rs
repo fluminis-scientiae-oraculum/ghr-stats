@@ -108,7 +108,10 @@ pub(crate) fn current_hook_paths(env: &str) -> (Option<String>, Option<String>) 
     (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR))
 }
 
-pub(crate) fn install_scripts(our_dir: &Path) -> Result<(PathBuf, PathBuf)> {
+pub(crate) fn install_scripts(
+    our_dir: &Path,
+    _root: &crate::shared::privileged::Root,
+) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(our_dir)?;
     let started = our_dir.join("job-started.sh");
     let completed = our_dir.join("job-completed.sh");

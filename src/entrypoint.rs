@@ -54,38 +54,39 @@ fn run() -> Result<std::process::ExitCode> {
     // Lazy, because `config` bootstraps the config file and must not require one.
     let load =
         || crate::shared::config::Config::load(config_path.as_deref()).context("loading config");
-    // `status`, `explain` and `timeline` exit codes carry meaning; 2 is "cannot determine"
-    // for all three.
+    // The machine verbs' exit codes carry meaning: a config or usage error is 3 (via
+    // `load()?`), anything that fails after that could not determine an answer (2).
     let ok = std::process::ExitCode::SUCCESS;
     match args.command {
         Some(Command::Config) => crate::ops::configure::run(config_path.as_deref()).map(|()| ok),
         None | Some(Command::Tui) => tui::run(&load()?, config_path.as_deref()).map(|()| ok),
         Some(Command::Status(a)) => {
-            crate::ops::status::run(&a, &load()?).map(std::process::ExitCode::from)
+            let cfg = load()?;
+            Ok(determined(crate::ops::status::run(&a, &cfg)))
         }
         Some(Command::Explain(a)) => {
-            crate::ops::explain::run(&a, &load()?).map(std::process::ExitCode::from)
+            let cfg = load()?;
+            Ok(determined(crate::ops::explain::run(&a, &cfg)))
         }
-        Some(Command::Timeline(a)) => {
-            crate::ops::timeline::run(&a, &load()?).map(std::process::ExitCode::from)
-        }
+        Some(Command::Timeline(a)) => Ok(determined(crate::ops::timeline::run(&a))),
         // Takes the path: `load` substitutes defaults for an unreadable config, hiding a
         // broken install.
-        Some(Command::Doctor(a)) => {
-            crate::ops::doctor::run(&a, config_path.as_deref()).map(std::process::ExitCode::from)
-        }
+        Some(Command::Doctor(a)) => Ok(determined(crate::ops::doctor::run(
+            &a,
+            config_path.as_deref(),
+        ))),
         Some(Command::Wait(a)) => {
-            crate::ops::wait::run(&a, &load()?).map(std::process::ExitCode::from)
+            let cfg = load()?;
+            Ok(determined(crate::ops::wait::run(&a, &cfg)))
         }
         Some(Command::Tail(a)) => {
-            crate::ops::tail::run(&a, &load()?).map(std::process::ExitCode::from)
+            let cfg = load()?;
+            Ok(determined(crate::ops::tail::run(&a, &cfg)))
         }
         Some(Command::Serve) => {
             crate::service::serve::run(&load()?, config_path.as_deref()).map(|()| ok)
         }
-        Some(Command::Systemd { action }) => {
-            crate::ops::systemd::run(action, &load()?).map(|()| ok)
-        }
+        Some(Command::Systemd { action }) => crate::ops::systemd::run(action).map(|()| ok),
         Some(Command::Db { action }) => run_db(action, &load()?).map(|()| ok),
         // Must work with the config absent or being removed.
         Some(Command::Uninstall(a)) => {
@@ -97,6 +98,7 @@ fn run() -> Result<std::process::ExitCode> {
 fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
     match action {
         DbAction::Prune { days } => {
+            cfg.require_readable()?;
             let mut db = crate::service::store::open_writer(&cfg.db_path)
                 .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;
             let cutoff = crate::shared::util::now_epoch() - i64::from(days) * 86_400;
@@ -114,13 +116,25 @@ fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
     }
 }
 
+/// A machine verb that fails at runtime could not determine its answer.
+fn determined<T: Into<std::process::ExitCode>>(r: Result<T>) -> std::process::ExitCode {
+    r.map(Into::into).unwrap_or_else(|e| {
+        eprintln!("Error: {e:?}");
+        std::process::ExitCode::from(2)
+    })
+}
+
 fn init_tracing(command: &Option<Command>) {
     use tracing_subscriber::{EnvFilter, fmt};
     if !logs_to_stderr(command) {
         return;
     }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// No `_` arm: a new verb must decide whether a log line would corrupt its output.

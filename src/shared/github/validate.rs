@@ -4,7 +4,9 @@
 
 use std::collections::HashSet;
 
-use super::{GitHubHost, Owner, RunnerScope, describe_failure, runners};
+use serde::{Deserialize, Serialize};
+
+use super::{Owner, RunnerScope, TokenKey, describe_failure, runners};
 use crate::shared::config::Secret;
 
 const FINE_PREFIX: &str = "github_pat_";
@@ -23,42 +25,75 @@ pub(crate) enum PatCheck {
     Rejected(String),
 }
 
-pub(crate) fn prefix_check(token: &str) -> Result<(), String> {
-    let t = token.trim();
-    if t.starts_with(FINE_PREFIX) {
-        return Ok(());
+/// A fine-grained PAT; built only by [`FineGrainedPat::parse`], so a classic token can
+/// reach neither the config nor the wire.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FineGrainedPat(String);
+
+impl FineGrainedPat {
+    pub fn parse(token: &str) -> Result<Self, String> {
+        let t = token.trim();
+        if t.starts_with(FINE_PREFIX) {
+            return Ok(Self(t.to_string()));
+        }
+        if CLASSIC_PREFIXES.iter().any(|p| t.starts_with(p)) {
+            return Err(format!("classic token detected — {GUIDANCE}"));
+        }
+        Err(format!("unrecognized token — {GUIDANCE}"))
     }
-    if CLASSIC_PREFIXES.iter().any(|p| t.starts_with(p)) {
-        return Err(format!("classic token detected — {GUIDANCE}"));
+
+    pub fn expose(&self) -> &str {
+        &self.0
     }
-    Err(format!("unrecognized token — {GUIDANCE}"))
 }
 
-/// Validate `token` for `org` against this host's runners, given as `(scope, agentId)`:
-/// every scope registered under `org` is listed, and only `org`'s runners are matched.
-pub(crate) fn validate(token: &str, org: &str, local: &[(RunnerScope, i64)]) -> PatCheck {
-    if let Err(g) = prefix_check(token) {
-        return PatCheck::Rejected(g);
+impl std::fmt::Debug for FineGrainedPat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FineGrainedPat(\"***\")")
     }
+}
+
+impl TryFrom<String> for FineGrainedPat {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        Self::parse(&s)
+    }
+}
+
+impl From<FineGrainedPat> for String {
+    fn from(p: FineGrainedPat) -> String {
+        p.0
+    }
+}
+
+/// Validate `token` for `key` against this host's runners, given as `(scope, agentId)`:
+/// every scope registered under the key is listed, and only its runners are matched.
+pub(crate) fn validate(
+    token: &FineGrainedPat,
+    key: &TokenKey,
+    local: &[(RunnerScope, i64)],
+) -> PatCheck {
     let mine: Vec<&(RunnerScope, i64)> = local
         .iter()
-        .filter(|(s, _)| s.login().eq_ignore_ascii_case(org))
+        .filter(|(s, _)| key.matches(&s.host, s.login()))
         .collect();
     let mut scopes: Vec<RunnerScope> = mine.iter().map(|(s, _)| s.clone()).collect();
     scopes.sort();
     scopes.dedup();
     if scopes.is_empty() {
         scopes.push(RunnerScope {
-            host: GitHubHost::dotcom(),
-            owner: Owner::Org(org.to_string()),
+            host: key.host().clone(),
+            owner: Owner::Org(key.login().to_string()),
         });
     }
-    let secret = Secret::from(token.trim().to_string());
+    let secret = Secret::from(token.expose().to_string());
     let mut api = Vec::new();
     for scope in &scopes {
         match runners(scope, &secret) {
             Ok(r) => api.extend(r),
-            Err(kind) => return PatCheck::Rejected(describe_failure(org, kind)),
+            Err(kind) => return PatCheck::Rejected(describe_failure(&key.to_string(), kind)),
         }
     }
     let ids: HashSet<i64> = mine.iter().map(|(_, id)| *id).collect();
@@ -75,14 +110,19 @@ mod tests {
 
     #[test]
     fn fine_grained_passes_prefix() {
-        assert!(prefix_check("github_pat_ABC").is_ok());
-        assert!(prefix_check("  github_pat_ABC  ").is_ok());
+        assert!(FineGrainedPat::parse("github_pat_ABC").is_ok());
+        assert_eq!(
+            FineGrainedPat::parse("  github_pat_ABC  ")
+                .unwrap()
+                .expose(),
+            "github_pat_ABC"
+        );
     }
 
     #[test]
     fn classic_is_rejected_with_guidance() {
         for p in ["ghp_x", "gho_x", "ghu_x", "ghs_x", "ghr_x"] {
-            let e = prefix_check(p).unwrap_err();
+            let e = FineGrainedPat::parse(p).unwrap_err();
             assert!(e.contains("classic"), "{e}");
             assert!(e.contains("github_pat_"));
             assert!(e.contains("Self-hosted runners: Read"));
@@ -91,7 +131,7 @@ mod tests {
 
     #[test]
     fn garbage_is_rejected() {
-        let e = prefix_check("hunter2").unwrap_err();
+        let e = FineGrainedPat::parse("hunter2").unwrap_err();
         assert!(e.contains("unrecognized"));
         assert!(e.contains("github_pat_"));
     }

@@ -1,5 +1,5 @@
 ---
-source: src/tui/overlay/wizard.rs
+source: src/tui/overlay/wizard/draw.rs
 expression: render(&mode)
 ---
 "                                                                                "
@@ -13,8 +13,8 @@ expression: render(&mode)
 "                │  org  example-org                            │                "
 "                │  Fine-grained PAT (github_pat_…):            │                "
 "                │•••••••••••••••                               │                "
-"                │  needs Self-hosted runners: Read  (+ Actions:│                "
-"                │Read for job results)                         │                "
+"                │  org runners: Self-hosted runners: Read      │                "
+"                │  repo runners: Administration: Read          │                "
 "                │  ✗ token lacks 'Self-hosted runners: Read' on│                "
 "                │example-org                                   │                "
 "                │                                              │                "

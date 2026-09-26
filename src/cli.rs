@@ -55,16 +55,10 @@ pub struct TailArgs {
     #[arg(long, value_name = "NAME")]
     pub runner: Option<String>,
 
-    /// Emit this many seconds of history before following.
-    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
-    pub backfill: u64,
-}
-
-impl TailArgs {
-    /// How far back the first poll reaches.
-    pub fn since_secs(&self) -> u64 {
-        self.backfill
-    }
+    /// Emit this many seconds of history before following (at most 7 days).
+    #[arg(long, value_name = "SECONDS", default_value_t = 0,
+          value_parser = clap::value_parser!(u32).range(0..=604_800))]
+    pub backfill: u32,
 }
 
 #[derive(clap::Args, Debug)]
@@ -102,8 +96,9 @@ pub struct DoctorArgs {
 #[derive(clap::Args, Debug)]
 pub struct TimelineArgs {
     /// How far back to look: 90s, 30m, 6h, 2d. Capped at 7d.
-    #[arg(long, value_name = "DURATION", default_value = "6h")]
-    pub since: String,
+    #[arg(long, value_name = "DURATION", default_value = "6h",
+          value_parser = crate::ops::timeline::since::parse_since)]
+    pub since: crate::ops::timeline::since::SinceWindow,
     /// Maximum rows per section (transitions, jobs, and samples if requested).
     #[arg(long, value_name = "N", default_value_t = 500)]
     pub limit: usize,

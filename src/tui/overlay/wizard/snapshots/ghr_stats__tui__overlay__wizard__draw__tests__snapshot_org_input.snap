@@ -1,5 +1,5 @@
 ---
-source: src/tui/wizard.rs
+source: src/tui/overlay/wizard/draw.rs
 expression: render(&mode)
 ---
 "                                                                                "
@@ -11,7 +11,7 @@ expression: render(&mode)
 "                                                                                "
 "                ┌ Add org ─────────────────────────────────────┐                "
 "                │                                              │                "
-"                │  GitHub org login: example-org               │                "
+"                │  GitHub org login (or host/org): example-org │                "
 "                │                                              │                "
 "                │  [Enter] next · [Esc] cancel                 │                "
 "                │                                              │                "

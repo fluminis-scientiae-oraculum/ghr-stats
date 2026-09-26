@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tui_input::Input;
 
-use super::WizardMode;
+use super::{Done, WizardMode};
 
 pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
     let area = crate::tui::view::centered_rect(60, 40, f.area());
@@ -25,8 +25,8 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             " Add org ",
             vec![
                 Line::from(""),
-                input_line("GitHub org login", &w.state.org, false),
-                Line::from(""),
+                input_line("GitHub org login (or host/org)", &w.state.org, false),
+                error_line(w.state.error.as_deref()),
                 footer("[Enter] next · [Esc] cancel"),
             ],
         ),
@@ -35,13 +35,17 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
                 Line::from(vec![
                     Span::raw("  org  "),
                     Span::styled(
-                        w.state.org.clone(),
+                        w.state.org.to_string(),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 input_line("Fine-grained PAT (github_pat_…)", &w.state.pat, true),
                 Line::from(Span::styled(
-                    "  needs Self-hosted runners: Read  (+ Actions: Read for job results)",
+                    "  org runners: Self-hosted runners: Read",
+                    Style::new().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  repo runners: Administration: Read",
                     Style::new().fg(Color::DarkGray),
                 )),
             ];
@@ -73,7 +77,7 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             vec![
                 Line::from(""),
                 input_line("GitHub org login to remove", &w.state.org, false),
-                Line::from(""),
+                error_line(w.state.error.as_deref()),
                 footer("[Enter] next · [Esc] cancel"),
             ],
         ),
@@ -84,7 +88,7 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
                 Line::from(vec![
                     Span::raw("  Remove the read-only PAT for "),
                     Span::styled(
-                        w.state.org.clone(),
+                        w.state.org.to_string(),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" and forget the org?"),
@@ -94,14 +98,16 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
             ],
         ),
         WizardMode::Done(w) => {
-            let color = if w.state.ok { Color::Green } else { Color::Red };
-            let glyph = if w.state.ok { "✓" } else { "✗" };
+            let (color, glyph, message) = match &w.state {
+                Done::Saved(m) => (Color::Green, "✓", m),
+                Done::Failed(m) => (Color::Red, "✗", m),
+            };
             (
                 " Done ",
                 vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("  {glyph} {}", w.state.message),
+                        format!("  {glyph} {message}"),
                         Style::new().fg(color),
                     )),
                     Line::from(""),
@@ -120,6 +126,17 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
 }
 
 /// `masked` renders `•` 1:1 per char, so the cursor still tracks the real caret.
+/// Blank when there is no error, so the layout does not jump.
+fn error_line(error: Option<&str>) -> Line<'static> {
+    match error {
+        Some(e) => Line::from(Span::styled(
+            format!("  ✗ {e}"),
+            Style::new().fg(Color::Red),
+        )),
+        None => Line::from(""),
+    }
+}
+
 fn input_line(label: &str, input: &Input, masked: bool) -> Line<'static> {
     let value = input.value();
     let shown: Vec<char> = if masked {
@@ -159,6 +176,12 @@ mod tests {
         Confirmed, Done, OrgInput, PatInput, RemoveConfirm, RemoveOrgInput, Wizard,
     };
     use super::*;
+    use crate::shared::github::TokenKey;
+    use crate::shared::github::validate::FineGrainedPat;
+
+    fn org() -> TokenKey {
+        TokenKey::parse("example-org").unwrap()
+    }
 
     fn render(mode: &WizardMode) -> String {
         use ratatui::Terminal;
@@ -172,7 +195,7 @@ mod tests {
     fn masked_pat_never_renders_the_secret() {
         let mode = WizardMode::PatInput(Wizard {
             state: PatInput {
-                org: "example-org".to_string(),
+                org: org(),
                 pat: Input::from("github_pat_SUPERSECRETVALUE".to_string()),
                 error: None,
             },
@@ -196,6 +219,7 @@ mod tests {
         let mode = WizardMode::OrgInput(Wizard {
             state: OrgInput {
                 org: Input::from("example-org".to_string()),
+                error: None,
             },
         });
         insta::assert_snapshot!(render(&mode));
@@ -205,7 +229,7 @@ mod tests {
     fn snapshot_pat_input_with_rejection() {
         let mode = WizardMode::PatInput(Wizard {
             state: PatInput {
-                org: "example-org".to_string(),
+                org: org(),
                 pat: Input::from("github_pat_abcd".to_string()),
                 error: Some("token lacks 'Self-hosted runners: Read' on example-org".to_string()),
             },
@@ -217,8 +241,8 @@ mod tests {
     fn snapshot_confirmed() {
         let mode = WizardMode::Confirmed(Wizard {
             state: Confirmed {
-                org: "example-org".to_string(),
-                pat: "github_pat_abcd".to_string(),
+                org: org(),
+                pat: FineGrainedPat::parse("github_pat_abcd").unwrap(),
                 matched: 3,
                 local: 4,
             },
@@ -229,11 +253,9 @@ mod tests {
     #[test]
     fn snapshot_done_ok() {
         let mode = WizardMode::Done(Wizard {
-            state: Done {
-                message: "saved read-only token for example-org (3/4 local runners matched)"
-                    .to_string(),
-                ok: true,
-            },
+            state: Done::Saved(
+                "saved read-only token for example-org (3/4 local runners matched)".to_string(),
+            ),
         });
         insta::assert_snapshot!(render(&mode));
     }
@@ -243,6 +265,7 @@ mod tests {
         let mode = WizardMode::RemoveOrgInput(Wizard {
             state: RemoveOrgInput {
                 org: Input::from("example-org".to_string()),
+                error: None,
             },
         });
         insta::assert_snapshot!(render(&mode));
@@ -251,9 +274,7 @@ mod tests {
     #[test]
     fn snapshot_remove_confirm() {
         let mode = WizardMode::RemoveConfirm(Wizard {
-            state: RemoveConfirm {
-                org: "example-org".to_string(),
-            },
+            state: RemoveConfirm { org: org() },
         });
         insta::assert_snapshot!(render(&mode));
     }

@@ -6,25 +6,26 @@ use std::path::Path;
 use super::hooks::{self as hook_revert, RunnerHookPlan};
 use crate::ops::systemd;
 use crate::shared::hooks::{env, install};
-use crate::shared::privileged;
+use crate::shared::privileged::{self, Root};
 
 use super::Plan;
 use super::plan::BinaryAction;
 
 impl Plan {
-    pub(super) fn apply(&self) {
+    pub(super) fn apply(&self, root: Option<&Root>) {
         if self.domains.hooks {
             println!("Hooks:");
-            if !privileged::is_root() {
-                println!(
+            match root {
+                None => println!(
                     "  ⚠ skipped — reverting hooks needs root; re-run `{}`",
                     privileged::sudo_hint("uninstall hooks")
-                );
-            } else {
-                for rp in &self.runners {
-                    println!("{}", hook_revert::apply_runner(rp));
+                ),
+                Some(root) => {
+                    for rp in &self.runners {
+                        println!("{}", hook_revert::apply_runner(rp, root));
+                    }
+                    gc_shared_scripts(&self.our_dir, &self.runners, root);
                 }
-                gc_shared_scripts(&self.our_dir, &self.runners);
             }
         }
 
@@ -64,7 +65,7 @@ impl Plan {
     }
 }
 
-fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
+fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan], _root: &Root) {
     let still_referenced = plans.iter().any(|rp| env_may_point_into(&rp.dir, our_dir));
     if still_referenced {
         println!(

@@ -55,9 +55,9 @@ pub(crate) struct Report {
 pub fn run(args: &DoctorArgs, config_path: Option<&Path>) -> Result<Verdict> {
     let report = diagnose(args, config_path);
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::ops::emit_json(&report)?;
     } else {
-        print!("{}", human(&report));
+        crate::ops::emit(&human(&report))?;
     }
     Ok(report.verdict)
 }

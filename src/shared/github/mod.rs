@@ -12,7 +12,7 @@ use crate::shared::config::Secret;
 use crate::shared::models::ApiErrorKind;
 
 pub(crate) use scope::is_repo_of;
-pub use scope::{GitHubHost, Owner, RunnerScope};
+pub use scope::{GitHubHost, Owner, RunnerScope, TokenKey};
 
 /// ureq's default timeout is infinite: a stalled peer would hang the producer thread and
 /// block SIGTERM shutdown.

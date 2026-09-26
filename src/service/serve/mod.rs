@@ -84,6 +84,7 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
         );
     }
 
+    cfg.require_readable()?;
     let _serve_lock = acquire_lock(cfg)?;
     let mut db = open_writer(&cfg.db_path)?;
     let sock = crate::service::ipc_server::socket_path();

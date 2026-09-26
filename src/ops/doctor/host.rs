@@ -7,8 +7,8 @@ use crate::cli::DoctorArgs;
 use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
-use crate::shared::github::validate::{self, PatCheck};
-use crate::shared::github::{GitHubHost, RunnerScope};
+use crate::shared::github::validate::{self, FineGrainedPat, PatCheck};
+use crate::shared::github::{RunnerScope, TokenKey};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
@@ -294,15 +294,23 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
     let mut missing = Vec::new();
     let mut rejected = Vec::new();
     for org in orgs {
-        let host = discovered
+        let key = discovered
             .iter()
             .find(|r| r.org.eq_ignore_ascii_case(org))
-            .map_or_else(GitHubHost::dotcom, |r| r.scope.host.clone());
-        let Some(token) = cfg.github_token_for(&host, org) else {
+            .map(|r| TokenKey::for_scope(&r.scope))
+            .or_else(|| TokenKey::parse(org).ok());
+        let Some(key) = key else {
+            rejected.push(format!("{org}: not a GitHub login"));
+            continue;
+        };
+        let Some(token) = cfg.github_token_for(key.host(), key.login()) else {
             missing.push(org.clone());
             continue;
         };
-        match validate::validate(token.expose(), org, &local) {
+        let check = FineGrainedPat::parse(token.expose()).map_or_else(PatCheck::Rejected, |pat| {
+            validate::validate(&pat, &key, &local)
+        });
+        match check {
             PatCheck::Valid {
                 runners, matched, ..
             } => ok.push(format!("{org} ({matched}/{runners} runners confirmed)")),

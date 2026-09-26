@@ -25,15 +25,15 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .spawn(move || {
             let conn = open_reader(&db);
             let mut server: Option<Server> = None;
-            let mut applied: Option<(bool, String)> = None;
+            let mut applied: Option<(bool, std::net::SocketAddr)> = None;
 
             while !term.load(Ordering::SeqCst) {
                 let cfg = shared.snapshot();
-                let desired = (cfg.metrics.pull.enabled, cfg.metrics.pull.addr.clone());
+                let desired = (cfg.metrics.pull.enabled, cfg.metrics.pull.addr);
                 if applied.as_ref() != Some(&desired) {
                     server = None; // drop any existing listener first (closes the port)
                     if desired.0 {
-                        match Server::http(&desired.1) {
+                        match Server::http(desired.1) {
                             Ok(s) => {
                                 tracing::info!(addr = %desired.1, "metrics pull listening");
                                 server = Some(s);

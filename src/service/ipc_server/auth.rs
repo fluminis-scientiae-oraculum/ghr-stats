@@ -6,33 +6,57 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
 use crate::shared::paths::ADMIN_GROUP;
 
-/// Peer credentials, resolved once per connection.
-#[derive(Clone, Copy)]
-pub(super) struct Auth {
-    pub(super) uid: u32,
-    pub(super) in_admin_group: bool,
+/// Who is on the other end of a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Peer {
+    Known {
+        uid: u32,
+        admin: bool,
+    },
+    /// `SO_PEERCRED` failed; never authorized.
+    Unknown,
 }
 
-/// Whether a peer may mutate config.
-pub(super) fn authorized(uid: u32, in_admin_group: bool) -> bool {
-    uid == 0 || in_admin_group
+/// Proof a peer may change config: root or a member of the admin group. Built only by
+/// [`Peer::admin`].
+pub(super) struct Admin {
+    uid: u32,
 }
 
-pub(super) fn peer_auth(stream: &UnixStream) -> Auth {
-    match getsockopt(stream, PeerCredentials) {
-        Ok(cred) => {
-            let uid = cred.uid();
-            Auth {
-                uid,
-                in_admin_group: uid_in_group(uid, ADMIN_GROUP),
+impl Admin {
+    pub(super) fn uid(&self) -> u32 {
+        self.uid
+    }
+}
+
+impl Peer {
+    pub(super) fn of(stream: &UnixStream) -> Peer {
+        match getsockopt(stream, PeerCredentials) {
+            Ok(cred) => {
+                let uid = cred.uid();
+                Peer::Known {
+                    uid,
+                    admin: uid == 0 || uid_in_group(uid, ADMIN_GROUP),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "ipc: peer credentials unavailable");
+                Peer::Unknown
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "ipc: peer credentials unavailable — treating as unprivileged");
-            Auth {
-                uid: u32::MAX,
-                in_admin_group: false,
-            }
+    }
+
+    pub(super) fn admin(&self) -> Option<Admin> {
+        match *self {
+            Peer::Known { uid, admin: true } => Some(Admin { uid }),
+            Peer::Known { admin: false, .. } | Peer::Unknown => None,
+        }
+    }
+
+    pub(super) fn uid(&self) -> Option<u32> {
+        match *self {
+            Peer::Known { uid, .. } => Some(uid),
+            Peer::Unknown => None,
         }
     }
 }

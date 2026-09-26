@@ -19,9 +19,9 @@ pub fn run(args: &StatusArgs, cfg: &Config) -> Result<Verdict> {
     status.verdict = verdict_for(&status);
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        crate::ops::emit_json(&status)?;
     } else {
-        print!("{}", human(&status));
+        crate::ops::emit(&human(&status))?;
     }
     Ok(status.verdict)
 }
@@ -104,7 +104,8 @@ fn verdict_for(status: &FleetStatus) -> Verdict {
 
 fn ephemeral_status(cfg: &Config) -> FleetStatus {
     let now = now_epoch();
-    let snap = crate::shared::collectors::collect_local(&cfg.runner_roots, now, false);
+    let roots = crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);
+    let snap = crate::shared::collectors::collect_local(&roots, now, false);
     let runners: Vec<RunnerStatus> = snap
         .runners
         .into_iter()
