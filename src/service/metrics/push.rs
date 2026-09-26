@@ -1,9 +1,5 @@
-//! Metrics push: periodically POST the snapshot as JSON to a configured
-//! ingestion endpoint (e.g. OpenObserve's `_json`). Blocking `ureq`. The thread
-//! reads the live config each cycle: it posts on the interval when enabled with
-//! an endpoint, and idles otherwise — so enabling/disabling push (or changing
-//! the endpoint) takes effect without a restart. Enable/disable transitions are
-//! logged once, not per cycle.
+//! Metrics push: POSTs the snapshot as JSON to the configured ingestion endpoint on an
+//! interval, following the live config.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +11,9 @@ use crate::service::store::open_reader;
 use crate::shared::config::SharedConfig;
 use crate::shared::util::now_epoch;
 
-/// Poll granularity for shutdown + config changes while idle/between posts.
 const TICK: Duration = Duration::from_millis(200);
 
-/// Read/write timeout for the push POST. ureq leaves these infinite by default,
-/// so a stalled ingestion endpoint would hang this thread and block the
-/// collector's SIGTERM shutdown. Bound it.
+/// ureq's timeouts are infinite by default; a stalled endpoint would block SIGTERM shutdown.
 const POST_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -32,7 +25,7 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .spawn(move || {
             let conn = open_reader(&db);
             let mut next = Instant::now();
-            let mut active = false; // whether push is currently on — for one-shot transition logs
+            let mut active = false;
 
             while !term.load(Ordering::SeqCst) {
                 let cfg = shared.snapshot();
@@ -41,7 +34,7 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                 if on != active {
                     if on {
                         tracing::info!(endpoint = %push.endpoint, every_s = push.interval_secs.max(5), "metrics push enabled");
-                        next = Instant::now(); // post promptly on enable
+                        next = Instant::now();
                     } else {
                         tracing::info!("metrics push disabled");
                     }

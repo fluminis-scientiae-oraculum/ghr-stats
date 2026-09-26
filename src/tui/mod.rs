@@ -1,18 +1,12 @@
-//! Interactive dashboard. Fully synchronous — blocking terminal I/O, called
-//! directly from `entrypoint`. The dashboard never writes: it is a pure client — an
-//! in-memory live sampler always, plus (in Persistent mode) an IPC reader of the
-//! collector (see `app` + `history`).
-//!
-//! Interaction is a typestate (see `screen`): the loop owns a runtime
-//! `ScreenState`, routes each event through it, and owns terminal teardown for
-//! the suspend window an action needs.
+//! Synchronous, read-only dashboard: a live sampler, plus an IPC reader of the
+//! collector in Persistent mode. The loop owns terminal teardown for suspended actions.
 
 mod app;
-mod history;
 mod input;
+mod overlay;
+mod source;
 mod view;
 mod viewmodel;
-mod widgets;
 
 use std::io::stdout;
 use std::path::Path;
@@ -31,32 +25,20 @@ use input::screen::{Confirm, Screen, ScreenState, Suspension};
 
 use crate::shared::config::Config;
 
-/// Live view refresh cadence (the loop still redraws immediately on input).
 const REFRESH: Duration = Duration::from_millis(2000);
 
-/// Set up the terminal, run the event loop, and always restore on exit.
-/// `ratatui::init` installs a panic hook that restores the terminal — but only
-/// raw mode + the alternate screen, NOT mouse capture (which we enable below,
-/// outside ratatui's knowledge). The `MouseCapture` guard closes that gap so a
-/// panic can't strand the terminal in mouse-reporting mode.
-/// `config_path` is the resolved `--config` override (if any) — threaded so the
-/// native config wizard writes back to the same file the run loaded.
+/// `config_path` is the `--config` override, so the wizard writes back to the loaded file.
 pub fn run(cfg: &Config, config_path: Option<&Path>) -> Result<()> {
     let mut terminal = ratatui::init();
     let mouse = MouseCapture::enable();
     let result = event_loop(&mut terminal, cfg, config_path);
-    drop(mouse); // release capture BEFORE ratatui leaves the alt screen (normal path)
+    drop(mouse); // before ratatui leaves the alternate screen
     ratatui::restore();
     result
 }
 
-/// RAII guard for terminal mouse capture, enabled OUTSIDE ratatui's lifecycle.
-/// The panic hook `ratatui::init` installs restores only raw mode + the alternate
-/// screen — it never disables mouse capture, so a panic would otherwise strand the
-/// terminal (and any multiplexer pane, e.g. tmux/zellij) reporting mouse events.
-/// Emitting `DisableMouseCapture` from `Drop` makes teardown fire on unwind as
-/// well as on the normal return path. crossterm's mouse toggles are idempotent,
-/// matching the assumption the `Suspension` guard in `input::screen` relies on.
+/// `ratatui::init`'s panic hook restores raw mode and the alternate screen but not
+/// mouse capture; disabling it in `Drop` covers unwind too.
 struct MouseCapture;
 
 impl MouseCapture {
@@ -72,12 +54,9 @@ impl Drop for MouseCapture {
     }
 }
 
-/// What an input handler decides the loop should do next.
 enum Next {
-    /// Stay in the TUI in this mode.
     Mode(ScreenState),
-    /// The user accepted: the loop must suspend, run the action, and resume.
-    Execute(Screen<Confirm<ActionKind>>),
+    Execute(Screen<Confirm>),
 }
 
 fn event_loop(
@@ -95,11 +74,8 @@ fn event_loop(
 
         let timeout = REFRESH.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
-            // Every arm moves `mode` into `next`; `mode` is reassigned by `drive`.
             let next = match event::read()? {
-                // A modal overlay (wizard / help / info) captures every key while
-                // open, so it is routed BEFORE the browsing/confirm state machine.
-                // Overlays never suspend the terminal.
+                // An open overlay captures every key before the screen state machine.
                 Event::Key(k) if k.kind == KeyEventKind::Press && app.overlay_open() => {
                     app.overlay_key(k);
                     Next::Mode(mode)
@@ -129,10 +105,6 @@ fn drive(next: Next, app: &mut App, terminal: &mut DefaultTerminal) -> Result<Sc
 fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
     match mode {
         ScreenState::Browsing(scr) => {
-            // Config-tab actions. `[a]` add-org and `[m]` metrics are native (no
-            // teardown, loop stays Browsing); `[o]` open-config and `[h]` hooks
-            // are suspend-to-TTY actions (arm Confirm → suspend). `[h]` is
-            // root-gated INFORMATIONALLY: non-root shows guidance, never an error.
             if app.tab == Tab::Config && app.drill.is_none() {
                 match code {
                     KeyCode::Char('a') => {
@@ -156,16 +128,12 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
                             });
                             return Next::Mode(ScreenState::Confirm(scr.confirm(action)));
                         }
-                        app.open_info(
-                            "Hook install needs root",
-                            crate::shared::privileged::root_guidance(),
-                        );
+                        app.open_info("Hook install needs root", overlay::help::root_guidance());
                         return Next::Mode(ScreenState::Browsing(scr));
                     }
                     _ => {}
                 }
             }
-            // Detail drill-down: R = restart, C = recycle (idle-only) the runner.
             if app.drill.is_some() {
                 let armed = match code {
                     KeyCode::Char('R') => Some(app.restart_action()),
@@ -193,10 +161,6 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
 }
 
 fn route_mouse(mode: ScreenState, app: &mut App, m: MouseEvent) -> Next {
-    // Only browsing handles mouse (tab/footer clicks, scroll); confirm/suspended
-    // ignore. A click that resolves to a key — a footer hint, or a double-click
-    // on a row — is dispatched through the SAME path as the keyboard (`route_key`),
-    // so footer buttons and double-click reuse every existing action.
     if !matches!(mode, ScreenState::Browsing(_)) {
         return Next::Mode(mode);
     }
@@ -206,19 +170,17 @@ fn route_mouse(mode: ScreenState, app: &mut App, m: MouseEvent) -> Next {
     }
 }
 
-/// Suspend ratatui, run the action on the real TTY, resume. Only the loop can do
-/// this — it owns the terminal. The `Suspension` guard couples teardown to the
-/// typestate transition via proof tokens and restores on any error path.
+/// Run the action on the real TTY; `Suspension` restores the terminal on every error path.
 fn run_suspended(
-    confirm: Screen<Confirm<ActionKind>>,
+    confirm: Screen<Confirm>,
     app: &mut App,
     terminal: &mut DefaultTerminal,
 ) -> Result<ScreenState> {
     let (guard, torn, mut tty) = Suspension::enter(terminal)?;
-    let suspended = confirm.suspend(&torn); // Confirm -> Suspended (needs &Torn)
-    let outcome = suspended.execute(&mut tty); // sudo/wizard on the real TTY
-    let restored = guard.resume()?; // ratatui re-initialised
-    let browsing = suspended.resume(restored); // Suspended -> Browsing (needs Restored)
+    let suspended = confirm.suspend(&torn);
+    let outcome = suspended.execute(&mut tty);
+    let restored = guard.resume()?;
+    let browsing = suspended.resume(restored);
     app.status = Some(outcome.message());
     Ok(ScreenState::Browsing(browsing))
 }
@@ -228,13 +190,10 @@ fn render(f: &mut Frame, app: &App, mode: &ScreenState) {
     if let ScreenState::Confirm(scr) = mode {
         view::draw_confirm(f, &scr.prompt());
     }
-    // The modal overlay is drawn last so it sits atop the dashboard + any confirm
-    // popup. (In practice they are mutually exclusive — overlays open only from
-    // Browsing.)
     match app.overlay() {
-        Some(Overlay::Wizard(w)) => widgets::wizard::draw(f, w),
-        Some(Overlay::Help) => widgets::help::draw_help(f),
-        Some(Overlay::Info { title, body }) => widgets::help::draw_info(f, title, body),
+        Some(Overlay::Wizard(w)) => overlay::wizard::draw(f, w),
+        Some(Overlay::Help) => overlay::help::draw_help(f),
+        Some(Overlay::Info { title, body }) => overlay::help::draw_info(f, title, body),
         None => {}
     }
 }

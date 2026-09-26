@@ -1,9 +1,5 @@
-//! Prometheus pull endpoint: a tiny blocking HTTP server. Bound to loopback by
-//! default (see `PullConfig::addr`). The thread reconciles its listener to the
-//! live config each cycle — binding when enabled, dropping it (closing the port)
-//! when disabled, rebinding on an address change — so a `[m]` toggle in the TUI
-//! takes effect without a restart. The recv loop uses a short timeout so it
-//! observes both the shutdown flag and config changes promptly.
+//! Prometheus pull endpoint (blocking `tiny_http`, loopback by default). Binds, rebinds or
+//! closes as the live config changes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,8 +14,6 @@ use crate::service::store::open_reader;
 use crate::shared::config::SharedConfig;
 use crate::shared::util::now_epoch;
 
-/// How long a bound listener blocks on `recv` (also the disabled-state poll) —
-/// bounds how quickly the thread reacts to shutdown or a config change.
 const TICK: Duration = Duration::from_millis(500);
 
 pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -31,8 +25,6 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .spawn(move || {
             let conn = open_reader(&db);
             let mut server: Option<Server> = None;
-            // The last-reconciled desired state; act only on a transition, so a
-            // steady state neither rebinds nor spams the log.
             let mut applied: Option<(bool, String)> = None;
 
             while !term.load(Ordering::SeqCst) {
@@ -46,8 +38,6 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                                 tracing::info!(addr = %desired.1, "metrics pull listening");
                                 server = Some(s);
                             }
-                            // Leave unbound; a later addr change retries. Logged once
-                            // (this is a transition), so no per-cycle spam.
                             Err(e) => {
                                 tracing::error!(error = %e, addr = %desired.1, "metrics pull: bind failed")
                             }
@@ -73,10 +63,10 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                             };
                             let _ = req.respond(resp);
                         }
-                        Ok(None) => {} // timeout — re-check shutdown + config
+                        Ok(None) => {}
                         Err(e) => tracing::warn!(error = %e, "metrics pull: recv"),
                     },
-                    None => thread::sleep(TICK), // disabled/unbound — poll config + term
+                    None => thread::sleep(TICK),
                 }
             }
             tracing::debug!("metrics pull stopped");

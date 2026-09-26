@@ -1,28 +1,4 @@
 //! Collector-side writes. One transaction per tick keeps a sample atomic.
-//!
-//! Cut by WHOSE ROWS THESE ARE — the mirror of the [`super::reader`] split, and
-//! the same three producers `serve` runs as separate threads:
-//!
-//! - **this file** — what the collector SAMPLED off this machine: the runner and
-//!   host ticks, and the local liveness edge they drive.
-//! - [`github`] — what GITHUB said, from the reconcile thread's `api_*` writes.
-//! - [`jobs`] — what the RUNNERS' HOOKS reported: the ingested event log, the
-//!   tailer's offset into it, and the conclusion write-back that fills a column
-//!   the hook left NULL.
-//!
-//! Ownership, note, and not which thread makes the call. [`jobs`] holds
-//! `apply_job_conclusions` even though the reconcile thread is what calls it,
-//! because the rows it updates are the hooks' — and history agrees: that function
-//! has changed twice, both times alongside the hook write and never alongside
-//! [`github`].
-//!
-//! [`prune`] stays here for the opposite reason: it belongs to NO producer. It
-//! deletes across every sample table, so its `SAMPLE_TABLES` list has to name
-//! what all three children write — which is a thing a parent may know and a
-//! sibling may not. `0.2.0` is the proof: adding `api_reconcile_sample` was one
-//! commit touching both [`github`]'s writes and this list, the only edit that has
-//! ever spanned two of these groups. `entrypoint` drives it on the retention
-//! timer, not `serve` on a producer thread.
 
 use rusqlite::{Connection, params};
 
@@ -35,7 +11,6 @@ mod jobs;
 pub use github::write_api_runners;
 pub use jobs::{apply_hook_events, apply_job_conclusions};
 
-/// Persist one tick: all runner rows plus the host row, atomically.
 pub fn write_local(
     conn: &mut Connection,
     runners: &[RunnerSample],
@@ -45,8 +20,8 @@ pub fn write_local(
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO runner_sample \
-             (ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (ts, agent_id, name, org, liveness, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for r in runners {
             stmt.execute(params![
@@ -55,7 +30,6 @@ pub fn write_local(
                 r.name,
                 r.org,
                 r.liveness.as_str(),
-                r.current_run_id,
                 r.cpu_pct.map(|v| v as f64),
                 r.mem_bytes.map(|v| v as i64),
                 r.uptime_s.map(|v| v as i64),
@@ -82,10 +56,8 @@ pub fn write_local(
         ],
     )?;
 
-    // Edge-detect liveness: reset `since_ts` only when a runner's liveness
-    // actually changes, so the TUI can show "Idle/Active for <dur>". One row
-    // per runner; `last_seen_ts` always advances. Pure-SQL edge detection —
-    // the single-writer connection makes the read-compare-write race-free.
+    // `since_ts` moves only on a liveness change. The read-compare-write is race-free
+    // because this is the only writer connection.
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO runner_state (dir, liveness, since_ts, last_seen_ts) \
@@ -105,9 +77,7 @@ pub fn write_local(
     Ok(())
 }
 
-/// Delete time-series samples older than `cutoff_ts`. `job_event` is kept (low
-/// volume, high value). Returns the number of rows removed. Safe to run while
-/// the collector writes — WAL handles the concurrency.
+/// Keeps `job_event`. A new time-series table must be added to `SAMPLE_TABLES`.
 pub fn prune(conn: &mut Connection, cutoff_ts: i64) -> Result<usize> {
     const SAMPLE_TABLES: [&str; 5] = [
         "runner_sample",
@@ -119,7 +89,6 @@ pub fn prune(conn: &mut Connection, cutoff_ts: i64) -> Result<usize> {
     let tx = conn.transaction()?;
     let mut removed = 0;
     for table in SAMPLE_TABLES {
-        // Table names are fixed literals — no injection surface.
         removed += tx.execute(
             &format!("DELETE FROM {table} WHERE ts < ?1"),
             params![cutoff_ts],
@@ -156,7 +125,6 @@ mod tests {
         conn.execute("INSERT INTO job_event (run_id) VALUES (42)", [])
             .unwrap();
 
-        // Cutoff 300 removes the two ts=100 rows; keeps ts=500 and job_event.
         let removed = prune(&mut conn, 300).unwrap();
         assert_eq!(removed, 2);
         let runners: i64 = conn
@@ -193,14 +161,12 @@ mod tests {
             name: "r".into(),
             org: "o".into(),
             liveness: live,
-            current_run_id: None,
             cpu_pct: None,
             mem_bytes: None,
             mem_current_bytes: None,
             uptime_s: None,
         };
 
-        // Two idle ticks: since_ts pins to the FIRST one (no edge on the second).
         write_local(&mut conn, &[sample(100, Liveness::Idle)], &host).unwrap();
         write_local(&mut conn, &[sample(200, Liveness::Idle)], &host).unwrap();
         let (live, since): (String, i64) = conn
@@ -212,7 +178,6 @@ mod tests {
             .unwrap();
         assert_eq!((live.as_str(), since), ("idle", 100));
 
-        // A liveness change moves since_ts to the change time; last_seen advances.
         write_local(&mut conn, &[sample(300, Liveness::Busy)], &host).unwrap();
         let (live, since, seen): (String, i64, i64) = conn
             .query_row(

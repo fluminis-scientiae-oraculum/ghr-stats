@@ -1,5 +1,5 @@
 ---
-source: src/tui/widgets/wizard.rs
+source: src/tui/overlay/wizard.rs
 expression: render(&mode)
 ---
 "                                                                                "
@@ -9,12 +9,12 @@ expression: render(&mode)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                ┌ Confirm remove ──────────────────────────────┐                "
+"                ┌ Remove org ──────────────────────────────────┐                "
 "                │                                              │                "
-"                │  Remove the read-only PAT for example-org and│                "
-"                │forget the org?                               │                "
+"                │  GitHub org login to remove: example-org     │                "
 "                │                                              │                "
-"                │  [y] remove · [n] cancel                     │                "
+"                │  [Enter] next · [Esc] cancel                 │                "
+"                │                                              │                "
 "                │                                              │                "
 "                │                                              │                "
 "                │                                              │                "

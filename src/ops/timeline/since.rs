@@ -1,29 +1,16 @@
-//! The question in: `--since 6h` to a bounded window.
-//!
-//! The cap is the point. A window is billed in work, not in output — deriving
-//! edges costs roughly a second per day of span on this fleet's database — so an
-//! unbounded `--since` is a way to hang the collector from the CLI. The parse
-//! therefore CLAMPS rather than rejecting, and records that it did, because a
-//! silently shortened window would make the answer a lie about its own range.
-//!
-//! A bare number is refused. `--since 6` is ambiguous between seconds and hours,
-//! and guessing would make every such invocation wrong half the time.
+//! `--since` to a bounded window. Deriving edges costs work proportional to the
+//! span, so an uncapped window could stall the collector.
 
 use anyhow::Result;
 
 use super::MAX_WINDOW_SECS;
 
-/// A parsed `--since`, and whether the cap moved it.
 pub(super) struct SinceWindow {
     pub(super) secs: u64,
     pub(super) clamped: bool,
 }
 
-/// Parse `90s` / `30m` / `6h` / `2d` into seconds, capped at [`MAX_WINDOW_SECS`].
-///
-/// A unit is required. A bare `6` could mean seconds or hours depending on who
-/// wrote the caller, and a window silently a hundred times wider than intended
-/// is worse than a rejected flag.
+/// A unit is required: a bare `6` could mean seconds or hours.
 pub(super) fn parse_since(s: &str) -> Result<SinceWindow> {
     let s = s.trim();
     let (digits, unit) = s.split_at(s.len().saturating_sub(1));
@@ -40,9 +27,7 @@ pub(super) fn parse_since(s: &str) -> Result<SinceWindow> {
     if n == 0 {
         anyhow::bail!("--since must be greater than zero (got {s:?})");
     }
-    // Saturating, so `999999999d` clamps to the cap rather than wrapping into a
-    // tiny window — an overflow that silently NARROWS the window would be the
-    // one failure mode a caller could not see in the output.
+    // Saturating: an overflow clamps to the cap instead of wrapping to a narrow window.
     let secs = n.saturating_mul(multiplier);
     Ok(SinceWindow {
         secs: secs.min(MAX_WINDOW_SECS),
@@ -63,9 +48,6 @@ mod tests {
         }
     }
 
-    /// A bare number is rejected rather than guessed at: `--since 6` meaning six
-    /// seconds when the caller meant six hours is a wrong answer that looks
-    /// right.
     #[test]
     fn since_requires_a_unit() {
         assert!(parse_since("6").is_err());
@@ -82,9 +64,6 @@ mod tests {
         assert!(w.clamped);
     }
 
-    /// A window so large it overflows `u64` seconds must clamp UP to the cap,
-    /// never wrap down to a few seconds — a silently narrowed window is the one
-    /// error a caller could not detect from the output.
     #[test]
     fn an_overflowing_window_clamps_to_the_cap() {
         let w = parse_since("999999999999999999999d").is_err();

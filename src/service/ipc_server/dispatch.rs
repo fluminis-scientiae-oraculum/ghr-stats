@@ -1,16 +1,5 @@
-//! What a request means.
-//!
-//! One request in, one response out, with no notion of sockets, threads or
-//! shutdown — [`super`] owns those. Everything here is a pure-ish adapter over
-//! two backing stores, and which one an arm reaches for is the file's internal
-//! grain: reads go to `store::reader` (plus `metrics::Snapshot` for the verdict),
-//! writes and token-org presence go to the config file through `config::persist`.
-//!
-//! Both dispatch tables are exhaustive with no `_` arm, so a new [`Query`] or
-//! [`Mutation`] variant is a compile error until it is handled here. That is also
-//! what makes the authz gate total: [`apply_mutation`] is reachable only through
-//! the one check in [`handle`], so every present and future mutation is gated by
-//! construction rather than by remembering to add a check.
+//! Request to response. Neither dispatch table has a `_` arm, and [`apply_mutation`]
+//! must stay reachable only past the authz check in [`handle`].
 
 use std::path::Path;
 
@@ -22,9 +11,6 @@ use crate::shared::ipc::{ApiRow, Mutation, Query, Request, Response, VERSION};
 
 use super::auth::{Auth, authorized};
 
-/// Map one request to a response. Reads go through `store::reader`; mutations go
-/// through the authz gate to `config::persist` (writing `config_path`). A DB or
-/// query error becomes `Response::Error` rather than dropping the connection.
 pub(super) fn handle(
     req: &Request,
     conn: Option<&Connection>,
@@ -35,15 +21,11 @@ pub(super) fn handle(
     match req {
         Request::Hello { .. } => Response::Hello {
             server: VERSION,
-            // Report our BUILD version too, so a TUI can tell "the service is
-            // an older binary" from "no service" — the upgrade-without-restart
-            // case, which otherwise looks identical to an absent collector.
+            // Lets a TUI tell an older running binary from an absent collector.
             version: crate::shared::util::BUILD_VERSION.to_string(),
         },
-        // Reads: never authorized (derived stats + config presence, no secrets).
+        // Reads are ungated: derived stats and config presence, no secrets.
         Request::Query(q) => serve_query(q, conn, config_path, max_age),
-        // Writes: the ONE authz gate. `apply_mutation` is reachable only past it,
-        // so no mutation — present or future — can skip authorization.
         Request::Mutate(m) => {
             if !authorized(auth.uid, auth.in_admin_group) {
                 tracing::warn!(
@@ -58,36 +40,19 @@ pub(super) fn handle(
     }
 }
 
-/// Upper bound on any read query's `limit`. The IPC is unauthenticated by design
-/// and reachable by any local user (the socket is 0666), so an unclamped `limit`
-/// — `usize::MAX` casts to a negative `i64`, which SQLite treats as "no limit" —
-/// would force a full-table scan + full JSON serialize. Cap it far above any real
-/// history/trend window.
+/// The socket is reachable by any local user, and `usize::MAX` casts to a negative
+/// `i64`, which SQLite treats as no limit.
 const MAX_QUERY_LIMIT: usize = 10_000;
 
-/// Clamp a client-supplied query limit to [`MAX_QUERY_LIMIT`]. Pure + tested.
 fn clamped(limit: usize) -> usize {
     limit.min(MAX_QUERY_LIMIT)
 }
 
-/// `timeline`'s own, tighter bound.
-///
-/// Its rows are an order of magnitude wider than a `HistPoint` — org, runner
-/// name and an adjudicated GitHub view per sample — so `MAX_QUERY_LIMIT` rows
-/// would serialize past `MAX_FRAME` and fail the whole reply rather than
-/// returning a short one. A cap that turns a large request into a *bounded
-/// answer* is the point of the verb; a cap that turns it into an error is not.
-/// Sized so even the widest row shape stays comfortably inside the frame.
+/// Timeline rows are far wider than a `HistPoint`; sized so a full reply stays inside `MAX_FRAME`.
 const MAX_TIMELINE_LIMIT: usize = 2_000;
 
-/// Serve a read query. Exhaustive over [`Query`] (a new read variant is a compile
-/// error until handled here — no `unreachable!`). The DB-availability check is
-/// factored into [`with_db`], so only the arms that need the reader carry it;
-/// `ConfiguredTokenOrgs` reads the config file instead. Every `limit` is clamped
-/// to [`MAX_QUERY_LIMIT`] before it reaches the reader.
 fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age: u64) -> Response {
     match q {
-        // Presence-only view of configured token orgs (config file, not the DB).
         Query::ConfiguredTokenOrgs => {
             Response::ConfiguredTokenOrgs(configured_token_orgs(config_path))
         }
@@ -134,9 +99,7 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                 },
             )
         }),
-        // The verdict is computed collector-side, from the same Snapshot the
-        // exporter uses — so `status`, /metrics and the push sink can never
-        // disagree about whether the fleet is healthy.
+        // Same `Snapshot` as the exporter, so `status`, /metrics and push never disagree.
         Query::FleetStatus => with_db(conn, |c| {
             wrap(
                 crate::service::metrics::Snapshot::gather(
@@ -149,12 +112,6 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
                 Response::FleetStatus,
             )
         }),
-        // The window is the client's to choose; the ROW COUNT is not. Clamping
-        // here rather than trusting the CLI's own cap is what keeps the bound
-        // real — the socket is reachable by any local user, and `timeline` is
-        // the first query whose natural answer is unbounded.
-        // Deliberately takes no window: the answer is a property of the store,
-        // so there is nothing for a caller to bound and nothing to clamp.
         Query::Retention => with_db(conn, |c| {
             wrap(reader::retention(c), |earliest_ts| Response::Retention {
                 earliest_ts,
@@ -176,11 +133,6 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
     }
 }
 
-/// Apply an authorized config mutation. Reachable ONLY past the authz gate in
-/// [`handle`]. Exhaustive over [`Mutation`] (a new write variant is a compile
-/// error until handled — and it is automatically gated, since this is the only
-/// caller). Success is audit-logged with the peer uid; a persist error becomes
-/// `Response::Error`.
 fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
     let result = match m {
         Mutation::SetMetricsPull { enabled, addr } => {
@@ -202,17 +154,14 @@ fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
     }
 }
 
-/// The configured token org logins, read FRESH from the system config (so a
-/// just-persisted `[a]` addition is reflected without a collector restart) —
-/// presence only, never a token value. An unreadable/malformed config ⇒ empty.
+/// Read from disk, so a just-persisted token org shows without a restart. Unreadable config
+/// ⇒ empty.
 fn configured_token_orgs(config_path: &Path) -> Vec<String> {
     std::fs::read_to_string(config_path)
         .map(|text| crate::shared::config::token_orgs(&text))
         .unwrap_or_default()
 }
 
-/// Run `f` with the DB reader connection, or reply `Error` if the DB is
-/// unavailable — the single home for that check, so every read arm shares it.
 fn with_db(conn: Option<&Connection>, f: impl FnOnce(&Connection) -> Response) -> Response {
     match conn {
         Some(c) => f(c),
@@ -220,7 +169,6 @@ fn with_db(conn: Option<&Connection>, f: impl FnOnce(&Connection) -> Response) -
     }
 }
 
-/// Fold a reader `Result<T>` into a `Response`: `ok` on success, `Error` on failure.
 fn wrap<T>(res: crate::shared::error::Result<T>, ok: impl FnOnce(T) -> Response) -> Response {
     match res {
         Ok(v) => ok(v),
@@ -236,16 +184,10 @@ mod tests {
 
     use crate::service::store;
 
-    /// `timeline`'s bound has to hold against the CLIENT, not just the CLI: the
-    /// socket is reachable by any local user, so a caller that ignores its own
-    /// cap must still get a bounded answer rather than an oversized frame the
-    /// server then fails to send.
     #[test]
     fn a_timeline_limit_is_clamped_server_side() {
         let mut conn = Connection::open_in_memory().unwrap();
         store::schema_for_test(&mut conn);
-        // Two samples, one edge — enough to prove the query ran, while the limit
-        // being clamped is what the assertion is really about.
         for (ts, live) in [(100, "idle"), (200, "busy")] {
             conn.execute(
                 "INSERT INTO runner_sample (ts, agent_id, name, org, liveness, dir) \
@@ -258,7 +200,6 @@ mod tests {
             &Request::Query(Query::Timeline(
                 crate::shared::models::timeline::TimelineQuery {
                     since_ts: 0,
-                    // A limit that would serialize past MAX_FRAME if honoured.
                     limit: usize::MAX,
                     org: None,
                     runner: None,
@@ -273,23 +214,11 @@ mod tests {
         match reply {
             Response::Timeline(t) => {
                 assert_eq!(t.transitions.items.len(), 1);
-                // Clamped, so the reply is a bounded answer — not the frame-too-
-                // large error an unclamped `usize::MAX` would have produced.
                 assert!(!t.transitions.limited);
                 assert_eq!(t.samples.map(|s| s.items.len()), Some(2));
             }
             other => panic!("expected a timeline, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn query_limit_is_clamped() {
-        // A hostile/huge limit is bounded; `usize::MAX` (which would cast to a
-        // negative i64 = SQLite "no limit") is capped, not passed through.
-        assert_eq!(clamped(5), 5);
-        assert_eq!(clamped(MAX_QUERY_LIMIT), MAX_QUERY_LIMIT);
-        assert_eq!(clamped(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
-        assert_eq!(clamped(usize::MAX), MAX_QUERY_LIMIT);
     }
 
     fn seeded() -> Connection {
@@ -304,7 +233,6 @@ mod tests {
         conn
     }
 
-    // Auth fixtures + a config path reads never touch.
     const ROOT: Auth = Auth {
         uid: 0,
         in_admin_group: false,
@@ -317,7 +245,6 @@ mod tests {
         uid: 1000,
         in_admin_group: false,
     };
-    /// Freshness window for tests whose assertions do not depend on it.
     use crate::shared::models::GhView;
     const MAX_AGE: u64 = 180;
     fn noconf() -> PathBuf {
@@ -370,8 +297,6 @@ mod tests {
             [],
         )
         .unwrap();
-        // A very wide window, so the row is unambiguously fresh regardless of
-        // the wall clock this test runs at.
         match handle(
             &Request::Query(Query::LatestApiRunners),
             Some(&conn),
@@ -389,10 +314,6 @@ mod tests {
         }
     }
 
-    /// The wire must carry the freshness verdict, not a bare state the TUI
-    /// would have to re-adjudicate. With a zero-second window the same row
-    /// crosses as Stale, and its online/busy read as unknown rather than as a
-    /// confident (and wrong) "online".
     #[test]
     fn latest_api_runners_reports_an_aged_row_as_stale_over_the_wire() {
         let conn = seeded();
@@ -452,8 +373,6 @@ mod tests {
             "[github.tokens]\nwidgets = \"github_pat_SECRET\"\nacme = \"github_pat_OTHER\"\n",
         )
         .unwrap();
-        // NOBODY (unauthorized for mutations) can still read presence — org logins
-        // aren't secret. No DB needed.
         match handle(
             &Request::Query(Query::ConfiguredTokenOrgs),
             None,
@@ -466,7 +385,6 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        // A missing/unreadable config yields an empty list, never an error.
         assert!(matches!(
             handle(&Request::Query(Query::ConfiguredTokenOrgs), None, NOBODY, &noconf(), MAX_AGE),
             Response::ConfiguredTokenOrgs(orgs) if orgs.is_empty()
@@ -496,7 +414,6 @@ mod tests {
             enabled: true,
             addr: "127.0.0.1:9999".to_string(),
         });
-        // A group member is authorized (as is root).
         assert!(matches!(
             handle(&req, None, MEMBER, &cfg, MAX_AGE),
             Response::Mutated
@@ -507,9 +424,4 @@ mod tests {
             "persisted config should hold the new addr"
         );
     }
-
-    // NB: there is deliberately NO per-mutation "is it gated?" test. The
-    // `Request::Mutate` branch is the sole path to `apply_mutation`, so the
-    // single `mutation_denied_*` case above proves the gate for EVERY present
-    // and future mutation — the structure guarantees it, not a test per variant.
 }

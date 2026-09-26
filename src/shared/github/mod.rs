@@ -1,6 +1,4 @@
-//! GitHub API (read-only), via the blocking `ureq` client — no async runtime.
-//! We hit `/orgs/{org}/actions/runners` directly. Tokens are fine-grained,
-//! read-only, and never logged.
+//! Read-only GitHub API over blocking `ureq`. Tokens are never logged.
 
 pub mod validate;
 
@@ -11,14 +9,11 @@ use serde::Deserialize;
 use crate::shared::error::{Error, Result};
 use crate::shared::models::ApiErrorKind;
 
-/// Global timeout for every GitHub call. ureq leaves the timeout unset
-/// (infinite) by default, so a peer that accepts the connection then stalls
-/// mid-response would hang the calling producer thread indefinitely and block
-/// the collector's SIGTERM shutdown. Bound it (`timeout_global`).
+/// ureq's default timeout is infinite: a stalled peer would hang the producer thread and
+/// block SIGTERM shutdown.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A runner as GitHub sees it. `id` is the same `agentId` stored in `.runner`,
-/// so it joins directly to locally-discovered runners.
+/// `id` is the `.runner` `agentId`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiRunner {
     pub id: i64,
@@ -34,12 +29,6 @@ struct RunnersResponse {
     runners: Vec<ApiRunner>,
 }
 
-/// List an org's self-hosted runners, classifying any failure.
-///
-/// The reconcile needs the failure *kind*, not a formatted message: it records
-/// per-org health and labels `ghr_api_reconcile_errors_total{kind=…}`. The
-/// message-returning [`list_org_runners`] is a thin wrapper over this, so both
-/// paths share one taxonomy ([`ApiErrorKind`]) instead of classifying twice.
 pub fn list_org_runners_classified(
     token: &str,
     org: &str,
@@ -66,15 +55,13 @@ pub fn list_org_runners_classified(
     }
 }
 
-/// List an org's self-hosted runners. Requires only the fine-grained
-/// "Self-hosted runners: read" organization permission.
+/// Needs only the fine-grained "Self-hosted runners: read" org permission.
 pub fn list_org_runners(token: &str, org: &str) -> Result<Vec<ApiRunner>> {
     list_org_runners_classified(token, org)
         .map_err(|kind| Error::Github(describe_failure(org, kind)))
 }
 
-/// One job of a workflow run, as the Actions API reports it. `conclusion` is
-/// null until the job finishes (then "success" | "failure" | "cancelled" | …).
+/// `conclusion` is null until the job finishes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunJob {
     pub name: String,
@@ -88,11 +75,8 @@ struct JobsResponse {
     jobs: Vec<RunJob>,
 }
 
-/// List the jobs of one workflow run (`repo` = "owner/name"). Used to reconcile
-/// each `job_event`'s pass/fail conclusion. Requires the fine-grained
-/// "Actions: read" repository permission — a token scoped only to
-/// "Self-hosted runners: read" gets 403 here, which the caller treats as "skip"
-/// so conclusions simply stay unresolved rather than failing the reconcile.
+/// `repo` is `owner/name`. Needs "Actions: read"; a runners-only token gets 403, which
+/// callers treat as skip.
 pub fn list_run_jobs(token: &str, repo: &str, run_id: i64) -> Result<Vec<RunJob>> {
     let url =
         format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100");
@@ -120,9 +104,6 @@ pub fn list_run_jobs(token: &str, repo: &str, run_id: i64) -> Result<Vec<RunJob>
     }
 }
 
-/// Render a classified failure as an actionable operator message. The hint text
-/// lives on [`ApiErrorKind`], not here — this only chooses the wording around
-/// it, so the wizard's message and the metric's `kind` label can never drift.
 fn describe_failure(org: &str, kind: ApiErrorKind) -> String {
     match kind.http_status() {
         Some(code) => format!("{org}: HTTP {code} — {}", kind.hint()),

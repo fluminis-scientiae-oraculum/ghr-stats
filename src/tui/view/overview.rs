@@ -1,7 +1,3 @@
-//! The fleet Summary: a host header (with a GitHub-view line in Persistent mode,
-//! or an "install the collector" hint in Ephemeral) and a responsive,
-//! ellipsized runner table.
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -17,8 +13,6 @@ use crate::tui::app::App;
 use crate::tui::viewmodel;
 
 pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
-    // The shared keymap footer is drawn by the parent; this view owns only its
-    // header + table.
     let chunks = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).split(area);
     draw_header(f, app, chunks[0]);
     draw_table(f, app, chunks[1]);
@@ -54,10 +48,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
     ]);
 
-    // All-green must be reachable only when GitHub agrees. During the
-    // 2026-07-25 outage this header read "21 runners · 21 idle · 0 offline"
-    // while 8 of them could not take work — every local signal was healthy and
-    // nothing surfaced the disagreement.
+    // Local signals can all be healthy while GitHub cannot route work to a runner.
     let divergent = app
         .runners
         .iter()
@@ -95,17 +86,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         None => Line::from(" host: no data"),
     };
 
-    // Third line: the GitHub fleet summary when data is present, else the reason
-    // it's absent — derived once in the viewmodel, never re-decided here.
     let third = match viewmodel::status::github_reason(
         app.mode(),
         app.has_tokens(),
         app.reconcile_populated(),
     ) {
         None => {
-            // Only FRESH readings count. A stale row must not be tallied as
-            // "online" — that is how the header stayed reassuring while the
-            // reconcile was dead.
             let online = app
                 .api_state
                 .values()
@@ -127,8 +113,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         )),
     };
 
-    // The build version rides the panel title: always visible, costs no rows,
-    // and answers "what am I actually running" without a keypress.
     let para = Paragraph::new(vec![counts, host, third]).block(Block::bordered().title(format!(
         " ghr-stats v{} ",
         crate::shared::util::BUILD_VERSION
@@ -137,9 +121,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_table(f: &mut Frame, app: &App, area: Rect) {
-    // Responsive: the metric columns are fixed; the Runner/Org text columns
-    // share the remaining width and middle-ellipsize to fit. `For` = time in the
-    // current liveness; `Hook` = job-hook status.
     let inner_w = area.width.saturating_sub(2) as usize;
     let fixed = 9 + 7 + 6 + 8 + 8 + 10 + 6 + 8; // Local,For,Hook,GH,CPU,Mem(ws),Up + spacing
     let flex = inner_w.saturating_sub(fixed).max(18);
@@ -184,15 +165,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▌")
         .block(Block::bordered().title(format!(" runners ({}) ", app.runners.len())));
 
-    // Render needs `&mut TableState`; borrow the interior-mutable state so
-    // ratatui's auto-scroll offset is written BACK to `app.table` (not discarded
-    // into a throwaway copy) — that's what keeps click-to-select accurate once the
-    // list scrolls past one screen.
+    // Borrow, not copy: click-to-select reads ratatui's auto-scroll offset back.
     let mut state = app.table.borrow_mut();
     f.render_stateful_widget(table, area, &mut state);
 
-    // Cache the data-row region (inside the border, below the header) so a click
-    // there selects the runner under the cursor.
+    // Inside the border, below the header.
     app.hits.borrow_mut().table_rows = Some(Rect {
         x: area.x + 1,
         y: area.y + 2,
@@ -201,13 +178,11 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
     });
 }
 
-/// Time held in the current liveness state ("2d14h", "5m"), or "—".
 fn state_for(secs: Option<i64>) -> String {
     secs.map(|s| fmt_dur(s.max(0) as u64))
         .unwrap_or_else(|| "—".to_string())
 }
 
-/// Compact GitHub-state glyph for the table's "GH" column.
 fn gh_span(gh: GhView) -> Span<'static> {
     match gh {
         GhView::Fresh { state, .. } if state.busy => {
@@ -217,9 +192,7 @@ fn gh_span(gh: GhView) -> Span<'static> {
             Span::styled("○ idle", Style::new().fg(Color::Cyan))
         }
         GhView::Fresh { .. } => Span::styled("× off", Style::new().fg(Color::Red)),
-        // We HAD a reading and it has aged out — distinct from "–" (never had
-        // one). Collapsing the two is what let a dead reconcile keep serving
-        // confident stale values as though they were live.
+        // Aged out, distinct from never having a reading.
         GhView::Stale { age_s } => Span::styled(
             format!("stale {}", fmt_dur(age_s.max(0) as u64)),
             Style::new().fg(Color::Yellow),
@@ -228,8 +201,6 @@ fn gh_span(gh: GhView) -> Span<'static> {
     }
 }
 
-/// Job-hook status glyph, colored by severity: ours (green ✓), a foreign hook
-/// (yellow ✗ — chain/instruct), none (red ✗), unreadable (gray ?).
 fn hook_span(h: HookStatus) -> Span<'static> {
     let color = match h {
         HookStatus::Ours => Color::Green,
@@ -237,5 +208,5 @@ fn hook_span(h: HookStatus) -> Span<'static> {
         HookStatus::Unset => Color::Red,
         HookStatus::Unreadable => Color::DarkGray,
     };
-    Span::styled(h.glyph(), Style::new().fg(color))
+    Span::styled(super::fmt::hook_glyph(h), Style::new().fg(color))
 }

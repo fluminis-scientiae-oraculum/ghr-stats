@@ -1,23 +1,10 @@
-//! Phase two: everything that can remove something.
-//!
-//! This module exists so the destructive surface is one file. Every
-//! `std::fs::remove_*` in `ops::uninstall` is here, which turns "a dry-run
-//! removes nothing" from a property you audit into a property you can see.
-//!
-//! Order is load-bearing. Hooks are reverted FIRST, per runner and detect-first,
-//! and only then are the shared scripts garbage-collected — and
-//! [`gc_shared_scripts`] refuses while any runner's live `.env` still points into
-//! our directory. A foreign or unreverted runner must never be left pointing at a
-//! script we deleted; that is the same never-strand rule the chain wrapper
-//! enforces from the other direction.
-//!
-//! [`remove_reporting`] prints each outcome rather than failing the run, because
-//! a partial uninstall must say exactly what it did and did not manage to remove.
+//! Every removal in `ops::uninstall`. Never strand a runner: shared hook scripts
+//! go only after the hooks are reverted and no runner's `.env` points at them.
 
 use std::path::Path;
 
+use super::hooks::{self as hook_revert, RunnerHookPlan};
 use crate::ops::systemd;
-use crate::shared::hooks::uninstall::{self as hook_revert, RunnerHookPlan};
 use crate::shared::hooks::{env, install};
 use crate::shared::privileged;
 
@@ -26,7 +13,6 @@ use super::plan::BinaryAction;
 
 impl Plan {
     pub(super) fn apply(&self) {
-        // Hooks first: revert runners, then GC the shared scripts if orphaned.
         if self.domains.hooks {
             println!("Hooks:");
             if !privileged::is_root() {
@@ -78,8 +64,6 @@ impl Plan {
     }
 }
 
-/// Remove the shared `job-*.sh` scripts + the hooks dir, but only once no
-/// runner's live `.env` may still point into it.
 fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
     let still_referenced = plans.iter().any(|rp| env_may_point_into(&rp.dir, our_dir));
     if still_referenced {
@@ -96,8 +80,6 @@ fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan]) {
     }
 }
 
-/// Whether a runner's current `.env` points a hook var inside `our_dir`; an
-/// unreadable `.env` might, so it counts.
 fn env_may_point_into(runner_dir: &Path, our_dir: &Path) -> bool {
     let Ok(env) = env::read(runner_dir) else {
         return true;

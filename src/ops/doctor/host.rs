@@ -1,14 +1,4 @@
-//! The checks this machine can answer for itself.
-//!
-//! No socket is opened in here. Every check reads the config, the runner install
-//! dirs, the database file or a PAT, which is why one unreadable config takes
-//! all of them out at once and why that reason is stated once, in
-//! [`config_dependent`], rather than rediscovered per check.
-//!
-//! [`ConfigSource`] is the reason the file starts with provenance rather than a
-//! [`Config`]: `Config::load` substitutes defaults when the system file is
-//! unreadable, so a `doctor` handed a loaded config would report a phantom
-//! install as merely empty. See the module docs on [`super`].
+//! Checks this machine answers directly; none opens the socket.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +7,7 @@ use crate::cli::DoctorArgs;
 use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
-use crate::shared::github::validate::{self, Verdict as PatVerdict};
+use crate::shared::github::validate::{self, PatCheck};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
@@ -25,10 +15,6 @@ use crate::shared::paths::{self, Scope};
 use super::{Check, Outcome, skipped};
 
 /// Where the config came from, or what stopped it.
-///
-/// `doctor` resolves this itself rather than accepting a loaded [`Config`],
-/// because a `Config` carries no provenance and the fallback-to-defaults path is
-/// silent. See the module docs.
 pub(super) enum ConfigSource {
     Loaded {
         path: PathBuf,
@@ -42,16 +28,13 @@ pub(super) enum ConfigSource {
         path: PathBuf,
         why: String,
     },
-    /// No config anywhere; the path is where one WOULD be written.
+    /// `path` is where one would be written.
     Missing {
         path: PathBuf,
     },
 }
 
 impl ConfigSource {
-    /// The config, when there is one. Every config-dependent check goes through
-    /// this, so "reasoned over a config we never loaded" has one place to be
-    /// wrong instead of one per check.
     pub(super) fn cfg(&self) -> Option<&Config> {
         match self {
             ConfigSource::Loaded { cfg, .. } => Some(cfg),
@@ -75,7 +58,6 @@ impl ConfigSource {
     }
 }
 
-/// Read the config with its provenance intact.
 pub(super) fn load_config(explicit: Option<&Path>) -> ConfigSource {
     let Some(path) = paths::resolve_config(explicit) else {
         return ConfigSource::Missing {
@@ -100,7 +82,6 @@ pub(super) fn load_config(explicit: Option<&Path>) -> ConfigSource {
     }
 }
 
-/// Does a config exist, and does it parse? Pure given the source.
 pub(super) fn config_check(source: &ConfigSource, orgs: &[String]) -> Check {
     let outcome = match source {
         ConfigSource::Loaded { path, cfg } => Outcome::Pass {
@@ -112,9 +93,7 @@ pub(super) fn config_check(source: &ConfigSource, orgs: &[String]) -> Check {
                 cfg.intervals.api_secs
             ),
         },
-        // Not a failure: a non-root operator reading a root-owned config is the
-        // expected shape of a system deployment, not a broken install. It is a
-        // SKIP, which still refuses to certify what it could not see.
+        // Non-root reading a root-owned config is a normal system deployment.
         ConfigSource::Unreadable { path, why } => Outcome::Skipped {
             why: format!("{}: {why} — re-run with sudo", path.display()),
         },
@@ -137,9 +116,6 @@ pub(super) fn config_check(source: &ConfigSource, orgs: &[String]) -> Check {
     }
 }
 
-/// The checks that need a config we could actually read. When we could not, each
-/// one is skipped with the SAME reason — stated once, here, rather than
-/// rediscovered per check.
 pub(super) fn config_dependent(
     source: &ConfigSource,
     args: &DoctorArgs,
@@ -170,7 +146,6 @@ pub(super) fn config_dependent(
     ]
 }
 
-/// Are there roots, and did they yield runners?
 fn runner_roots_check(cfg: &Config, found: usize) -> Check {
     let roots = runners::effective_roots(&cfg.runner_roots);
     let outcome = if roots.is_empty() {
@@ -201,13 +176,15 @@ fn runner_roots_check(cfg: &Config, found: usize) -> Check {
     }
 }
 
-/// The database file: present, and how big. Writability is the collector's
-/// problem — it runs as root and is the only writer — so this reports what a
-/// reader can establish without claiming more.
+/// Existence only: writability belongs to the collector, the sole writer.
 fn database_check(cfg: &Config) -> Check {
     let outcome = match std::fs::metadata(&cfg.db_path) {
         Ok(m) => Outcome::Pass {
-            detail: format!("{} — {}", cfg.db_path.display(), human_bytes(m.len())),
+            detail: format!(
+                "{} — {}",
+                cfg.db_path.display(),
+                crate::shared::util::fmt_bytes(m.len())
+            ),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outcome::Fail {
             detail: format!("no database at {}", cfg.db_path.display()),
@@ -226,8 +203,6 @@ fn database_check(cfg: &Config) -> Check {
     }
 }
 
-/// Hook install state per runner. Job-level data exists only if these are wired,
-/// so an unhooked fleet is a real gap — silent, which is why it is checked.
 fn hooks_check(discovered: &[RunnerInfo]) -> Check {
     let our_dirs = [
         install::hooks_dir(&Scope::System.data_dir()),
@@ -238,7 +213,7 @@ fn hooks_check(discovered: &[RunnerInfo]) -> Check {
     let mut unset = Vec::new();
     let mut unreadable = Vec::new();
     for r in discovered {
-        match install::detect_in(&r.dir, &our_dirs) {
+        match install::detect(&r.dir, &our_dirs) {
             HookStatus::Ours => ours += 1,
             HookStatus::Foreign => foreign.push(r.name.clone()),
             HookStatus::Unset => unset.push(r.name.clone()),
@@ -282,17 +257,8 @@ fn hooks_check(discovered: &[RunnerInfo]) -> Check {
     }
 }
 
-/// Per-org PAT validation.
-///
-/// The validation available is a read-and-confirm, not a scope listing: GitHub
-/// exposes no bearer-side introspection of a fine-grained token's granted
-/// permissions, so `validate` proves the token can list the org's runners and
-/// how many of them match locally-discovered ones. That IS the check that
-/// matters — a token that cannot list runners is the failure, whatever its
-/// scopes claim.
-///
-/// This is the only check that touches the network; `--offline` skips it, and
-/// skipping keeps the verdict at "cannot determine" rather than green.
+/// GitHub offers no bearer-side introspection of a fine-grained PAT's
+/// permissions, so this proves the token can list the org's runners instead.
 fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offline: bool) -> Check {
     let check = Check {
         id: "tokens",
@@ -329,11 +295,11 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
             continue;
         };
         match validate::validate(&token, org, &local_ids) {
-            PatVerdict::Valid {
+            PatCheck::Valid {
                 runners, matched, ..
             } => ok.push(format!("{org} ({matched}/{runners} runners confirmed)")),
             // The reason is the API's own — never the token.
-            PatVerdict::Rejected(why) => rejected.push(format!("{org}: {why}")),
+            PatCheck::Rejected(why) => rejected.push(format!("{org}: {why}")),
         }
     }
 
@@ -357,39 +323,16 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
     Check { outcome, ..check }
 }
 
-/// Every org this host cares about: configured, plus discovered from `.runner`
-/// files. A configured org with no runners still needs a working PAT, and a
-/// discovered org with no config entry is exactly the gap worth reporting.
 pub(super) fn org_names(cfg: &Config, discovered: &[RunnerInfo]) -> Vec<String> {
     let mut orgs: BTreeSet<String> = cfg.orgs.iter().cloned().collect();
     orgs.extend(discovered.iter().map(|r| r.org.clone()));
     orgs.into_iter().collect()
 }
 
-/// Bytes at human scale — a database size is read by a person deciding whether
-/// to prune, not parsed.
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut v = n as f64;
-    let mut unit = 0;
-    while v >= 1024.0 && unit < UNITS.len() - 1 {
-        v /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// An unreadable config is a SKIP, not a failure — a non-root operator
-    /// reading a root-owned config is the expected shape of a system
-    /// deployment. It still refuses to certify anything it could not see.
     #[test]
     fn an_unreadable_config_skips_rather_than_fails() {
         let source = ConfigSource::Unreadable {
@@ -401,9 +344,6 @@ mod tests {
         assert!(source.blocked().unwrap().contains("sudo"));
     }
 
-    /// ...and every config-dependent check inherits that same reason, rather
-    /// than each rediscovering it or, worse, reading `Config::default()` and
-    /// reporting a phantom fleet as merely empty.
     #[test]
     fn config_dependent_checks_are_skipped_together_with_one_reason() {
         let source = ConfigSource::Unreadable {
@@ -436,11 +376,5 @@ mod tests {
             Outcome::Fail { fix, .. } => assert!(fix.contains("ghr-stats config"), "{fix}"),
             other => panic!("expected a failure, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn bytes_render_at_human_scale() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1_213_259_776), "1.1 GiB");
     }
 }

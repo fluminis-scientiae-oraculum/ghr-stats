@@ -1,14 +1,5 @@
-//! Driving [`App`] from the operator: keys and mouse resolved to navigation.
-//!
-//! Every handler here ends in tab, selection or drill state and nothing else —
-//! no config write, no collector call. That is why a footer-hint click returns a
-//! [`KeyCode`] rather than acting: a click and the key it depicts must take the
-//! SAME path, so the two can never drift, and the loop's `route_key` stays the
-//! one place an action is dispatched.
-//!
-//! Mouse handling reads the hit cache [`super::Hits`] that the render pass
-//! populates — ratatui is immediate-mode, so the geometry a click lands on is
-//! only known from the frame that drew it.
+//! Keys and mouse resolved to tab, selection and drill state only. Clicks that
+//! stand for a key return its [`KeyCode`] so the loop's `route_key` dispatches both.
 
 use std::time::{Duration, Instant};
 
@@ -17,18 +8,14 @@ use ratatui::layout::Rect;
 
 use super::{App, Tab};
 
-/// Max gap between two clicks on the same Summary row to count as a double-click
-/// (opens Detail). Chosen to match typical desktop double-click timing.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
     pub(crate) fn on_key(&mut self, code: KeyCode) {
-        // Help is global — it opens over any view/mode.
         if code == KeyCode::Char('?') {
             self.open_help();
             return;
         }
-        // While drilled into Detail, keys are back-nav / refresh only.
         if self.drill.is_some() {
             match code {
                 KeyCode::Char('q') => self.should_quit = true,
@@ -59,11 +46,7 @@ impl App {
         }
     }
 
-    /// Handle a mouse event. Returns `Some(key)` when a click should be
-    /// dispatched as if that key were pressed — a footer-hint click maps to its
-    /// key, and a double-click on a runner row maps to `Enter` (open Detail) —
-    /// so `route_mouse` can reuse the full keyboard action path. `None` when the
-    /// event was fully handled here (scroll, tab click, single-click select).
+    /// `Some(key)`: dispatch as if that key were pressed.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) -> Option<KeyCode> {
         match m.kind {
             MouseEventKind::ScrollDown if self.scrollable() => {
@@ -75,8 +58,7 @@ impl App {
                 None
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // A click resolves to at most one target; snapshot the hit cache,
-                // then act (so the `hits` borrow is released before `&mut self`).
+                // Snapshot so the `hits` borrow ends before `&mut self` calls.
                 let (tab, footer_key, rows) = {
                     let hit = self.hits.borrow();
                     let tab = (m.row == hit.tab_row)
@@ -97,7 +79,6 @@ impl App {
                         .flatten();
                     (tab, footer_key, hit.table_rows)
                 };
-                // A footer hint acts like pressing its key (routed via route_key).
                 if let Some(k) = footer_key {
                     return Some(k);
                 }
@@ -114,12 +95,7 @@ impl App {
         }
     }
 
-    /// Select the Summary row under a click at `(col, row)`, if it lands on the
-    /// table's data region and a runner exists there (respecting the scroll
-    /// offset). Summary-only, like the scroll wheel.
-    /// Select the runner row under a click, and return `Some(Enter)` when it is
-    /// the second click on the same row within [`DOUBLE_CLICK`] — a double-click
-    /// opens Detail (dispatched as `Enter` via `route_key`). Summary-only.
+    /// `Some(Enter)` on a second click on the same row within [`DOUBLE_CLICK`].
     fn select_or_open(&mut self, region: Rect, col: u16, row: u16) -> Option<KeyCode> {
         if !self.scrollable() {
             return None;
@@ -136,7 +112,6 @@ impl App {
         self.table.borrow_mut().select(Some(idx));
         let now = Instant::now();
         let double = matches!(self.last_click, Some((prev, t)) if prev == idx && now.duration_since(t) <= DOUBLE_CLICK);
-        // Reset after a double (so a third click starts fresh); else record this.
         self.last_click = if double { None } else { Some((idx, now)) };
         double.then_some(KeyCode::Enter)
     }

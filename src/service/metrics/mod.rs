@@ -1,7 +1,5 @@
-//! Prometheus exposition — one of the collector's outputs: sample → SQLite → expose.
-//! Two independent, opt-in paths (config `[metrics]`): a pull `/metrics`
-//! endpoint (loopback by default) and a JSON push to an ingestion sink. Both
-//! read the DB on their own connections (WAL) — never the writer thread.
+//! Prometheus exposition: a pull `/metrics` endpoint and a JSON push, both opt-in via `[metrics]`.
+//! Both read the DB on their own WAL connections, never the writer thread.
 
 pub mod encode;
 
@@ -15,11 +13,8 @@ use std::thread::JoinHandle;
 
 use crate::shared::config::SharedConfig;
 
-/// Spawn the metrics threads, joined by `serve` on shutdown. Both are ALWAYS
-/// spawned (not gated on the startup config): each reconciles its own resource
-/// to the live config snapshot every cycle — the pull thread binds/drops its
-/// `/metrics` listener, the push thread posts-or-idles — so a `[metrics]` toggle
-/// via the TUI takes effect without a restart. A disabled thread just idles.
+/// Both threads always spawn and reconcile to the live config each cycle, so a `[metrics]`
+/// toggle needs no restart.
 pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>) -> Vec<JoinHandle<()>> {
     vec![
         pull::spawn(shared.clone(), Arc::clone(&term)),

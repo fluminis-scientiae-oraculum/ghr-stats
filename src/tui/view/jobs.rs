@@ -1,5 +1,4 @@
-//! Recent jobs across the fleet (from hook events; conclusion filled later by
-//! the API reconcile).
+//! Jobs come from hook events; the API reconcile fills `conclusion` later.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -29,8 +28,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The Jobs empty-state copy — derived in the viewmodel so "no jobs yet" is never
-/// mistaken for "hooks not installed".
 fn empty_state(app: &App) -> String {
     let view = viewmodel::status::jobs_view(app.mode(), app.hooked_runner_count());
     viewmodel::copy::jobs_empty(view)
@@ -72,7 +69,6 @@ fn duration(j: &JobRow) -> String {
     }
 }
 
-/// Result cell: API conclusion if known, else a coarse state from the timing.
 fn result_span(j: &JobRow) -> Span<'static> {
     match j.conclusion.as_deref() {
         Some("success") => Span::styled("success", Style::new().fg(Color::Green)),

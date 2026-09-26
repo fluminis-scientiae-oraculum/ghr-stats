@@ -1,8 +1,4 @@
-//! Fleet-wide trends: occupancy, host load, memory, and disk (/tmp + aggregate
-//! `_work`) over time. In Persistent mode these come from the collector; in
-//! Ephemeral, from the in-memory ring (a since-launch window). Each metric is a
-//! line chart with a relative-time X axis and a 0-based Y axis (see
-//! [`super::draw_time_chart`]); incomparable Y scales ⇒ one chart per metric.
+//! One chart per metric: their Y scales are incomparable.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -42,10 +38,9 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Ratio(1, 5); 5])
         .split(outer[1]);
 
-    // One clock read per frame, shared by every chart's relative-time X labels.
     let now = now_epoch();
 
-    // Busy runners over time (Y capped at peak online ⇒ axis reflects capacity).
+    // Y capped at peak online, so the axis shows capacity.
     let busy_pts: Vec<(f64, f64)> = app
         .trend_busy
         .iter()
@@ -63,15 +58,8 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         .max()
         .unwrap_or(0)
         .max(1);
-    // GitHub's own count of online runners, overlaid. Ticks with no reconcile
-    // data are simply absent from this series, so the line breaks rather than
-    // dropping to zero. Without it the occupancy chart drew a flat healthy trace
-    // straight through a four-hour outage, because local liveness never moved.
-    //
-    // The headline prints the denominator (`GH 9/17`) because the overlaid line
-    // cannot: a fleet with runners GitHub is never asked about keeps the magenta
-    // trace permanently below the yellow one, and only the ratio says whether
-    // that gap is an outage or a silence.
+    // The title prints `online/known`: runners GitHub is never asked about keep the
+    // overlay below the local line, and only the ratio tells an outage from silence.
     let gh_pts: Vec<(f64, f64)> = app
         .trend_busy
         .iter()
@@ -97,7 +85,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Host load average.
     let load_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
@@ -124,7 +111,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Memory used (percent — natural 0..100 scale).
     let mem_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
@@ -153,7 +139,6 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // /tmp used (raw bytes; skip ticks that didn't sample it).
     let tmp_pts: Vec<(f64, f64)> = app
         .trend_host
         .iter()
@@ -181,9 +166,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         },
     );
 
-    // Aggregate _work size — Persistent-only: the live sampler skips the
-    // expensive `_work` walk (`walk_work=false`), so in Ephemeral there is no
-    // data to plot. Say so rather than show a perpetually-empty chart.
+    // The live sampler skips the `_work` walk, so Ephemeral mode has no data.
     if matches!(app.mode(), Mode::Ephemeral) {
         f.render_widget(
             Paragraph::new(viewmodel::copy::work_persistent_only())

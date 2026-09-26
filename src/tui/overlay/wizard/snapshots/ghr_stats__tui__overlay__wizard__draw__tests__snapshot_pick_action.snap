@@ -1,6 +1,6 @@
 ---
-source: src/tui/widgets/wizard.rs
-expression: render(&mode)
+source: src/tui/overlay/wizard.rs
+expression: "render(&WizardMode::new())"
 ---
 "                                                                                "
 "                                                                                "
@@ -9,12 +9,12 @@ expression: render(&mode)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                ┌ Remove org ──────────────────────────────────┐                "
+"                ┌ Configure ───────────────────────────────────┐                "
 "                │                                              │                "
-"                │  GitHub org login to remove: example-org     │                "
+"                │  [a]  add / replace org + read-only PAT      │                "
+"                │  [r]  remove org (drops its PAT)             │                "
 "                │                                              │                "
-"                │  [Enter] next · [Esc] cancel                 │                "
-"                │                                              │                "
+"                │  [a] add/replace · [r] remove · [Esc] close  │                "
 "                │                                              │                "
 "                │                                              │                "
 "                │                                              │                "

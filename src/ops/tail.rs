@@ -1,28 +1,5 @@
-//! `ghr-stats tail` — the fleet's transitions as they happen, one JSON object
-//! per line.
-//!
-//! **This is a poll, not a subscription, and that was the phase-6 decision
-//! rather than an implementation shortcut** (the reasoning lives in
-//! `shared::ipc`). The short version: a transition does not exist until a
-//! sampler observes it, so a subscriber would receive events on the same
-//! `local_secs` grid a poller sees; a held-open stream would occupy one of the
-//! collector's few connection slots for its lifetime, which is the lockout
-//! `4b3b490` was written to end; and a poller can PROVE it kept up, because
-//! `Bounded` reports truncation, whereas a stream that drops under backpressure
-//! has to be built to admit it.
-//!
-//! Two properties follow from that and are load-bearing here.
-//!
-//! **Falling behind is emitted, never swallowed.** If more transitions occurred
-//! than the limit returned, `tail` prints a `gap` object naming the section and
-//! the window it could not fully cover. A watcher that silently skips events is
-//! worse than no watcher, because its silence is indistinguishable from calm.
-//!
-//! **The cursor is a timestamp AND the identities already emitted at it.**
-//! `since_ts` is inclusive and a fleet routinely flips several runners on one
-//! tick, so an exclusive cursor would drop the co-timed edges and an inclusive
-//! one would repeat them forever. Carrying the keys seen at the newest tick
-//! costs memory proportional to the fleet, not to the window.
+//! `ghr-stats tail`: polls the collector's timeline and prints each new
+//! transition as one JSON line. A poll that hit its limit emits a `gap` line.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -33,7 +10,6 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::cli::TailArgs;
-use crate::ops::poll::remaining;
 use crate::shared::config::Config;
 use crate::shared::ipc::client::Client;
 use crate::shared::ipc::{Query, Request, Response};
@@ -43,27 +19,12 @@ use crate::shared::models::timeline::{
 use crate::shared::util::now_epoch;
 
 /// Rows fetched per poll, per section.
-///
-/// Generous against a five-second window — this fleet's busiest observed minute
-/// is far under it — so `limited` firing means something genuinely unusual
-/// happened rather than that the default was too tight.
 const POLL_LIMIT: usize = 500;
 
-/// Whether the stream could be followed at all.
-///
-/// `tail` retrieves rather than judges, so like `timeline` and `wait` it does
-/// not return a [`Verdict`]: an eventful window and a quiet one are equally
-/// successful tails. Only losing the collector ends it unsuccessfully.
-///
-/// [`Verdict`]: crate::shared::models::Verdict
 pub(crate) enum Availability {
-    /// The reader closed the pipe — `ghr-stats tail | head -5` is an ordinary
-    /// invocation and must end at 0, not at the usage code an unhandled
-    /// `BrokenPipe` would produce. (A Ctrl-C never reaches here: the default
-    /// SIGINT disposition ends the process at 130, the shell's own convention
-    /// for a stream stopped by its operator.)
+    /// Includes the reader closing the pipe (`tail | head`). Ctrl-C never returns
+    /// here: the default SIGINT disposition ends the process at 130.
     Followed,
-    /// There is no collector, so there is nothing to follow.
     Unavailable,
 }
 
@@ -76,41 +37,24 @@ impl From<Availability> for ExitCode {
     }
 }
 
-/// One emitted line. Externally tagged so a consumer can branch on `type`
-/// without inspecting the shape, and so `gap` is impossible to mistake for an
-/// event.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Line<'a> {
     Transition(&'a Transition),
     Job(&'a JobTransition),
-    /// We fell behind: more rows existed than one poll returned.
+    /// More rows existed than one poll returned.
     Gap {
         section: &'static str,
-        /// The window that could not be fully covered, so the caller knows
-        /// exactly what to re-ask `timeline` for.
+        /// The window to re-ask `timeline` for.
         since_epoch: i64,
         until_epoch: i64,
         limit: usize,
     },
 }
 
-/// What has already been emitted, so an overlapping poll does not repeat it.
-///
-/// Keyed by `(ts, identity)` across the whole rolling window rather than by a
-/// high-water timestamp. A high-water mark is wrong twice over. It drops a
-/// late arrival — `job_event` timestamps come from the hook's own clock and are
-/// ingested by a tailer that can lag, so a job may legitimately surface with a
-/// `ts` behind one already emitted. And it says nothing about the query window,
-/// which is the part that actually has to overlap: edges are derived with `LAG`
-/// over the rows *inside* the window, so an edge exists only when its
-/// PREDECESSOR SAMPLE is also inside. Re-asking from the last event emitted
-/// would leave that predecessor outside and silently suppress the edge — and
-/// because job events are frequent and liveness edges are rare, a busy fleet
-/// would suppress exactly the transitions worth watching.
-///
-/// Pruned to the same horizon as the query, so memory tracks the window rather
-/// than the uptime, and nothing is forgotten that could still be returned.
+/// Emitted `(ts, identity)` pairs across the whole rolling window, not a
+/// high-water mark: job `ts` comes from the hook's own clock and can arrive late.
+/// Pruned to the query horizon.
 #[derive(Default)]
 struct Cursor {
     seen: HashSet<(i64, String)>,
@@ -122,26 +66,17 @@ impl Cursor {
         self.seen.insert((ts, key))
     }
 
-    /// Forget events the query can no longer return.
     fn prune(&mut self, before: i64) {
         self.seen.retain(|(ts, _)| *ts >= before);
     }
 }
 
-/// Run the verb. Returns only when the collector is unreachable — otherwise the
-/// caller ends it (Ctrl-C), which is why there is no disconnect handling here.
 pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
     let secs = cfg.intervals.local_secs.max(1);
     let interval = Duration::from_secs(secs);
-    // Every poll asks for a ROLLING window, never for "everything since the last
-    // event". The window has to be wide enough to contain the predecessor sample
-    // of any edge inside it — see `Cursor` — so it is several sampling intervals
-    // deep, with a floor for hosts sampling fast enough that four ticks is only
-    // a few seconds. The cursor, not the window, is what stops repeats.
+    // Edges are derived with `LAG` inside the query window, so the window must be
+    // several ticks deep to hold each edge's predecessor sample. The cursor stops repeats.
     let lookback = (secs * 4).max(60) as i64;
-    // The first poll may reach further back, but only if asked: `tail` answers
-    // "what is happening", and `timeline --since` already answers "what
-    // happened", so backfill is a flag rather than a surprise flood.
     let mut since = now_epoch() - lookback.max(args.since_secs() as i64);
     let mut transitions = Cursor::default();
     let mut jobs = Cursor::default();
@@ -169,28 +104,21 @@ pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
 
         match emit(&mut out, &timeline, &mut transitions, &mut jobs) {
             Ok(()) => {}
-            // Our reader went away — `| head`, a closed pager, a killed consumer.
-            // That is the pipeline working, not a failure of ours.
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 return Ok(Availability::Followed);
             }
             Err(e) => return Err(e.into()),
         }
-        // The window rolls with the clock rather than chasing the last event.
-        // Forget only what the next query can no longer return, so the two stay
-        // exactly in step: nothing is remembered needlessly, and nothing that
-        // could still arrive is forgotten.
         since = now_epoch() - lookback;
         transitions.prune(since);
         jobs.prune(since);
 
-        std::thread::sleep(remaining(started.elapsed(), interval));
+        std::thread::sleep(interval.saturating_sub(started.elapsed()));
     }
 }
 
-/// One poll. Connects per iteration rather than holding a client: a connection
-/// held across polls is the resource a subscribe path would have monopolised,
-/// and reconnecting is also what lets a `tail` survive a collector restart.
+/// Connects per poll: holds none of the collector's few connection slots between
+/// polls, and survives a collector restart.
 fn fetch(query: &TimelineQuery) -> Option<Timeline> {
     let mut client = Client::connect_any().ok()?;
     match client.request(&Request::Query(Query::Timeline(query.clone()))) {
@@ -199,18 +127,13 @@ fn fetch(query: &TimelineQuery) -> Option<Timeline> {
     }
 }
 
-/// Print everything in this poll that has not been printed before, oldest
-/// first, flushing per line so a consumer reading our stdout sees each event as
-/// it lands rather than when the pipe buffer happens to fill.
 fn emit(
     out: &mut impl Write,
     t: &Timeline,
     transitions: &mut Cursor,
     jobs: &mut Cursor,
 ) -> std::io::Result<()> {
-    // The gap goes FIRST, before the events it qualifies: a consumer that reads
-    // the events and then learns some were missing has already acted on a set it
-    // believed was complete.
+    // Gap first: a consumer must not act on a batch it believes is complete.
     gap(out, "transitions", &t.transitions, t)?;
     gap(out, "jobs", &t.jobs, t)?;
 
@@ -248,23 +171,13 @@ fn gap<T>(
 }
 
 fn line(out: &mut impl Write, l: &Line) -> std::io::Result<()> {
-    // Serialisation of a borrowed, closed enum cannot realistically fail, but it
-    // is folded into the io error rather than unwrapped: a panic in a long-lived
-    // watcher is the one failure mode with no diagnostic left behind.
     let json = serde_json::to_string(l).map_err(std::io::Error::other)?;
     writeln!(out, "{json}")?;
-    // Per line, not per poll: a consumer piping this into `jq` or an agent loop
-    // must see an event when it happens, not when the pipe buffer fills.
     out.flush()
 }
 
-/// Identity of a transition within one tick.
-///
-/// Must distinguish everything that can legitimately co-occur: two runners in
-/// different orgs share an `agent_id` on this fleet, and one runner can produce
-/// a liveness edge and a GitHub edge at the same instant. The `to` value is part
-/// of the key so a flap back and forth across one tick is two events, not one
-/// swallowed by de-duplication.
+/// Identity within one tick. Includes the org (agent ids and names repeat across
+/// orgs) and `to`, so a flap across one tick is two events.
 fn transition_key(t: &Transition) -> String {
     use crate::shared::models::timeline::{Edge, ReconcileEdge};
     match &t.edge {
@@ -279,9 +192,7 @@ fn transition_key(t: &Transition) -> String {
     }
 }
 
-/// Identity of a job edge within one tick. `(run, job, runner)` is the table's
-/// own key; the end distinguishes a start from a completion recorded at the same
-/// second, which a fast job does produce.
+/// The end distinguishes a start from a completion in the same second.
 fn job_key(j: &JobTransition) -> String {
     use crate::shared::models::timeline::JobEdge;
     let end = match j.edge {
@@ -340,8 +251,6 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
-    /// The overlap is deliberate — we re-ask from the newest tick we emitted —
-    /// so the cursor, not the query, is what stops an event printing twice.
     #[test]
     fn an_event_already_emitted_is_not_emitted_again() {
         let mut c = Cursor::default();
@@ -350,17 +259,12 @@ mod tests {
         assert_eq!(run_emit(&t, &mut c).lines().count(), 0);
     }
 
-    /// The case an exclusive `> ts` cursor gets wrong: several runners flipping
-    /// on one sampler tick is the NORMAL shape of an incident, and dropping all
-    /// but the first would hide exactly the correlated failure worth watching.
     #[test]
     fn co_timed_events_all_survive_the_cursor() {
         let mut c = Cursor::default();
         let first = timeline(vec![tr(100, "r1", Liveness::Busy)], false);
         assert_eq!(run_emit(&first, &mut c).lines().count(), 1);
 
-        // The next poll overlaps and returns r1 again plus two more at the SAME
-        // timestamp. Only the two new ones may print.
         let second = timeline(
             vec![
                 tr(100, "r1", Liveness::Busy),
@@ -372,9 +276,6 @@ mod tests {
         assert_eq!(run_emit(&second, &mut c).lines().count(), 2);
     }
 
-    /// A runner that flips away and back within one tick is two events. Keying
-    /// on identity alone would swallow the second and leave the watcher
-    /// believing the first never reversed.
     #[test]
     fn a_flap_inside_one_tick_is_two_events() {
         let mut c = Cursor::default();
@@ -385,8 +286,6 @@ mod tests {
         assert_eq!(run_emit(&t, &mut c).lines().count(), 2);
     }
 
-    /// Memory tracks the WINDOW, not the uptime: pruning drops exactly what the
-    /// next query can no longer return, and nothing else.
     #[test]
     fn the_cursor_forgets_only_what_the_query_can_no_longer_return() {
         let mut c = Cursor::default();
@@ -403,10 +302,6 @@ mod tests {
         assert_eq!(c.seen.len(), 1);
     }
 
-    /// A late arrival must still print. `job_event` timestamps come from the
-    /// hook's own clock via a tailer that can lag, so an event whose `ts` sits
-    /// behind one already emitted is normal — and a high-water cursor drops it
-    /// silently, which is the reason this one keys on the whole window.
     #[test]
     fn an_event_older_than_one_already_emitted_still_prints() {
         let mut c = Cursor::default();
@@ -418,10 +313,6 @@ mod tests {
         assert_eq!(run_emit(&late, &mut c).lines().count(), 1);
     }
 
-    /// Pruning must not resurrect an event the next query still returns. The
-    /// horizon is shared with the query window precisely so the two cannot
-    /// disagree; an event exactly AT the horizon is still returnable and so must
-    /// still be remembered.
     #[test]
     fn pruning_at_the_query_horizon_does_not_resurrect_an_event() {
         let mut c = Cursor::default();
@@ -431,9 +322,6 @@ mod tests {
         assert_eq!(run_emit(&t, &mut c).lines().count(), 0);
     }
 
-    /// Falling behind must be visible, and visible BEFORE the events it
-    /// qualifies — a consumer that acts on the batch first has already acted on
-    /// a set it believed was complete.
     #[test]
     fn falling_behind_emits_a_gap_line_first() {
         let mut c = Cursor::default();
@@ -455,8 +343,6 @@ mod tests {
         assert!(!out.contains("gap"), "{out}");
     }
 
-    /// Two orgs share `agent_id` 22 on this fleet, so the org must be part of
-    /// the key or one org's edge would suppress the other's.
     #[test]
     fn the_same_runner_name_in_two_orgs_is_two_identities() {
         let a = tr(100, "r1", Liveness::Busy);

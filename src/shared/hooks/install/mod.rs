@@ -1,26 +1,5 @@
-//! Runner hook install — detect-first, NEVER clobber (operator: "detect →
-//! choose per runner").
-//!
-//! A GitHub runner allows exactly ONE script per `ACTIONS_RUNNER_HOOK_JOB_*`
-//! var, and an operator may already use them (e.g. for docker cleanup). So we
-//! DETECT the current state and, on a conflict, offer to CHAIN (a wrapper that
-//! runs the existing hook then appends our event) or to INSTRUCT (print the
-//! snippet to add) — we never overwrite a foreign hook. Our scripts (and the
-//! wrapper) preserve the original exit code: a non-zero runner hook fails the job.
-//!
-//! Only ONE thing splits out of this file, and it is worth saying why the obvious
-//! candidates did not. Detect-vs-act, read-vs-write and parse-vs-render all FAIL
-//! the seam test: [`HookStatus`] is spoken by the detection, the chaining and the
-//! reversal alike; [`env_value`], [`OUR_VARS`] and [`assigns_any`] are shared by
-//! every path that touches a runner's `.env`. Manipulating one runner's hook
-//! configuration is genuinely one job, and cutting it along a layer would put the
-//! same vocabulary on both sides of the line.
-//!
-//! [`chain`] is different because it is not a layer but a FORMAT. The wrapper this
-//! module writes is parsed back by `uninstall`, and the two halves must stay
-//! symmetric or reversing a chained runner leaves it HOOKLESS — the exact inverse
-//! of never-clobber. A format with a writer and a reader is a real boundary even
-//! where the layering is not, so that is where the cut goes.
+//! Runner hook install: detect first, never clobber a foreign hook (chain or instruct instead).
+//! A runner allows one script per `ACTIONS_RUNNER_HOOK_JOB_*` var; a non-zero hook fails the job.
 
 use std::path::{Path, PathBuf};
 
@@ -32,73 +11,37 @@ pub(crate) use chain::{original_from_wrapper, plan_chain_slot};
 
 const STARTED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_STARTED";
 const COMPLETED_VAR: &str = "ACTIONS_RUNNER_HOOK_JOB_COMPLETED";
-/// Env var the hook scripts read for their event-log path. The installer wires it
-/// to the runner's own [`crate::shared::hooks::runner_event_log`] so the hook
-/// writes a log the runner user owns (the collector reads it as root).
+/// Read by our hook scripts; points at [`crate::shared::hooks::runner_event_log`].
 const EVENT_LOG_VAR: &str = "GHR_STATS_EVENT_LOG";
 
-/// Our hook scripts, embedded so the binary is self-contained for any adopter.
 const STARTED_SCRIPT: &str = include_str!("../../../../packaging/hooks/job-started.sh");
 const COMPLETED_SCRIPT: &str = include_str!("../../../../packaging/hooks/job-completed.sh");
 
-/// What a runner's hook env vars currently point at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HookStatus {
-    /// Both vars point inside our hooks dir.
+    /// Both vars point inside one of our hooks dirs.
     Ours,
-    /// At least one var points at a foreign script — chain or instruct.
+    /// At least one var points at a foreign script.
     Foreign,
-    /// Neither var is set — a clean install is possible.
     Unset,
-    /// The `.env` could not be read (perms); caller may use a heuristic.
     Unreadable,
 }
 
-impl HookStatus {
-    /// ✓ / ✗ / ? glyph for the dashboard.
-    pub(crate) fn glyph(self) -> &'static str {
-        match self {
-            HookStatus::Ours => "✓",
-            HookStatus::Foreign | HookStatus::Unset => "✗",
-            HookStatus::Unreadable => "?",
-        }
-    }
-}
-
-/// Where ghr-stats installs its hook scripts (outside any runner `_work`, which
-/// a checkout would overwrite). `data_dir` already ends in `ghr-stats`.
+/// Outside any runner `_work`, which a checkout overwrites.
 pub(crate) fn hooks_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("hooks")
 }
 
-/// Read + classify a runner's `.env`. `Unreadable` if it can't be read.
-pub(crate) fn detect(install_dir: &Path, our_dir: &Path) -> HookStatus {
-    detect_in(install_dir, std::slice::from_ref(&our_dir.to_path_buf()))
-}
-
-/// Like [`detect`] but classifies "ours" against SEVERAL candidate hooks dirs.
-///
-/// Detection must be independent of the euid the caller runs under: hooks are
-/// always installed by a root process (System scope, `/var/lib/ghr-stats/hooks`),
-/// but the read-only TUI is normally run non-root — so a status probe has to
-/// consider EVERY scope's hooks dir, not just `Scope::detect()`'s. Passing the
-/// current euid's single dir is what made a System-scoped hook read as `Foreign`
-/// (or a fresh install read as absent) in a plain `ghr-stats` dashboard.
-pub(crate) fn detect_in(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
+/// Accepts any scope's hooks dir: the TUI usually runs non-root while hooks live in the
+/// system scope.
+pub(crate) fn detect(install_dir: &Path, our_dirs: &[PathBuf]) -> HookStatus {
     match super::env::read(install_dir) {
-        Ok(env) => classify_in(&env.text, our_dirs),
+        Ok(env) => classify(&env.text, our_dirs),
         Err(_) => HookStatus::Unreadable,
     }
 }
 
-/// Classify hook state from `.env` text + our hooks dir. Pure.
-pub(crate) fn classify(env: &str, our_dir: &Path) -> HookStatus {
-    classify_in(env, std::slice::from_ref(&our_dir.to_path_buf()))
-}
-
-/// Classify against several candidate hooks dirs: a hook is ours if it is a file
-/// directly inside any of them.
-pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
+pub(crate) fn classify(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
     let is_ours = |v: &str| is_directly_in(Path::new(v), our_dirs);
     match (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR)) {
         (None, None) => HookStatus::Unset,
@@ -113,13 +56,11 @@ pub(crate) fn classify_in(env: &str, our_dirs: &[PathBuf]) -> HookStatus {
     }
 }
 
-/// Whether `path` names a file directly inside one of `dirs` (so no `..` escape).
 pub(crate) fn is_directly_in(path: &Path, dirs: &[PathBuf]) -> bool {
     path.parent().is_some_and(|p| dirs.iter().any(|d| p == d))
 }
 
-/// Where the chain wrappers for the runner at `runner_dir` live, named after
-/// its install dir (runner names repeat across orgs; dirs do not).
+/// Named after the install dir: runner names repeat across orgs, dirs do not.
 pub(crate) fn chain_wrapper_paths(our_dir: &Path, runner_dir: &Path) -> [PathBuf; 2] {
     let slug: String = runner_dir
         .to_string_lossy()
@@ -139,18 +80,10 @@ pub(crate) fn chain_wrapper_paths(our_dir: &Path, runner_dir: &Path) -> [PathBuf
     ]
 }
 
-/// The three vars ghr-stats owns in a runner's `.env`. Every other line in that
-/// file is the operator's and survives every path below.
+/// Every other `.env` line is the operator's and must survive every rewrite.
 const OUR_VARS: [&str; 3] = [STARTED_VAR, COMPLETED_VAR, EVENT_LOG_VAR];
 
-/// The raw value if `line` **assigns** `key` (`KEY=VALUE`), else `None`.
-///
-/// The single definition of "this line assigns KEY", so reading and rewriting
-/// cannot disagree about it. Until this was extracted, `env_value` required the
-/// `=` while the three rewrite paths tested a bare `starts_with(key)` — and a
-/// bare prefix also matches a *longer* var, so those paths would silently delete
-/// a line like `ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=…` that they would never
-/// read back. One predicate, four callers, nothing left to keep in sync. Pure.
+/// The value if `line` assigns exactly `key`; a longer var sharing the prefix is a different var.
 fn assignment<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let line = line.trim();
     if line.starts_with('#') {
@@ -159,14 +92,11 @@ fn assignment<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     line.strip_prefix(key)?.strip_prefix('=')
 }
 
-/// Whether `line` assigns any of `keys` — i.e. whether it is *ours to drop*.
-/// Never-clobber applies to `.env` content, not just to the operator's hook
-/// scripts, so every rewrite path filters through this one rule. Pure.
 fn assigns_any(line: &str, keys: &[&str]) -> bool {
     keys.iter().any(|key| assignment(line, key).is_some())
 }
 
-/// The value of `.env` key `key` (KEY=VALUE; last wins; quotes stripped).
+/// Last assignment wins; quotes stripped.
 fn env_value(env: &str, key: &str) -> Option<String> {
     env.lines()
         .filter_map(|l| assignment(l, key))
@@ -174,12 +104,10 @@ fn env_value(env: &str, key: &str) -> Option<String> {
         .next_back()
 }
 
-/// The current hook script paths from `.env` (for chaining onto a foreign hook).
 pub(crate) fn current_hook_paths(env: &str) -> (Option<String>, Option<String>) {
     (env_value(env, STARTED_VAR), env_value(env, COMPLETED_VAR))
 }
 
-/// Write our two hook scripts into `our_dir` (mode 0755). Returns their paths.
 pub(crate) fn install_scripts(our_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(our_dir)?;
     let started = our_dir.join("job-started.sh");
@@ -202,14 +130,8 @@ fn write_script_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite `.env` content with the two hook vars pointing at `started`/
-/// `completed` (replacing any existing values, preserving other lines). Any
-/// prior [`EVENT_LOG_VAR`] is always dropped first; `event_log` re-adds it:
-/// - `Some(log)` on **install** — point the runner at its own event log;
-/// - `None` on **restore** — strip our var so a reverted foreign `.env` never
-///   keeps a `GHR_STATS_EVENT_LOG` line we injected.
-///
-/// Pure.
+/// Points both hook vars at `started`/`completed`, keeping other lines. Always drops a prior
+/// [`EVENT_LOG_VAR`]; `Some(log)` re-adds it (install), `None` leaves it out (restore).
 pub(crate) fn rewrite_env(
     existing: &str,
     started: &Path,
@@ -231,11 +153,8 @@ pub(crate) fn rewrite_env(
     s
 }
 
-/// Remove our three vars (both hook vars + [`EVENT_LOG_VAR`]) from `.env`
-/// content, preserving every other line — the inverse of [`rewrite_env`] for a
-/// runner we installed *fresh* (its pre-install state was [`HookStatus::Unset`]).
-/// Restoring a *chained* runner instead reuses [`rewrite_env`] (with `None` for
-/// the event log) and the recovered originals. Pure.
+/// Inverse of [`rewrite_env`] for a fresh install; a chained runner is restored via
+/// [`rewrite_env`] with the recovered originals instead.
 pub(crate) fn remove_hook_vars(existing: &str) -> String {
     let kept: Vec<&str> = existing
         .lines()
@@ -249,20 +168,15 @@ pub(crate) fn remove_hook_vars(existing: &str) -> String {
     s
 }
 
-/// Ensure `.env` sets `GHR_STATS_EVENT_LOG=<log>` exactly, touching ONLY that var
-/// and leaving the hook vars untouched. Returns `Some(new_env)` when a change is
-/// needed, `None` when it is already correct. This is the *repair* path for a
-/// runner already wired to us (`HookStatus::Ours`) that predates the event-log
-/// var — an upgrade from a version that installed hooks but never set the log
-/// path would otherwise be skipped by `apply_hooks` and never emit events. Pure.
+/// Sets only [`EVENT_LOG_VAR`], leaving the hook vars alone; `None` when already correct.
 pub(crate) fn ensure_event_log(existing: &str, log: &Path) -> Option<String> {
     let want = log.display().to_string();
     if env_value(existing, EVENT_LOG_VAR).as_deref() == Some(want.as_str()) {
-        return None; // already points at this runner's log — nothing to do
+        return None;
     }
     let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| !assigns_any(l, &[EVENT_LOG_VAR])) // drop any stale value
+        .filter(|l| !assigns_any(l, &[EVENT_LOG_VAR]))
         .map(str::to_string)
         .collect();
     out.push(format!("{EVENT_LOG_VAR}={want}"));
@@ -271,7 +185,6 @@ pub(crate) fn ensure_event_log(existing: &str, log: &Path) -> Option<String> {
     Some(s)
 }
 
-/// The snippet printed for the "instruct" path (operator adds it to their hook).
 pub(crate) fn instruct_snippet(our_dir: &Path) -> String {
     let started = our_dir.join("job-started.sh");
     let completed = our_dir.join("job-completed.sh");
@@ -285,7 +198,6 @@ pub(crate) fn instruct_snippet(our_dir: &Path) -> String {
     )
 }
 
-/// The one seeding helper both test modules need.
 #[cfg(test)]
 mod fixtures {
     use std::path::PathBuf;
@@ -302,43 +214,35 @@ mod tests {
 
     #[test]
     fn classify_unset_ours_foreign() {
-        assert_eq!(classify("", &our()), HookStatus::Unset);
+        assert_eq!(classify("", &[our()]), HookStatus::Unset);
         let ours = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
                     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh\n";
-        assert_eq!(classify(ours, &our()), HookStatus::Ours);
+        assert_eq!(classify(ours, &[our()]), HookStatus::Ours);
         let foreign = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup-started.sh\n\
                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup-completed.sh\n";
-        assert_eq!(classify(foreign, &our()), HookStatus::Foreign);
-        // one ours + one missing ⇒ not fully ours
+        assert_eq!(classify(foreign, &[our()]), HookStatus::Foreign);
         let half = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n";
-        assert_eq!(classify(half, &our()), HookStatus::Foreign);
+        assert_eq!(classify(half, &[our()]), HookStatus::Foreign);
     }
 
     #[test]
     fn classify_in_treats_any_scope_dir_as_ours() {
-        // The cross-scope status bug: hooks install System-scope (they need
-        // root), but the non-root TUI enumerates BOTH scope dirs. A System-scoped
-        // hook — clean OR chained — must read as Ours even with the User dir also
-        // a candidate. Checking only the euid's (User) dir mislabeled it Foreign.
         let sys = PathBuf::from("/var/lib/ghr-stats/hooks");
         let usr = PathBuf::from("/home/u/.local/share/ghr-stats/hooks");
         let dirs = [usr.clone(), sys.clone()];
         let clean = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
                      ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/job-completed.sh\n";
-        assert_eq!(classify_in(clean, &dirs), HookStatus::Ours);
-        // Chained: `.env` points at the wrappers, which live inside our hooks dir.
+        assert_eq!(classify(clean, &dirs), HookStatus::Ours);
         let chained = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/chain-r1-started.sh\n\
              ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/chain-r1-completed.sh\n";
-        assert_eq!(classify_in(chained, &dirs), HookStatus::Ours);
-        // Documents the pre-fix failure: against ONLY the User dir it reads Foreign.
+        assert_eq!(classify(chained, &dirs), HookStatus::Ours);
         assert_eq!(
-            classify_in(clean, std::slice::from_ref(&usr)),
+            classify(clean, std::slice::from_ref(&usr)),
             HookStatus::Foreign
         );
-        // A genuinely foreign hook is still Foreign against both dirs.
         let foreign = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/sbin/cleanup.sh\n\
                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/cleanup.sh\n";
-        assert_eq!(classify_in(foreign, &[usr, sys]), HookStatus::Foreign);
+        assert_eq!(classify(foreign, &[usr, sys]), HookStatus::Foreign);
     }
 
     #[test]
@@ -365,7 +269,6 @@ mod tests {
         assert!(!out.contains("/old/start.sh"));
         assert!(out.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED=/h/job-started.sh"));
         assert!(out.contains("ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/h/job-completed.sh"));
-        // Install wires the per-runner event-log var.
         assert!(out.contains(
             "GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson"
         ));
@@ -373,8 +276,6 @@ mod tests {
 
     #[test]
     fn rewrite_env_none_strips_our_event_log_var() {
-        // The restore path (chained uninstall) passes `None`: any GHR_STATS_EVENT_LOG
-        // we injected must be stripped, never carried into the operator's .env.
         let existing = "KEEP=1\n\
                         GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson\n";
         let out = rewrite_env(
@@ -389,17 +290,11 @@ mod tests {
 
     #[test]
     fn prefix_sharing_operator_vars_survive_every_rewrite_path() {
-        // All three drop paths tested a BARE `VAR` prefix until B19, so an
-        // operator line whose name merely *starts with* one of ours was deleted
-        // without ever being read back — `env_value` has always required the
-        // `=`, so the rewriters were dropping more than the reader could see.
-        // `_EXTRA`/`_ARCHIVE` are hypothetical; the gap is the point.
         let existing = "ACTIONS_RUNNER_HOOK_JOB_STARTED_EXTRA=/op/extra.sh\n\
                         GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson\n\
                         ACTIONS_RUNNER_HOOK_JOB_STARTED=/old/start.sh\n\
                         GHR_STATS_EVENT_LOG=/old/events.ndjson\n";
 
-        // The reader is the reference: a longer var is a DIFFERENT var.
         assert_eq!(
             env_value(existing, EVENT_LOG_VAR).as_deref(),
             Some("/old/events.ndjson")
@@ -418,7 +313,6 @@ mod tests {
                 out.contains("GHR_STATS_EVENT_LOG_ARCHIVE=/op/archive.ndjson"),
                 "operator var dropped by prefix match:\n{out}"
             );
-            // Ours still go, in every one of the three paths.
             assert!(
                 !out.contains("/old/events.ndjson"),
                 "stale value kept:\n{out}"
@@ -428,7 +322,6 @@ mod tests {
 
     #[test]
     fn remove_hook_vars_drops_all_three_and_preserves_others() {
-        // Both hook vars AND our event-log var are stripped; other lines survive.
         let existing = "TMPDIR=/var/tmp/runner\n\
                         ACTIONS_RUNNER_HOOK_JOB_STARTED=/h/job-started.sh\n\
                         KEEP=1\n\
@@ -436,7 +329,6 @@ mod tests {
                         ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/h/job-completed.sh\n";
         let out = remove_hook_vars(existing);
         assert_eq!(out, "TMPDIR=/var/tmp/runner\nKEEP=1\n");
-        // An .env that was ONLY our three vars reverts to empty (true unset).
         let only = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/h/job-started.sh\n\
                     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/h/job-completed.sh\n\
                     GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson\n";
@@ -446,29 +338,23 @@ mod tests {
     #[test]
     fn ensure_event_log_adds_when_missing_fixes_stale_noops_when_correct() {
         let log = Path::new("/srv/actions-runner/runner-01/.ghr-stats-events.ndjson");
-        // Missing (the upgrade case: wired pre-fix, no event-log var) → add it,
-        // leaving the hook vars untouched.
         let missing = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/chain-r1-started.sh\n\
                        ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/var/lib/ghr-stats/hooks/chain-r1-completed.sh\n";
         let out = ensure_event_log(missing, log).expect("a change was needed");
         assert!(out.contains(
             "GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson"
         ));
-        assert!(out.contains("chain-r1-started.sh")); // hook vars preserved
-        // Stale value → replaced (exactly one line, the correct one).
+        assert!(out.contains("chain-r1-started.sh"));
         let stale = "GHR_STATS_EVENT_LOG=/old/path.ndjson\nKEEP=1\n";
         let fixed = ensure_event_log(stale, log).expect("a change was needed");
         assert!(!fixed.contains("/old/path.ndjson"));
         assert_eq!(fixed.matches("GHR_STATS_EVENT_LOG=").count(), 1);
         assert!(fixed.contains("KEEP=1"));
-        // Already correct → no change.
         assert!(ensure_event_log(&out, log).is_none());
     }
 
     #[test]
     fn fresh_install_reverses_to_unset() {
-        // unset (other lines only) → install → remove ⇒ byte-identical original,
-        // even though install now also writes the per-runner event-log var.
         let original = "TMPDIR=/var/tmp/runner\nKEEP=1\n";
         let installed = rewrite_env(
             original,
@@ -478,7 +364,7 @@ mod tests {
                 "/srv/actions-runner/runner-01/.ghr-stats-events.ndjson",
             )),
         );
-        assert_eq!(classify(&installed, &our()), HookStatus::Ours);
+        assert_eq!(classify(&installed, &[our()]), HookStatus::Ours);
         assert!(installed.contains("GHR_STATS_EVENT_LOG="));
         assert_eq!(remove_hook_vars(&installed), original);
     }

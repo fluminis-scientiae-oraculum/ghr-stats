@@ -1,25 +1,11 @@
-//! What the wire gets: the snapshot adjudicated into one answer.
-//!
-//! The only projection that computes a [`Verdict`], and the only one whose types
-//! cross the IPC boundary — which is the same statement twice, because a verdict
-//! is what a remote caller cannot derive for itself.
-//!
-//! It is computed on the COLLECTOR rather than left to each consumer: an agent
-//! re-deriving "is this healthy?" from six gauges gets it wrong the same way a
-//! human does, which is the whole lesson of the incident this release addresses.
-//! One verdict, one place. `ipc_server::dispatch` is the sole caller.
+//! Adjudicates a [`Snapshot`] into the [`FleetStatus`] sent over IPC, so consumers share
+//! one verdict.
 
 use crate::shared::models::{FleetCounts, FleetStatus, Mode, OrgStatus, RunnerStatus, Verdict};
 
 use super::Snapshot;
 
 impl Snapshot {
-    /// Project the snapshot into the machine-facing [`FleetStatus`] payload.
-    ///
-    /// The verdict is computed HERE, on the collector, rather than left to each
-    /// consumer: an agent re-deriving "is this healthy?" from six gauges gets it
-    /// wrong the same way a human does — which is the whole lesson of the
-    /// incident this release addresses. One verdict, one place.
     pub fn to_status(&self, mode: Mode) -> FleetStatus {
         let reconcile_age = |org: &str| -> Option<i64> {
             self.reconcile
@@ -52,22 +38,11 @@ impl Snapshot {
             .orgs
             .iter()
             .map(|o| {
-                // Judge an org only from readings we actually have.
-                //
-                // `github_online` counts FRESH readings only, so comparing it
-                // against `total` reads ignorance as failure: an org we cannot
-                // ask about — no PAT, a broken token, a reconcile gap — scores
-                // zero and looks like a total outage. That is the conflation
-                // this release exists to end, and the one `GhView::online`
-                // forbids in as many words: callers must not treat "we don't
-                // know" as "offline". The alert recipes already guard it with
-                // `ghr_api_org_configured == 1`; this is the same guard, on the
-                // path an agent actually reads.
+                // Only fresh readings count: an org we cannot ask about (no PAT, broken
+                // token, reconcile gap) is Unknown, not an outage.
                 let verdict = if o.github_known == 0 {
                     Verdict::Unknown
                 } else if o.github_online < o.github_known {
-                    // Some runner we CAN see is offline to GitHub — the shape
-                    // the incident took.
                     Verdict::Degraded
                 } else {
                     Verdict::Ok
@@ -82,8 +57,7 @@ impl Snapshot {
             })
             .collect();
 
-        // "No runners at all" is not health — it is an inability to answer, and
-        // must not exit 0 as though the fleet were fine.
+        // No runners is an inability to answer, not health.
         let verdict = if self.runners.is_empty() {
             Verdict::Unknown
         } else if self.divergent > 0 || self.offline > 0 {
@@ -116,9 +90,6 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    /// One org, one healthy idle runner, and NO reconcile rows at all — the org
-    /// has never been asked about successfully. Either no PAT is configured, or
-    /// it is an account type with no org runner API.
     fn seed_unreconciled() -> Connection {
         let mut c = Connection::open_in_memory().unwrap();
         crate::service::store::schema_for_test(&mut c);
@@ -131,21 +102,12 @@ mod tests {
         c
     }
 
-    /// An org we CANNOT ASK ABOUT must not be reported as degraded.
-    ///
-    /// `github_online` counts only FRESH readings, so an org whose reconcile has
-    /// never succeeded contributes 0 — and a bare `github_online < total` then
-    /// reads ignorance as failure. That is the exact conflation this release
-    /// exists to end, it is what `GhView::online`'s contract forbids ("callers
-    /// must not treat \"we don't know\" as \"offline\""), and it is what the
-    /// `configured == 1` clause already guards in the alert recipes.
     #[test]
     fn an_org_we_cannot_ask_about_is_unknown_not_degraded() {
         let snap = Snapshot::gather(&seed_unreconciled(), 1100, "9.9.9", 180).unwrap();
         let st = snap.to_status(Mode::Persistent);
         let org = &st.orgs[0];
 
-        // The premise: we have no reading at all for this org.
         assert_eq!(org.runners, 1);
         assert_eq!(org.github_online, 0);
         assert_eq!(org.reconcile_age_s, None, "never reconciled");
@@ -157,9 +119,6 @@ mod tests {
         );
     }
 
-    /// The guard against over-correcting. Making ignorance `Unknown` must not
-    /// make a REAL fault quiet: an org we can see, holding a runner GitHub says
-    /// is offline, is still degraded.
     #[test]
     fn a_runner_we_can_see_going_offline_still_degrades_its_org() {
         let mut c = Connection::open_in_memory().unwrap();
@@ -172,7 +131,6 @@ mod tests {
             )
             .unwrap();
         }
-        // GitHub answered for both, and says r1 cannot take work.
         for (id, online) in [(1, 0), (2, 1)] {
             c.execute(
                 "INSERT INTO api_runner_sample (ts,agent_id,org,name,online,busy) \

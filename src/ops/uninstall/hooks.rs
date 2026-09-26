@@ -1,18 +1,6 @@
-//! Runner hook REVERSAL — the inverse of `install`, and just as careful.
-//!
-//! Install never clobbers a foreign hook; uninstall must never *strand* one.
-//! Per runner we re-detect from the authoritative source (its live `.env` + our
-//! on-disk wrappers) and act only on what we ourselves installed:
-//!
-//! - **fresh** (our plain `job-*.sh`, runner was unset) → strip the two vars;
-//! - **chained** (our `chain-*.sh` wrapper, runner had a foreign hook) → restore
-//!   the operator's ORIGINAL hook (recovered from the wrapper) + delete the
-//!   wrapper — the runner is left exactly as we found it;
-//! - **foreign / unset / mixed / unreadable** → leave it untouched, report why.
-//!
-//! No manifest: the classification comes from the same authoritative per-runner
-//! sources install used, so a hand-edited `.env` self-corrects instead of the
-//! reversal acting on a stale record.
+//! Runner hook reversal. Never strand a foreign hook: act only on what we
+//! installed (fresh → strip; chained → restore the original, delete the wrapper)
+//! and leave everything else. Classified from the live `.env`, not a manifest.
 
 use std::path::{Path, PathBuf};
 
@@ -20,26 +8,20 @@ use crate::shared::hooks::env::{self, EnvFile};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 
-/// What a runner's `.env` reveals about *our* footprint on it. Pure result of
-/// [`classify_revert`]; the paths carried by `Chained` are the wrapper scripts to
-/// read + delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RevertKind {
-    /// Foreign hook or unset — not ours; never touch it.
+    /// Foreign hook or unset: never touch it.
     NotManaged,
-    /// Both vars are our plain scripts — strip them (back to the unset state).
     Fresh,
-    /// Both vars are our chain wrappers — restore the wrapped originals.
     Chained {
         started_wrapper: PathBuf,
         completed_wrapper: PathBuf,
     },
-    /// Managed by us but in a mixed/partial state — report, never auto-mutate.
+    /// Ours but partial: report, never auto-mutate.
     Mixed,
 }
 
-/// Classify how (if at all) to revert a runner from its `.env` text + our hooks
-/// dir. Pure. Only a state where BOTH vars point at our scripts is ever touched.
+/// Only a state where both vars point at our scripts is ever touched.
 pub(crate) fn classify_revert(env: &str, our_dir: &Path) -> RevertKind {
     let inside =
         |p: &Path| install::is_directly_in(p, std::slice::from_ref(&our_dir.to_path_buf()));
@@ -70,7 +52,7 @@ pub(crate) fn classify_revert(env: &str, our_dir: &Path) -> RevertKind {
                 RevertKind::Mixed
             }
         }
-        // Exactly one var set: ours ⇒ an odd half-install (manual); else foreign.
+        // Exactly one var set: ours is a half-install (manual); otherwise foreign.
         (s, c) => match s.or(c).map(PathBuf::from) {
             Some(p) if inside(&p) => RevertKind::Mixed,
             _ => RevertKind::NotManaged,
@@ -78,18 +60,14 @@ pub(crate) fn classify_revert(env: &str, our_dir: &Path) -> RevertKind {
     }
 }
 
-/// The concrete, previewable action for one runner — built by [`plan_runner`]
-/// without mutating anything, so the dry-run shows exactly what execution does.
 #[derive(Debug, Clone)]
 pub(crate) enum RevertAction {
-    /// Nothing to do; `why` explains (foreign / unset / unreadable).
+    /// Foreign, unset or unreadable.
     Leave { why: String },
-    /// Ours but ambiguous — needs a human; `why` explains.
+    /// Ours but ambiguous: needs a human.
     Manual { why: String },
-    /// Fresh install: rewrite `.env` to `new_env` (the two vars removed).
+    /// Fresh install: `new_env` has the two vars removed.
     Strip { new_env: String },
-    /// Chained: rewrite `.env` to `new_env` (originals restored) + delete the
-    /// wrappers; `originals` is shown in the plan so the operator sees what returns.
     Restore {
         new_env: String,
         originals: (PathBuf, PathBuf),
@@ -97,7 +75,6 @@ pub(crate) enum RevertAction {
     },
 }
 
-/// A per-runner reversal plan (no mutation performed).
 pub(crate) struct RunnerHookPlan {
     pub name: String,
     pub dir: PathBuf,
@@ -105,8 +82,6 @@ pub(crate) struct RunnerHookPlan {
     pub action: RevertAction,
 }
 
-/// Build the reversal plan for one runner by reading its live `.env` (+ any of
-/// our wrappers it points at). No mutation — safe to call for the dry-run.
 pub(crate) fn plan_runner(r: &RunnerInfo, our_dir: &Path) -> RunnerHookPlan {
     let (env, action) = match env::read(&r.dir) {
         Err(e) => (
@@ -128,13 +103,10 @@ pub(crate) fn plan_runner(r: &RunnerInfo, our_dir: &Path) -> RunnerHookPlan {
     }
 }
 
-/// The action half of [`plan_runner`], separated so the classification + restore
-/// arithmetic is unit-testable against on-disk wrapper files. Reads wrappers (to
-/// recover originals) but writes nothing.
 fn plan_action(text: &str, our_dir: &Path) -> RevertAction {
     match classify_revert(text, our_dir) {
         RevertKind::NotManaged => RevertAction::Leave {
-            why: match install::classify(text, our_dir) {
+            why: match install::classify(text, std::slice::from_ref(&our_dir.to_path_buf())) {
                 HookStatus::Unset => "no ghr-stats hook (unset)".to_string(),
                 _ => "foreign hook — left untouched (not ours)".to_string(),
             },
@@ -153,8 +125,7 @@ fn plan_action(text: &str, our_dir: &Path) -> RevertAction {
             let oc = read_wrapped_original(&completed_wrapper);
             match (os, oc) {
                 (Some(os), Some(oc)) => RevertAction::Restore {
-                    // `None`: strip the GHR_STATS_EVENT_LOG we injected — never
-                    // carry our var into the restored foreign `.env`.
+                    // `None` drops our GHR_STATS_EVENT_LOG from the restored `.env`.
                     new_env: install::rewrite_env(text, &os, &oc, None),
                     originals: (os, oc),
                     wrappers: vec![started_wrapper, completed_wrapper],
@@ -168,13 +139,11 @@ fn plan_action(text: &str, our_dir: &Path) -> RevertAction {
     }
 }
 
-/// Read a wrapper file and recover the operator's original hook path from it.
 fn read_wrapped_original(wrapper: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(wrapper).ok()?;
     install::original_from_wrapper(&text)
 }
 
-/// Apply a runner's reversal plan (privileged); returns a receipt line.
 pub(crate) fn apply_runner(plan: &RunnerHookPlan) -> String {
     let (new_env, restored) = match &plan.action {
         RevertAction::Leave { why } => return format!("  · {} — {why}", plan.name),
@@ -246,7 +215,6 @@ mod tests {
             }
         );
 
-        // One ours, one foreign ⇒ never a clean revert.
         let half = "ACTIONS_RUNNER_HOOK_JOB_STARTED=/var/lib/ghr-stats/hooks/job-started.sh\n\
                     ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/sbin/y.sh\n";
         assert_eq!(classify_revert(half, &our()), RevertKind::NotManaged);
@@ -256,7 +224,6 @@ mod tests {
     fn plan_action_restore_recovers_original_from_disk_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let our_dir = dir.path();
-        // Lay down two real chain wrappers pointing at the operator's hooks.
         let orig_s = "/usr/local/sbin/cleanup-started.sh";
         let orig_c = "/usr/local/sbin/cleanup-completed.sh";
         for (name, orig) in [

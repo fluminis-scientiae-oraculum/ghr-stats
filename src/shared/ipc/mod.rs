@@ -1,30 +1,8 @@
-//! The collector↔client IPC: a small, synchronous, length-prefixed JSON protocol
-//! over a Unix domain socket. No HTTP framework, no async runtime — one frame is
-//! a `u32`-LE length followed by a `serde_json` body. The collector (Persistent
-//! mode) serves it; the TUI and every machine-facing verb (`status`, `explain`,
-//! `timeline`, `doctor`) are clients, and a successful `connect` is itself the
-//! Persistent-mode signal.
-//!
-//! By construction the protocol carries ONLY derived fleet stats: there is no
-//! `Request`/`Response` variant that returns a GitHub token or a config value.
-//! Every response payload reuses a `shared::models` type verbatim (the shapes the
-//! store's read queries return), so the wire types and the query types can never
-//! drift apart.
-//!
-//! **One request, one response — deliberately, and there is no subscribe path.**
-//! A streaming verb (`tail`) was specced against this protocol and the shape was
-//! decided against on three grounds. Transitions do not exist until a sampler
-//! observes them, so a subscriber would receive events quantised to the same
-//! `local_secs` grid a poller sees — the latency argument is empty against this
-//! collector's own cadence. A long-lived subscription would hold one of
-//! `MAX_CONNS` connection slots for its lifetime, and the accept loop *drops*
-//! callers past that cap rather than queueing them, so a handful of forgotten
-//! streams would refuse every other client — the exact lockout the
-//! thread-per-connection fix was written to end. And a poll can prove it kept up,
-//! because `Bounded<T>` reports whether a limit truncated the answer, whereas a
-//! stream that drops events under backpressure has to be built to admit it.
-//! A verb that wants a live feed therefore polls a `Query` with a cursor; adding
-//! a many-response frame shape needs to defeat those three first.
+//! Collector↔client IPC: synchronous, length-prefixed JSON over a Unix socket.
+//! A frame is a `u32`-LE length then a `serde_json` body; one request, one response.
+//! No variant carries a GitHub token or config value.
+//! No subscribe path: the accept loop drops callers past `MAX_CONNS`, so long-lived
+//! streams would lock out other clients; live feeds poll a `Query` with a cursor.
 
 pub mod client;
 
@@ -37,66 +15,23 @@ use crate::shared::models::{
     BusyPoint, FleetStatus, GhView, HistPoint, HostPoint, JobRow, RunnerState,
 };
 
-/// Wire protocol version. Bump on any breaking change to `Request`/`Response`.
-/// The same binary ships both halves, so a mismatch means the installed service
-/// is older/newer than the TUI binary — restart the service after upgrading.
-/// v2: added `RunnerStates` (persisted liveness edges for the "For" duration).
-/// v3: added authorized config mutations (`SetMetricsPull`, `AddOrgToken`).
-/// v4: added `ConfiguredTokenOrgs` (presence-only view of the root config's
-///     configured org logins — so a non-root TUI reflects the true PAT state).
-/// v5: split `Request` into `Query`/`Mutate` so authz is structural (mutations
-///     are unreachable except past the gate).
-/// v6: `ActiveJob` → `LatestJob` — the runner-detail job line now shows the most
-///     recent job (running OR last completed), not only an in-flight one.
-/// v7: added `RemoveOrgToken` (drop an org's PAT + forget the org) — the config
-///     wizard's `[r]` action.
-/// v8: runner identity is the install `dir`, not `agentId` (which collides across
-///     orgs). `RunnerHistory` keys by `dir`, `ApiRow` carries `org` (so the GH
-///     join is `(org, agent_id)`), and `RunnerState` is keyed by `dir`.
-/// v9: the GitHub view carries its own freshness verdict, and `FleetStatus`
-///     joins `Query` (the machine-facing snapshot behind `ghr-stats status`). `ApiRow.view` is a
-///     `GhView` (Fresh/Stale/Unknown) rather than a bare `ApiState`, so a stale
-///     read can no longer be rendered as live, and `BusyPoint` carries
-///     `github_online` so the occupancy chart can plot a gap instead of a zero.
-/// v10: added `Timeline` — the first query that answers about a WINDOW rather
-///     than an instant. It is also the first whose reply is explicitly bounded
-///     (`Bounded<T>` carries whether the limit cut it), because a history query
-///     is the one shape that can outgrow both the frame cap and a caller's
-///     context. `BusyPoint.github_online: Option<u32>` also became
-///     `github: Option<GhCount>`, which carries the population the count speaks
-///     for — the occupancy chart's GitHub line is meaningless without its
-///     denominator on a fleet that holds runners GitHub is never asked about.
-///     Also `Retention` — where the record starts, as its own question. It was
-///     first answered by reading `Timeline.window.truncated_at`, which meant
-///     `doctor` derived every edge across a 7-day window (8.13s on a 1.1 GiB
-///     database) to read one nullable timestamp a covering index answers in
-///     0.25ms. A cheap fact deserves a cheap question.
+/// Wire protocol version; client and collector must match (checked by `Hello`).
 pub const VERSION: u16 = 10;
 
-/// Reject any frame whose length prefix exceeds this (corrupt/hostile guard),
-/// before allocating. 1 MiB is far above any real history response.
 const MAX_FRAME: u32 = 1 << 20;
 
-/// A TUI → collector request. The three-way split is deliberate and *structural*
-/// (not cosmetic): the collector routes purely on this shape — `Query` is served
-/// with no authorization, `Mutate` is reachable ONLY past the peer-cred authz
-/// gate. So an unauthorized mutation, or a mutation that forgot the gate, is
-/// unrepresentable — a compile-time property, not something a test must guard.
-/// Adding a variant to either inner enum forces the matching handler arm
-/// (exhaustive `match`, no `unreachable!`), so "changed here, forgot there"
-/// becomes a build error.
+/// `Query` is served unauthenticated; `Mutate` is reachable only past the peer-cred authz gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
-    /// Version handshake — proves the peer speaks our protocol version.
-    Hello { client: u16 },
-    /// A read. Never authorized (carries only derived fleet stats + config
-    /// presence — never a secret).
+    /// `client` is the caller's [`VERSION`].
+    Hello {
+        client: u16,
+    },
     Query(Query),
-    /// A config write. Authorized (uid 0 or the `ghr-stats` group) or refused.
+    /// Allowed for uid 0 or the `ghr-stats` group; otherwise `Response::Denied`.
     Mutate(Mutation),
 }
 
-/// The read queries the TUI issues. Unauthenticated by construction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Query {
     HostSeries {
@@ -116,45 +51,30 @@ pub enum Query {
         runner_name: String,
     },
     LatestApiRunners,
-    /// The whole machine-facing fleet snapshot, verdict included. Backs
-    /// `ghr-stats status`: one round-trip instead of six, and the health call is
-    /// made by the collector rather than reassembled (and mis-derived) by each
-    /// client.
+    /// Machine-facing fleet snapshot with the collector-computed health verdict.
     FleetStatus,
-    /// What changed over a window, and optionally the samples underneath it.
-    /// The only query about a span rather than an instant, and the only one
-    /// whose caller states a bound — see [`TimelineQuery`].
+    /// What changed over a window, optionally with the samples underneath it.
     Timeline(TimelineQuery),
-    /// Where the retained record starts. Takes no window BY DESIGN: the answer
-    /// is a property of the store, not of any span, and asking it through
-    /// [`Query::Timeline`] made a `min(ts)` cost a full edge derivation.
+    /// Where the retained record starts.
     Retention,
-    /// Persisted per-runner liveness edges (survive restarts) — for the "For"
-    /// duration. Falls back to the TUI's in-memory edge when absent.
+    /// Persisted per-runner liveness edges; they survive collector restarts.
     RunnerStates,
-    /// The org logins that have a configured read-only PAT — presence ONLY, never
-    /// the token. Lets a non-root TUI (which can't read the root-owned /etc config)
-    /// show the true configured-token state via the root collector.
+    /// Org logins with a configured PAT; presence only, never the token.
     ConfiguredTokenOrgs,
 }
 
-/// The config writes the TUI can request. Authorized (uid 0 or `ghr-stats` group)
-/// by the single gate on the `Request::Mutate` branch — every present and future
-/// variant is behind it, with no per-variant opt-in to forget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Mutation {
-    /// Toggle the Prometheus pull endpoint (mirrors the TUI's `[m]`).
+    /// Toggle the Prometheus pull endpoint.
     SetMetricsPull { enabled: bool, addr: String },
-    /// Add/replace a read-only PAT for an org (mirrors the wizard's `[a]`). The
-    /// token is one-way: it is written but never returned in any response.
+    /// Add or replace an org's PAT; never returned in any response.
     AddOrgToken { org: String, token: String },
-    /// Remove an org's PAT and forget the org (mirrors the wizard's `[r]`).
+    /// Remove an org's PAT and forget the org.
     RemoveOrgToken { org: String },
 }
 
 impl Mutation {
-    /// A stable, payload-free audit label for a mutation (never the org/token) —
-    /// the single variant→name map, shared by the collector's deny + apply logs.
+    /// Audit-log label; never includes the org or token.
     pub fn action(&self) -> &'static str {
         match self {
             Mutation::SetMetricsPull { .. } => "set_metrics_pull",
@@ -164,47 +84,24 @@ impl Mutation {
     }
 }
 
-/// One runner's GitHub state, paired with its `(org, agent_id)` identity. A `Vec`
-/// of these — not a `HashMap` — crosses the wire, because JSON object keys must
-/// be strings; the client rebuilds the map (`ipc::client::api_map`). `org` is
-/// part of the key because `agent_id` is unique only within an org.
+/// One runner's GitHub view keyed by `(org, agent_id)`; `agent_id` is unique only per org.
+/// Sent as a `Vec` because JSON object keys must be strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiRow {
     pub agent_id: i64,
     pub org: String,
-    /// GitHub's view WITH its freshness already decided by the collector, which
-    /// is the side that knows when the reading was taken. The TUI renders the
-    /// verdict; it never re-derives it from a timestamp.
+    /// Freshness is decided by the collector; clients render it, never re-derive it.
     pub view: GhView,
 }
 
-/// A collector → TUI reply. `Error` carries a human string for logging; the TUI
-/// falls back to its in-memory rings on any non-data reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Hello {
         server: u16,
-        /// The COLLECTOR's build version (not the wire version). Lets the TUI
-        /// show "you upgraded the binary but did not restart the service",
-        /// which is otherwise invisible.
-        ///
-        /// `serde(default)` is load-bearing for cross-version handshakes: a
-        /// pre-v9 collector sends no such field, and without the default the
-        /// reply would fail to deserialize and surface as "unexpected handshake
-        /// reply" instead of the clean version mismatch we want to report.
+        /// Collector build version, not [`VERSION`]. `serde(default)` so older
+        /// collectors that omit it still produce a clean version mismatch.
         #[serde(default)]
         version: String,
-    },
-    /// A peer refusing our version outright.
-    ///
-    /// **This collector never sends it** — its handshake reports rather than
-    /// negotiates, answering [`Response::Hello`] with its own version whatever
-    /// the client claims, because it cannot know which request shapes a
-    /// differing client will actually use. The variant exists so a client can
-    /// still understand a peer that does refuse, and `client.rs` reads `server`
-    /// out of either reply identically. Pinned by an integration test.
-    VersionMismatch {
-        server: u16,
     },
     HostSeries(Vec<HostPoint>),
     BusySeries(Vec<BusyPoint>),
@@ -213,31 +110,18 @@ pub enum Response {
     LatestJob(Option<JobRow>),
     LatestApiRunners(Vec<ApiRow>),
     FleetStatus(Box<FleetStatus>),
-    /// Boxed like `FleetStatus`: both dwarf every other variant, and an enum is
-    /// as large as its largest arm — unboxed, every small reply would carry the
-    /// cost of the biggest one.
     Timeline(Box<Timeline>),
-    /// The oldest retained sample, or `None` when nothing has been sampled yet.
-    ///
-    /// A bare timestamp rather than a computed "days of history": retention is
-    /// reported, never judged (pruning is manual), and the caller that renders
-    /// it is better placed than the collector to decide what it means.
+    /// Oldest retained sample; `None` when nothing has been sampled yet.
     Retention {
         earliest_ts: Option<i64>,
     },
-    /// Persisted liveness edges; `RunnerState.dir` is self-keying, so a
-    /// `Vec` crosses the wire and the client rebuilds the map.
     RunnerStates(Vec<RunnerState>),
-    /// Configured org logins (presence only — no token values ever cross here).
     ConfiguredTokenOrgs(Vec<String>),
-    /// A mutation was authorized and persisted.
     Mutated,
-    /// A mutation was refused — the peer is neither root nor in `ghr-stats`.
     Denied,
     Error(String),
 }
 
-/// Write one length-prefixed JSON frame: `u32`-LE length, then the body.
 pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let body = serde_json::to_vec(msg).map_err(io::Error::other)?;
     let len = u32::try_from(body.len())
@@ -249,7 +133,6 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()>
     w.flush()
 }
 
-/// Read one length-prefixed JSON frame. Enforces `MAX_FRAME` before allocating.
 pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<T> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -280,7 +163,6 @@ mod tests {
         }]);
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
-        // First four bytes are the LE length of the JSON body.
         let declared = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         assert_eq!(declared, buf.len() - 4);
         let back: Response = read_frame(&mut &buf[..]).unwrap();
@@ -289,7 +171,6 @@ mod tests {
 
     #[test]
     fn oversize_length_prefix_is_rejected_before_alloc() {
-        // A hostile 4 GiB length prefix must error, not attempt a huge alloc.
         let mut framed = (u32::MAX).to_le_bytes().to_vec();
         framed.extend_from_slice(b"ignored");
         let err = read_frame::<_, Request>(&mut &framed[..]).unwrap_err();
@@ -300,56 +181,7 @@ mod tests {
     fn truncated_body_errors() {
         let mut buf = Vec::new();
         write_frame(&mut buf, &Request::Query(Query::HostSeries { limit: 10 })).unwrap();
-        buf.truncate(buf.len() - 2); // lose the tail of the body
+        buf.truncate(buf.len() - 2);
         assert!(read_frame::<_, Request>(&mut &buf[..]).is_err());
-    }
-
-    #[test]
-    fn mutation_request_variants_round_trip() {
-        let mut buf = Vec::new();
-        write_frame(
-            &mut buf,
-            &Request::Mutate(Mutation::SetMetricsPull {
-                enabled: true,
-                addr: "127.0.0.1:9477".to_string(),
-            }),
-        )
-        .unwrap();
-        let back: Request = read_frame(&mut &buf[..]).unwrap();
-        assert!(matches!(
-            back,
-            Request::Mutate(Mutation::SetMetricsPull { enabled: true, addr })
-                if addr == "127.0.0.1:9477"
-        ));
-
-        let mut buf = Vec::new();
-        write_frame(
-            &mut buf,
-            &Request::Mutate(Mutation::AddOrgToken {
-                org: "acme".to_string(),
-                token: "github_pat_ABC".to_string(),
-            }),
-        )
-        .unwrap();
-        let back: Request = read_frame(&mut &buf[..]).unwrap();
-        assert!(matches!(
-            back,
-            Request::Mutate(Mutation::AddOrgToken { org, token })
-                if org == "acme" && token == "github_pat_ABC"
-        ));
-    }
-
-    /// The mutation-reply variants carry no payload — structurally, no `Response`
-    /// can return a token. This pins that: their JSON bodies mention neither a
-    /// token nor a value, only the tag.
-    #[test]
-    fn mutation_replies_are_payload_free() {
-        for resp in [Response::Mutated, Response::Denied] {
-            let body = serde_json::to_string(&resp).unwrap();
-            assert!(
-                body == "\"Mutated\"" || body == "\"Denied\"",
-                "mutation reply must be a bare tag, got {body}"
-            );
-        }
     }
 }

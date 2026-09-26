@@ -1,34 +1,4 @@
-//! Server-side reads (the IPC server + the metrics exporter). The collector is
-//! the only writer; readers open their own connection and rely on WAL for
-//! contention-free concurrent reads. The TUI no longer opens the DB — in
-//! Persistent mode it fetches these same shapes over the IPC socket, so the
-//! query structs below double as the IPC wire payloads (hence the serde derives).
-//!
-//! Cut by WHICH PRODUCER WROTE THE ROWS, because that is what a schema change
-//! follows. `serve` runs those producers as separate threads on separate
-//! periods, and each one owns its own tables:
-//!
-//! - **this file** — what the collector SAMPLED off this machine: the runner and
-//!   host ticks.
-//! - [`github`] — what GITHUB said, from the reconcile thread's writes.
-//! - [`jobs`] — what the RUNNERS' HOOKS reported: the ingested event log, and
-//!   the tailer's own place in the streams it read them from.
-//! - [`timeline`] — the one cluster with a shape rather than a source of its own:
-//!   every function elsewhere answers "what is true now", while those derive what
-//!   CHANGED between two samples.
-//!
-//! `V6` (the `api_*` tables) landed entirely in [`github`]; the job-conclusion
-//! reconcile landed entirely in [`jobs`]. The model types agree with the split —
-//! `GhView`/`ApiState` appear only in one, `JobRow`/`PendingConclusion` only in
-//! another, `OptionalExtension` only where a query may legitimately match nothing.
-//!
-//! [`busy_series`] stays here despite joining GitHub's rows: it is DRIVEN by the
-//! local tick and enriches it, which is exactly why it is the series that can
-//! show the two disagreeing.
-//!
-//! Every reader is re-exported flat, so callers keep saying `reader::recent_jobs`
-//! and have no reason to learn which producer's file it moved to.
-
+//! Server-side reads for the IPC server and metrics exporter, each on its own WAL connection.
 use std::collections::HashMap;
 
 use rusqlite::{Connection, params};
@@ -38,15 +8,9 @@ use crate::shared::models::{
     BusyPoint, GhCount, HistPoint, HostPoint, Liveness, RunnerSample, RunnerState,
 };
 
-/// The `timeline` query's readers — the edge derivations and the window
-/// assembly. Split out because they are the one cluster here with a shape of
-/// their own: every other function in this module answers "what is true now",
-/// while these derive what CHANGED between two samples.
+/// Edge derivations and window assembly for the `timeline` query.
 pub mod timeline;
 
-// Re-exported so callers keep saying `reader::timeline(..)`. The module and the
-// function share a name deliberately — the module IS that query's readers, and
-// a caller has no reason to learn that the entry point moved.
 pub use timeline::timeline;
 
 mod github;
@@ -55,8 +19,7 @@ mod jobs;
 pub use github::{api_reconcile_states, api_runner_states, latest_api_runners};
 pub use jobs::{ingest_offsets, job_counts, jobs_awaiting_conclusion, latest_job, recent_jobs};
 
-/// The most recent `limit` samples for a runner, returned oldest → newest so
-/// they can be fed straight into a left-to-right sparkline.
+/// Newest `limit` samples, oldest first.
 pub fn runner_history(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<HistPoint>> {
     let mut stmt = conn.prepare_cached(
         "SELECT ts, cpu_pct, mem_bytes FROM runner_sample \
@@ -74,7 +37,7 @@ pub fn runner_history(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<
     Ok(out)
 }
 
-/// Recent host samples, oldest → newest.
+/// Newest `limit` host samples, oldest first.
 pub fn host_series(conn: &Connection, limit: usize) -> Result<Vec<HostPoint>> {
     let mut stmt = conn.prepare_cached(
         "SELECT ts, load1, mem_used, mem_total, tmp_bytes, work_bytes, root_free FROM host_sample \
@@ -96,25 +59,9 @@ pub fn host_series(conn: &Connection, limit: usize) -> Result<Vec<HostPoint>> {
     Ok(out)
 }
 
-/// Fleet occupancy per tick (busy and online counts), oldest → newest.
-///
-/// The GitHub count is LEFT-joined per runner from the newest reconcile reading
-/// AT OR BEFORE that tick, bounded by `max_age` — the same shape
-/// [`timeline_samples`] uses, for the same reason. The two producers are
-/// independent threads on different periods (local ticks default to 5s, API
-/// ticks to 60s) that each stamp their own clock, so joining on exact `ts`
-/// equality only matched when both happened to fire inside the same second:
-/// roughly one point per twelve, and the density tracked scheduler drift rather
-/// than whether GitHub data existed. Carrying the last reading forward gives a
-/// continuous series; `max_age` is what keeps it honest, so a dead reconcile
-/// thread decays into a gap instead of a confident flat line.
-///
-/// Joining per `(org, agent_id)` also narrows the count to OUR runners: the old
-/// query summed every API row at the matching tick, which on an org whose
-/// runners are spread across hosts counted machines this host cannot see.
-///
-/// Deriving occupancy from local liveness alone is what let the Trends chart
-/// draw a flat healthy line straight through a four-hour outage.
+/// Occupancy per tick, oldest first. Each runner's GitHub reading is the newest at or
+/// before the tick, within `max_age`: the local and API threads stamp independent clocks,
+/// so an exact-`ts` join misses.
 pub fn busy_series(conn: &Connection, limit: usize, max_age: u64) -> Result<Vec<BusyPoint>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.ts, \
@@ -135,8 +82,7 @@ pub fn busy_series(conn: &Connection, limit: usize, max_age: u64) -> Result<Vec<
             ts: r.get(0)?,
             busy: r.get::<_, i64>(1)? as u32,
             online: r.get::<_, i64>(2)? as u32,
-            // `gh_online` is NULL exactly when no row joined, which is the same
-            // condition as `gh_known == 0`; `GhCount::new` owns that decision.
+            // `gh_online` is NULL exactly when `gh_known == 0`.
             github: GhCount::new(
                 r.get::<_, Option<i64>>(3)?.unwrap_or(0) as u32,
                 r.get::<_, i64>(4)? as u32,
@@ -148,8 +94,6 @@ pub fn busy_series(conn: &Connection, limit: usize, max_age: u64) -> Result<Vec<
     Ok(out)
 }
 
-/// Every runner's most recent sample (the latest tick). Consumed by the metrics
-/// exporter (`metrics::encode`); empty if the collector has never sampled.
 pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
     let max_ts: Option<i64> =
         conn.query_row("SELECT max(ts) FROM runner_sample", [], |r| r.get(0))?;
@@ -157,7 +101,7 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare_cached(
-        "SELECT ts, agent_id, name, org, liveness, current_run_id, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes \
+        "SELECT ts, agent_id, name, org, liveness, cpu_pct, mem_bytes, uptime_s, dir, mem_current_bytes \
          FROM runner_sample WHERE ts = ?1",
     )?;
     let rows = stmt.query_map(params![ts], |r| {
@@ -167,19 +111,16 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
             name: r.get(2)?,
             org: r.get(3)?,
             liveness: Liveness::from_db(&r.get::<_, String>(4)?),
-            current_run_id: r.get(5)?,
-            cpu_pct: r.get::<_, Option<f64>>(6)?.map(|v| v as f32),
-            mem_bytes: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-            uptime_s: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-            dir: r.get(9)?,
-            mem_current_bytes: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            cpu_pct: r.get::<_, Option<f64>>(5)?.map(|v| v as f32),
+            mem_bytes: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            uptime_s: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+            dir: r.get(8)?,
+            mem_current_bytes: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         })
     })?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Current liveness + since-edge timestamp per runner, keyed by install `dir`.
-/// Drives the "Idle/Active for <dur>" display.
 pub fn runner_states(conn: &Connection) -> Result<HashMap<String, RunnerState>> {
     let mut stmt =
         conn.prepare_cached("SELECT dir, liveness, since_ts, last_seen_ts FROM runner_state")?;
@@ -198,34 +139,17 @@ pub fn runner_states(conn: &Connection) -> Result<HashMap<String, RunnerState>> 
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// The most recent host sample, if any (for the metrics exporter + banners).
 pub fn latest_host(conn: &Connection) -> Result<Option<HostPoint>> {
     Ok(host_series(conn, 1)?.pop())
 }
 
-/// The oldest retained sample, or `None` when nothing has been sampled yet.
-///
-/// `runner_sample` alone, not a union across every `*_sample` table: they are
-/// pruned together by `db prune`, and runners are the series that exists on
-/// every deployment — a host with metrics disabled still samples runners. A
-/// union would trade a covering-index probe for a scan per table to sharpen an
-/// answer nobody reads that precisely.
-///
-/// The cheapness is the point. This fact was previously read out of
-/// [`timeline::timeline`]'s `window.truncated_at`, which meant deriving every
-/// edge across the caller's window: 8.13s for the 7 days `doctor` asked for, on
-/// a 1.1 GiB / 8.1M-row database. `min(ts)` over `idx_runner_sample_ts` is a
-/// covering-index search — 0.25ms on the same table.
+/// Oldest retained sample. `runner_sample` alone suffices since `db prune` prunes every sample
+/// table together, and `min(ts)` stays a covering-index probe.
 pub fn retention(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row("SELECT min(ts) FROM runner_sample", [], |r| r.get(0))
         .map_err(Into::into)
 }
 
-/// Seeding helpers shared by all three producers' test modules.
-///
-/// In the parent because a seeded in-memory database is the same database
-/// whichever producer's rows a test is about — copying it per child would let
-/// the three drift apart while every test still passed.
 #[cfg(test)]
 mod fixtures {
     use rusqlite::{Connection, params};
@@ -258,15 +182,11 @@ mod tests {
     use super::fixtures::{api_sample, mem_db};
     use super::*;
 
-    /// An empty store must answer "nothing yet" rather than a zero timestamp —
-    /// `doctor` renders this, and 1970 is not a retention window.
     #[test]
     fn retention_of_an_empty_store_is_none_not_zero() {
         assert_eq!(retention(&mem_db()).unwrap(), None);
     }
 
-    /// The OLDEST sample, not the newest, and unaffected by which runner or org
-    /// wrote it: retention is a property of the store, not of any one series.
     #[test]
     fn retention_is_the_oldest_sample_across_every_runner() {
         let conn = mem_db();
@@ -297,7 +217,6 @@ mod tests {
             .unwrap();
         }
         let h = runner_history(&conn, "/srv/r7", 3).unwrap();
-        // newest 3, oldest → newest
         assert_eq!(
             h.iter().map(|p| p.ts).collect::<Vec<_>>(),
             vec![200, 300, 400]
@@ -309,7 +228,6 @@ mod tests {
     #[test]
     fn busy_series_counts_busy_and_online_per_tick() {
         let conn = mem_db();
-        // tick 100: two idle, one busy, one offline → busy=1 online=3
         for (id, live) in [(1, "idle"), (2, "busy"), (3, "idle"), (4, "offline")] {
             conn.execute(
                 "INSERT INTO runner_sample (ts, agent_id, name, org, liveness) \
@@ -323,9 +241,6 @@ mod tests {
         assert_eq!((s[0].busy, s[0].online), (1, 3));
     }
 
-    /// A tick with local samples but no reconcile data must plot a GAP. Emitting
-    /// 0 would draw "GitHub says nothing is online" for a fleet nobody asked
-    /// GitHub about — inventing an outage instead of admitting ignorance.
     #[test]
     fn busy_series_plots_a_gap_not_a_zero_for_a_tick_without_api_data() {
         let conn = mem_db();
@@ -341,24 +256,15 @@ mod tests {
             [],
         )
         .unwrap();
-        // Only tick 200 has a reconcile row.
         api_sample(&conn, 200, "o", 1, 1, 0);
 
         let s = busy_series(&conn, 10, 180).unwrap();
         assert_eq!(s.len(), 2);
-        // Tick 100 predates every reading — a gap, and never a zero. A reading
-        // is only ever carried FORWARD; inventing GitHub's opinion of a moment
-        // before it was asked would be a different lie in the same family.
         assert!(s[0].github.is_none());
         let gh = s[1].github.unwrap();
         assert_eq!((gh.online, gh.known), (1, 1));
     }
 
-    /// The bug this fixes: the two producers are independent threads on
-    /// different periods (5s local, 60s API) that each stamp their own clock, so
-    /// an exact-`ts` join matched only when both fired inside the same second.
-    /// Every tick between two reconciles reported a gap, and the series' density
-    /// tracked scheduler drift rather than whether GitHub data existed.
     #[test]
     fn busy_series_carries_the_newest_reading_at_or_before_each_tick() {
         let conn = mem_db();
@@ -370,23 +276,16 @@ mod tests {
             )
             .unwrap();
         }
-        // One reconcile, landing on the first tick only.
         api_sample(&conn, 100, "o", 1, 1, 0);
 
         let s = busy_series(&conn, 10, 180).unwrap();
         assert_eq!(s.len(), 4);
-        // All four ticks carry it: under the old exact-`ts` join only the first
-        // did, so three of every four points vanished.
         for p in &s {
             let gh = p.github.expect("reading carried forward");
             assert_eq!((gh.online, gh.known), (1, 1));
         }
     }
 
-    /// Carrying forward is only honest while the reading is fresh. Past
-    /// `max_age` the series must decay into a gap — otherwise a dead reconcile
-    /// thread draws a confident flat line forever, which is the failure the
-    /// whole GitHub-view rework exists to prevent.
     #[test]
     fn busy_series_stops_carrying_a_reading_past_max_age() {
         let conn = mem_db();
@@ -406,11 +305,6 @@ mod tests {
         assert!(s[2].github.is_none()); // age 300, past it — a gap
     }
 
-    /// The count speaks only for runners it has a reading for, and says so.
-    /// A fleet holding an org GitHub is never asked about (a personal account
-    /// has no org runner API) would otherwise draw a permanent divergence: the
-    /// GitHub line sitting below the local one forever, for runners nobody ever
-    /// asked about. `known` is what tells that silence apart from an outage.
     #[test]
     fn busy_series_counts_only_the_runners_it_has_a_reading_for() {
         let conn = mem_db();
@@ -423,8 +317,7 @@ mod tests {
             .unwrap();
         }
         api_sample(&conn, 100, "asked", 1, 1, 0);
-        // A runner GitHub knows about that this host does not run — another
-        // machine in the same org. It must not inflate our count.
+        // Another host's runner in the same org must not inflate our count.
         api_sample(&conn, 100, "asked", 99, 1, 0);
 
         let s = busy_series(&conn, 10, 180).unwrap();

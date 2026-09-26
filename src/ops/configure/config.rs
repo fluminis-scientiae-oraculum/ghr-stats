@@ -1,19 +1,5 @@
-//! What ends up in the `0600` config file: the per-org token plan and the
-//! metrics choice.
-//!
-//! Every write here is a faithful in-place [`persist`] edit, so each OTHER
-//! setting in the file survives untouched — the wizard may be re-run against a
-//! hand-edited config without flattening it.
-//!
-//! [`apply_config`] is deliberately PURE OF PROMPTS: all consent has already
-//! happened by the time it is called, which is what makes the whole
-//! set/replace/remove/preserve behaviour unit-testable end to end. Both of this
-//! module's tests exercise exactly that.
-//!
-//! [`existing_token_orgs`] reads presence from the file TEXT rather than a parsed
-//! schema, so it survives schema drift, and it degrades to add-only rather than
-//! failing when the file cannot be read — the ordinary case for a non-root run
-//! against a root-owned `/etc` config.
+//! Config-file half of the wizard. Every write is an in-place [`persist`] edit
+//! that preserves every other setting in the file.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,13 +9,11 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
 
 use crate::shared::config::persist;
-use crate::shared::github::validate::{self, Verdict};
+use crate::shared::github::validate::{self, PatCheck};
 use crate::shared::models::RunnerInfo;
 
 use super::confirm;
 
-/// The per-org PAT changes the token step decided: orgs to set/replace (with the
-/// validated token) and orgs to remove. Applied via faithful `persist` edits.
 #[derive(Default)]
 pub(super) struct TokenPlan {
     pub(super) set: BTreeMap<String, String>,
@@ -42,10 +26,8 @@ impl TokenPlan {
     }
 }
 
-/// The org logins that already have a PAT in `target` — presence only, read from
-/// the file text (so it survives schema drift). Empty when the file is absent or
-/// unreadable (a non-root run can't read the root-owned `/etc` config, so it
-/// degrades to add-only rather than failing).
+/// Empty when unreadable: a non-root run against the root-owned `/etc` config
+/// degrades to add-only.
 pub(super) fn existing_token_orgs(target: &Path) -> BTreeSet<String> {
     std::fs::read_to_string(target)
         .ok()
@@ -53,10 +35,7 @@ pub(super) fn existing_token_orgs(target: &Path) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Per-org PAT management: for an org that already has a PAT, offer keep /
-/// replace / remove; for one without, offer to add. Candidates are the union of
-/// discovered orgs and orgs that already hold a PAT (so a stale one — whose
-/// runners are gone — can still be removed). Bounded validation on set/replace.
+/// Candidates include orgs that only hold a PAT, so a stale one can be removed.
 pub(super) fn manage_tokens(
     theme: &ColorfulTheme,
     discovered: &[RunnerInfo],
@@ -107,9 +86,6 @@ pub(super) fn manage_tokens(
     Ok(plan)
 }
 
-/// Prompt for a fine-grained PAT and validate it (fine-grained only, read +
-/// agentId-confirm). `Some(token)` once valid; `None` if left blank or the user
-/// gives up after a rejection. Shared by the add and replace paths.
 fn prompt_validated_pat(
     theme: &ColorfulTheme,
     org: &str,
@@ -124,7 +100,7 @@ fn prompt_validated_pat(
             return Ok(None);
         }
         match validate::validate(&token, org, local_ids) {
-            Verdict::Valid {
+            PatCheck::Valid {
                 runners,
                 matched,
                 local,
@@ -132,7 +108,7 @@ fn prompt_validated_pat(
                 println!("    ✓ valid — {runners} runners, matched {matched}/{local} local");
                 return Ok(Some(token));
             }
-            Verdict::Rejected(why) => {
+            PatCheck::Rejected(why) => {
                 println!("    ✗ {why}");
                 if !confirm(theme, "    try again?", true)? {
                     return Ok(None);
@@ -142,10 +118,7 @@ fn prompt_validated_pat(
     }
 }
 
-/// Apply the wizard's decisions as faithful in-place `persist` edits: set the
-/// roots, set/replace the collected PATs, remove the ones marked for removal, and
-/// enable metrics if chosen. Every OTHER setting in the file is preserved. Pure
-/// of prompts (all consent happened already), so it is unit-testable end-to-end.
+/// Prompt-free: all consent has happened before this is called.
 pub(super) fn apply_config(
     target: &Path,
     roots: &[PathBuf],
@@ -159,8 +132,7 @@ pub(super) fn apply_config(
     for org in &plan.remove {
         persist::remove_org_token(target, org)?;
     }
-    // Only touch metrics when enabling — declining leaves any existing pull/push
-    // config alone rather than clobbering it.
+    // Declining leaves any existing pull/push config alone.
     if metrics.pull {
         persist::set_metrics_pull(target, true, &metrics.addr)?;
     }
@@ -193,10 +165,6 @@ pub(super) fn prompt_metrics(theme: &ColorfulTheme) -> Result<MetricsChoice> {
 mod tests {
     use super::*;
 
-    /// The wizard's apply step, end-to-end against a real config file: set a new
-    /// PAT, replace an existing one, remove another, and set the roots — while
-    /// every untouched setting (here the push config) survives. This is the
-    /// CLI-side of add/replace/remove, proven without the interactive prompts.
     #[test]
     fn apply_config_sets_replaces_removes_and_preserves_the_rest() {
         let dir = tempfile::tempdir().unwrap();
@@ -231,10 +199,8 @@ mod tests {
             cfg.github_token_for("beta").as_deref(),
             Some("github_pat_B")
         );
-        // widgets removed (presence check is env-independent).
         assert!(!cfg.github.tokens.contains_key("widgets"));
         assert!(!text.contains("github_pat_W"));
-        // Untouched settings + the new roots.
         assert!(cfg.metrics.push.enabled);
         assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/r")]);
     }

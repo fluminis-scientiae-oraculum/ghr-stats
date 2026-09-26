@@ -119,7 +119,6 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b"), b"678").unwrap();
         assert_eq!(dir_size(dir.path()), 8);
-        // A non-existent path is simply zero, never a panic.
         assert_eq!(dir_size(Path::new("/nonexistent/ghr/path")), 0);
     }
 }

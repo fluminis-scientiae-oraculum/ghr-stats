@@ -1,21 +1,3 @@
-//! What the operator sees: the wizard popup, drawn over the dashboard.
-//!
-//! Separated from the machine because it is reached by a different caller —
-//! `tui::mod` draws, `tui::app::mutate` keys — and because every ratatui drawing
-//! type in this module lives here and nowhere else. The rendering has also
-//! changed alone twice (`263f490`, `888d653`), which is the seam test's third
-//! leg: past commits landed on ONE side of it.
-//!
-//! The masking is a SECURITY property, not a cosmetic one: [`input_line`] renders
-//! the PAT buffer as `•` so the secret cannot reach the screen, and therefore
-//! cannot reach a snapshot, a tmux capture, or a screen-share. It is 1:1 per
-//! char, so the cursor still tracks the real caret.
-//!
-//! The tests below fabricate states directly rather than driving the transitions
-//! — legitimate only because a child module can reach its ancestor's private
-//! fields, and the right trade here: a snapshot test should pin one state's
-//! appearance without depending on the path taken to reach it.
-
 use ratatui::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,7 +6,6 @@ use tui_input::Input;
 
 use super::WizardMode;
 
-/// Render the centered wizard popup over the dashboard.
 pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
     let area = crate::tui::view::centered_rect(60, 40, f.area());
     f.render_widget(Clear, area);
@@ -138,9 +119,7 @@ pub(crate) fn draw(f: &mut Frame, mode: &WizardMode) {
     f.render_widget(popup, area);
 }
 
-/// A labelled input field showing the value with a reverse-video cursor at the
-/// widget's cursor position. `masked` renders the value as `•` (the PAT); the
-/// cursor still tracks the real caret since the mask is 1:1 per char.
+/// `masked` renders `•` 1:1 per char, so the cursor still tracks the real caret.
 fn input_line(label: &str, input: &Input, masked: bool) -> Line<'static> {
     let value = input.value();
     let shown: Vec<char> = if masked {
@@ -181,8 +160,6 @@ mod tests {
     };
     use super::*;
 
-    /// Render a wizard state into an in-memory `TestBackend` and flatten it to
-    /// text — the deterministic, CI-able answer to "does it draw right?".
     fn render(mode: &WizardMode) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -191,8 +168,6 @@ mod tests {
         format!("{}", term.backend())
     }
 
-    /// SECURITY: the PAT buffer must render masked — the secret must never reach
-    /// the screen (nor, therefore, a snapshot / tmux capture / screen-share).
     #[test]
     fn masked_pat_never_renders_the_secret() {
         let mode = WizardMode::PatInput(Wizard {

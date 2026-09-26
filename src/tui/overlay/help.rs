@@ -1,6 +1,4 @@
-//! The `[?]` help sheet and the informational block — read-only centered popups
-//! (see [`crate::tui::app::Overlay`]), dismissed by any key. Kept separate from
-//! the wizard: help/info carry no state and never write anything.
+//! The `[?]` help sheet and the info block: stateless popups dismissed by any key.
 
 use ratatui::Frame;
 use ratatui::style::{Color, Modifier, Style};
@@ -10,9 +8,6 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::tui::view::centered_rect;
 use crate::tui::viewmodel;
 
-/// The full keymap + action reference + how to run as root. Not per-context: a
-/// single sheet you can open anywhere to see everything the TUI does (the
-/// footer is the per-context quick-ref; this is the manual).
 pub(crate) fn draw_help(f: &mut Frame) {
     let mut lines = vec![
         section("Navigation"),
@@ -63,7 +58,7 @@ pub(crate) fn draw_help(f: &mut Frame) {
         blank(),
         section("Running as root"),
     ];
-    for l in crate::shared::privileged::root_guidance().lines() {
+    for l in root_guidance().lines() {
         lines.push(Line::from(format!("  {l}")).style(Style::new().fg(Color::Gray)));
     }
     lines.push(blank());
@@ -81,8 +76,6 @@ pub(crate) fn draw_help(f: &mut Frame) {
     );
 }
 
-/// A read-only info block (title + wrapped body). Used for the privilege
-/// guidance — informational, never an error.
 pub(crate) fn draw_info(f: &mut Frame, title: &str, body: &str) {
     let mut lines = vec![blank()];
     for l in body.lines() {
@@ -129,4 +122,19 @@ fn dismiss_hint() -> Line<'static> {
 
 fn blank() -> Line<'static> {
     Line::from("")
+}
+
+pub(crate) fn root_guidance() -> String {
+    format!(
+        "Installing runner hooks rewrites each runner's .env and writes shared \
+         scripts, so the whole process must run as root.\n\n\
+         Re-run the dashboard as root:\n\
+         \x20\x20sudo {exe}\n\n\
+         If `sudo ghr-stats` says \"command not found\", that is expected: sudo resets PATH to a \
+         secure default that excludes ~/.cargo/bin and ~/.local/bin, so a user-wide install is \
+         not on it. Use the absolute path above, or install system-wide with\n\
+         \x20\x20{exe} systemd install --system\n\
+         which copies the binary to /usr/local/bin (on sudo's path).",
+        exe = crate::shared::privileged::exe_path()
+    )
 }

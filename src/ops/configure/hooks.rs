@@ -1,15 +1,6 @@
-//! What ends up in the RUNNERS' OWN install dirs: job hooks, and the restarts
-//! that make them take effect.
-//!
-//! The only half of the wizard that writes outside the config file, which is why
-//! it is the only importer of `privileged`, `install` and `HookStatus` — it
-//! touches files this process does not own, on behalf of a service it does not
-//! run. It has also changed eleven times to the config half's four.
-//!
-//! Detect-first, and NEVER clobbering. An existing hook is chained rather than
-//! replaced, because the runner's hook path holds at most one script and someone
-//! else may already own it — overwriting would silently disable whatever was
-//! there. When chaining is not safe, the wizard instructs instead of acting.
+//! Runner-side half of the wizard: job hooks and the restarts that apply them.
+//! Never clobber: a runner's hook var holds one script, so an existing foreign
+//! hook is chained or the user is given a snippet instead.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -28,8 +19,6 @@ use crate::shared::privileged;
 
 use super::confirm;
 
-// ---- runner hooks: detect-first, choose chain-or-instruct, never clobber ----
-
 pub(super) fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     if discovered.is_empty() {
         return Ok(());
@@ -41,10 +30,7 @@ pub(super) fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Re
     apply_hooks(theme, discovered)
 }
 
-/// Discover runners under `roots` and run the hook install/repair flow. The
-/// entry point the TUI's `[h]` action uses (while suspended, on the real TTY),
-/// so the per-runner detect → install/chain/instruct decisions are the same
-/// ones the CLI wizard makes — one implementation, two front-ends.
+/// The TUI's `[h]` action, run while the TUI is suspended on the real TTY.
 pub(crate) fn install_hooks_for_tui(roots: &[PathBuf]) -> Result<()> {
     let theme = ColorfulTheme::default();
     let discovered = runners::discover(roots);
@@ -66,13 +52,8 @@ pub(crate) fn install_hooks_for_tui(roots: &[PathBuf]) -> Result<()> {
     apply_hooks(&theme, &discovered)
 }
 
-/// The shared hook install/repair core: gate on a root *process*, write our
-/// scripts, then per runner detect → install (unset) / chain-or-instruct
-/// (foreign) / no-op (ours). No initial confirm — the caller already consented
-/// (the CLI wizard's prompt or the TUI's confirm popup).
+/// No initial confirm: the caller has already consented.
 fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
-    // A root process: the scripts go in the system hooks dir every runner user
-    // reads, and each runner's `.env` belongs to another user.
     if let Err(hint) = privileged::require_root("config") {
         println!(
             "  runner hooks need root — the scripts go in the system hooks dir, and \
@@ -94,7 +75,7 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     println!("  hook scripts → {}", our_dir.display());
 
     for r in discovered {
-        match install::detect(&r.dir, &our_dir) {
+        match install::detect(&r.dir, std::slice::from_ref(&our_dir)) {
             HookStatus::Ours => repair_event_log(r),
             HookStatus::Unreadable => println!(
                 "  ? {} — .env not readable; re-run as the runner user or root",
@@ -133,8 +114,6 @@ fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
     Ok(())
 }
 
-/// Already wired to us: add the per-runner event-log path if an older install
-/// never set it.
 fn repair_event_log(r: &RunnerInfo) {
     let Some(env) = read_env(r) else { return };
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
@@ -144,7 +123,6 @@ fn repair_event_log(r: &RunnerInfo) {
     }
 }
 
-/// Clean install: point the runner's `.env` hook vars at our scripts.
 fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
     let Some(env) = read_env(r) else { return };
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
@@ -152,9 +130,7 @@ fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
     write_and_restart(r, &env, &new, "hooks installed");
 }
 
-/// Chain: a slot with a foreign original gets a wrapper that runs it then ours; an
-/// empty slot gets our plain script. Wrappers are written before `.env`, so a
-/// runner never points at a missing script.
+/// Wrappers are written before `.env`, so a runner never points at a missing script.
 fn chain_for(r: &RunnerInfo, our_dir: &Path, our_started: &Path, our_completed: &Path) {
     let Some(env) = read_env(r) else { return };
     let (orig_started, orig_completed) = install::current_hook_paths(&env.text);

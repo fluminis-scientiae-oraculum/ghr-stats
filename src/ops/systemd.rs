@@ -1,10 +1,5 @@
-//! `ghr-stats systemd install|uninstall` — manage the `serve` service.
-//!
-//! Install copies the running binary to a stable absolute path (so a root unit
-//! and a later `sudo ghr-stats` resolve the same file — the sudo-PATH gap),
-//! renders a unit that runs `<bin> serve`, and enables it. System scope needs
-//! root; user scope installs a `--user` service. Self-contained: the unit is
-//! rendered in-process, not read from a packaging file (works for any adopter).
+//! `ghr-stats systemd`. Install copies the binary to a stable path so the root unit
+//! and a later `sudo ghr-stats` (sudo's secure_path) resolve the same file.
 
 use std::path::Path;
 
@@ -23,8 +18,6 @@ pub fn run(action: SystemdAction, _cfg: &Config) -> Result<()> {
     }
 }
 
-/// Explicit `--system`/`--user` win; otherwise derive from the effective uid.
-/// Shared with `uninstall`, which resolves scope the same way.
 pub(crate) fn resolve_scope(system: bool, user: bool) -> Scope {
     match (system, user) {
         (true, _) => Scope::System,
@@ -34,11 +27,6 @@ pub(crate) fn resolve_scope(system: bool, user: bool) -> Scope {
 }
 
 fn install(scope: Scope) -> Result<()> {
-    // Same requirement as the hook installer: a system unit needs a root
-    // *process* (it writes /etc + /usr/local/bin), which per-op sudo cannot
-    // provide. `require_root` refuses a non-root process with a re-run hint.
-    // (Modelling the file/unit writes as a PrivilegedExecution too is future
-    // work — the precedent is in `privileged`.)
     if scope == Scope::System
         && let Err(hint) = crate::shared::privileged::require_root("systemd install --system")
     {
@@ -59,22 +47,17 @@ fn install(scope: Scope) -> Result<()> {
     println!("  config: {}", scope.config_file().display());
     println!("  data:   {}", scope.data_dir().display());
     println!("  socket: {}", scope.socket_path().display());
-    // The admin group only gates the root collector's /etc writes; a user-scope
-    // collector owns its config outright, so provision it for System only.
+    // The admin group only gates the root collector's /etc writes.
     if scope == Scope::System {
         provision_admin_group();
     }
     Ok(())
 }
 
-/// Idempotently create the `ghr-stats` admin group and add the invoking operator
-/// (`$SUDO_USER`) to it, so an authorized non-root TUI can edit the root-owned
-/// system config over the socket without per-edit sudo. Best-effort: a failure
-/// here does NOT fail the install (the service is already up) — it prints the
-/// manual command instead. Membership is resolved fresh by the collector on each
-/// request, so it takes effect immediately (no re-login).
+/// Best-effort: a failure prints the manual command and does not fail the install.
+/// The collector resolves membership per request, so no re-login is needed.
 fn provision_admin_group() {
-    // `groupadd -f`: succeeds whether or not the group already exists (idempotent).
+    // `-f`: exits 0 when the group already exists.
     if let Err(e) = run_tool("groupadd", &["-f", ADMIN_GROUP]) {
         println!("  note: could not create the `{ADMIN_GROUP}` group ({e}).");
         println!("        create it + add operators to allow non-root config edits:");
@@ -83,7 +66,6 @@ fn provision_admin_group() {
         );
         return;
     }
-    // Add the human who ran `sudo` (never root itself) to the group.
     match std::env::var("SUDO_USER") {
         Ok(user) if !user.is_empty() && user != "root" => {
             match run_tool("usermod", &["-aG", ADMIN_GROUP, &user]) {
@@ -97,7 +79,6 @@ fn provision_admin_group() {
                 }
             }
         }
-        // Installed directly as root (no SUDO_USER): nothing to add automatically.
         _ => println!(
             "  group:  `{ADMIN_GROUP}` ready — allow a non-root TUI to edit config with: \
              sudo usermod -aG {ADMIN_GROUP} <user>"
@@ -105,8 +86,6 @@ fn provision_admin_group() {
     }
 }
 
-/// Run a system administration tool, mapping a non-zero exit / missing binary to
-/// an `Err` the caller reports (never propagated — group setup is best-effort).
 fn run_tool(tool: &str, args: &[&str]) -> Result<()> {
     let status = std::process::Command::new(tool)
         .args(args)
@@ -118,20 +97,16 @@ fn run_tool(tool: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Disable + remove the service unit (best-effort), leaving data in place. Shared
-/// with the top-level `uninstall` orchestrator's `--service` domain.
 pub(crate) fn uninstall(scope: Scope) -> Result<()> {
     let unit_path = scope.systemd_unit_path();
-    // Best-effort: the unit may already be gone.
     let _ = systemctl(scope, &["disable", "--now", UNIT_NAME]);
     if unit_path.exists() {
         std::fs::remove_file(&unit_path)
             .with_context(|| format!("removing {}", unit_path.display()))?;
     }
     let _ = systemctl(scope, &["daemon-reload"]);
-    // The IPC socket lives under the unit's RuntimeDirectory=, which `disable
-    // --now` already tears down; remove it defensively for a foreground/dev
-    // collector or an already-stopped unit (tmpfs, so usually a no-op).
+    // `disable --now` already removed the RuntimeDirectory; this covers a dev
+    // collector or an already-stopped unit.
     let _ = std::fs::remove_file(scope.socket_path());
     let _ = std::fs::remove_dir(scope.runtime_dir());
     println!(
@@ -142,16 +117,13 @@ pub(crate) fn uninstall(scope: Scope) -> Result<()> {
     Ok(())
 }
 
-/// Render the systemd unit. Pure (no I/O) so it is unit-tested.
 fn render_unit(bin: &Path, scope: Scope) -> String {
     let wanted_by = match scope {
         Scope::System => "multi-user.target",
         Scope::User => "default.target",
     };
-    // RuntimeDirectory= makes systemd create + own /run/ghr-stats (and remove it
-    // on stop), so the IPC socket lives on tmpfs with no stale-file cleanup to do.
-    // Mode 0755 keeps the dir world-traversable so a non-root TUI can reach a
-    // root service's socket (the socket itself is widened to 0666 by the server).
+    // RuntimeDirectory= puts the socket on tmpfs, created and removed by systemd.
+    // 0755 lets a non-root TUI reach a root service's socket (the server makes it 0666).
     format!(
         "[Unit]\n\
          Description=ghr-stats collector — sample self-hosted runners, serve metrics + TUI IPC\n\
@@ -180,12 +152,8 @@ fn copy_bin(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Write to a sibling temp file, then atomically rename over `dst`. A plain
-    // copy overwrites `dst` IN PLACE and fails with ETXTBSY ("text file busy")
-    // when `dst` is the currently-running collector — i.e. every upgrade of a
-    // live service. rename swaps the inode instead: the running process keeps
-    // executing the old (now-unlinked) file, and new starts pick up the new one.
-    // Same directory ⇒ same filesystem ⇒ the rename is atomic.
+    // Temp file + rename: an in-place copy over the running collector fails with
+    // ETXTBSY. Same directory, so the rename is atomic.
     let tmp = dst.with_extension("new");
     std::fs::copy(src, &tmp)
         .with_context(|| format!("staging {} → {}", src.display(), tmp.display()))?;
@@ -200,9 +168,7 @@ fn copy_bin(src: &Path, dst: &Path) -> Result<()> {
 fn enable(scope: Scope) -> Result<()> {
     systemctl(scope, &["daemon-reload"])?;
     systemctl(scope, &["enable", UNIT_NAME])?;
-    // `restart` (not `start`/`--now`): on a fresh install it just starts, but on
-    // a re-install over an already-active service it swaps in the new binary +
-    // unit — `start` alone would no-op and leave the old process running.
+    // `restart`, not `start`: a re-install must replace an already-running process.
     systemctl(scope, &["restart", UNIT_NAME])?;
     Ok(())
 }
@@ -238,7 +204,6 @@ mod tests {
         assert!(u.contains("ExecStart=/usr/local/bin/ghr-stats serve"));
         assert!(u.contains("WantedBy=multi-user.target"));
         assert!(u.contains("Type=simple"));
-        // The IPC socket lives under the systemd-managed RuntimeDirectory.
         assert!(u.contains("RuntimeDirectory=ghr-stats"));
         assert!(u.contains("RuntimeDirectoryMode=0755"));
     }
@@ -262,14 +227,11 @@ mod tests {
 
         copy_bin(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"v1");
-        // Executable bit survives the copy.
         assert_ne!(
             std::fs::metadata(&dst).unwrap().permissions().mode() & 0o111,
             0
         );
 
-        // Re-install (the upgrade case ETXTBSY breaks with a plain in-place copy):
-        // a second call replaces the target via rename and leaves no stray `.new`.
         std::fs::write(&src, b"v2-longer").unwrap();
         copy_bin(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"v2-longer");

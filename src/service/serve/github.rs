@@ -1,22 +1,6 @@
-//! The reconcile thread: what GitHub says, and how well we could ask.
-//!
-//! Runs on `api_secs`, the slow cadence, in its own thread precisely because it
-//! is network-bound. Orgs come from the explicit `config.orgs` list when set, else
-//! from a fresh scan of the runners' `.runner` files each cycle — so it shares no
-//! mutable state with the local sampler.
-//!
-//! Degradation is per-ORG, never per-cycle: [`gather_api`] returns one
-//! [`ApiOrgOutcome`] per org rather than a flat row list, because "GitHub says
-//! this runner is offline", "we could not ask GitHub" and "no PAT is configured"
-//! are three different facts. A flat `Vec<ApiRunnerRow>` collapsed them into one —
-//! the failing org simply had no rows, so its series VANISHED instead of reporting
-//! a value, which is how a four-hour outage looked like a healthy fleet.
-//!
-//! The same cycle opportunistically backfills finished jobs' pass/fail
-//! `conclusion`, which the hook cannot know: the hook records TIMING and exits
-//! while the job is still being graded. It is opportunistic because it needs the
-//! token to also carry "Actions: read" — a runners-only token gets 403, which is
-//! logged and skipped so the job simply keeps its neutral "done" state.
+//! GitHub reconcile thread. Also backfills finished jobs' `conclusion`, which the hook
+//! exits too early to see; that needs "Actions: read", so a runners-only token's 403 is
+//! skipped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,15 +17,9 @@ use crate::shared::util::now_epoch;
 
 use super::{Sample, sleep_until};
 
-/// Cap on how many pending job conclusions one reconcile cycle resolves — drains
-/// a large backlog a batch at a time instead of a burst of API calls.
+/// Per cycle, so a large backlog drains in batches rather than an API burst.
 const JOB_RECONCILE_LIMIT: usize = 200;
 
-/// Producer: reconcile GitHub's view on `api_secs`. Uses the explicit
-/// `config.orgs` list when set, else discovers orgs from the runners' `.runner`
-/// files each cycle — so it shares no mutable state with the local sampler. Each
-/// cycle also resolves finished jobs' pass/fail `conclusion` from the Actions API
-/// (opportunistic — see [`reconcile_job_conclusions`]), using its own reader.
 pub(super) fn api_loop(
     cfg: &SharedConfig,
     term: &AtomicBool,
@@ -52,8 +30,7 @@ pub(super) fn api_loop(
 
     while !term.load(Ordering::SeqCst) {
         if Instant::now() >= next {
-            // Snapshot per cycle: a PAT added via the TUI (AddOrgToken) is picked
-            // up here on the next reconcile — no restart.
+            // Per cycle, so a PAT added over IPC applies without a restart.
             let c = cfg.snapshot();
             let orgs: BTreeSet<String> = if c.orgs.is_empty() {
                 collectors::runners::discover(&c.runner_roots)
@@ -65,18 +42,14 @@ pub(super) fn api_loop(
             };
             let now = now_epoch();
             let outcomes = gather_api(&c, &orgs, term);
-            // Send whenever an org was attempted, even if every one failed.
-            // Gating on "produced rows" (the old behaviour) meant a total
-            // reconcile failure left NO trace at all: no health row, no audit
-            // row, and the previous tick's values kept being served as current.
-            // A fleet-wide outage is exactly when the record matters most.
+            // Send even if every org failed, so a total outage still records health rows.
             if !outcomes.is_empty() && tx.send(Sample::Api { ts: now, outcomes }).is_err() {
-                break; // writer gone
+                break;
             }
             if let Some(conn) = reader.as_ref() {
                 let updates = reconcile_job_conclusions(&c, conn, term);
                 if !updates.is_empty() && tx.send(Sample::JobConclusions { updates }).is_err() {
-                    break; // writer gone
+                    break;
                 }
             }
             next = Instant::now() + Duration::from_secs(c.intervals.api_secs.max(10));
@@ -85,15 +58,6 @@ pub(super) fn api_loop(
     }
 }
 
-/// Query each org's runners (best-effort, per-org). A missing token, permission
-/// error, or network failure degrades that org, never the cycle. Bails between
-/// orgs if shutdown was signalled, so a SIGTERM mid-cycle exits promptly.
-///
-/// Returns one [`ApiOrgOutcome`] per org rather than a flat row list. The
-/// distinction is load-bearing downstream: "GitHub says this runner is offline",
-/// "we could not ask GitHub", and "no PAT is configured for this org" are three
-/// different facts that a flat `Vec<ApiRunnerRow>` collapsed into one — the org
-/// simply had no rows, so its series vanished instead of reporting a value.
 fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<ApiOrgOutcome> {
     let mut out = Vec::new();
     for org in orgs {
@@ -130,11 +94,6 @@ fn gather_api(cfg: &Config, orgs: &BTreeSet<String>, term: &AtomicBool) -> Vec<A
     out
 }
 
-/// Resolve finished jobs' pass/fail `conclusion` from the Actions API. The hook
-/// records job *timing*; this fills the conclusion. Opportunistic: it needs the
-/// token to also carry "Actions: read" — a runners-only token gets 403, which we
-/// log and skip so the job just keeps its neutral "done" state (no regression).
-/// One `list_run_jobs` call per (repo, run) with pending rows; bails on shutdown.
 fn reconcile_job_conclusions(
     cfg: &Config,
     conn: &Connection,
@@ -144,7 +103,6 @@ fn reconcile_job_conclusions(
     if pending.is_empty() {
         return Vec::new();
     }
-    // One API call per run: group the pending rows by (org, repo, run_id).
     let mut by_run: BTreeMap<(String, String, i64), Vec<PendingConclusion>> = BTreeMap::new();
     for p in pending {
         by_run
@@ -170,10 +128,8 @@ fn reconcile_job_conclusions(
     updates
 }
 
-/// Match each pending job to its API job and collect the resolved conclusions.
-/// A run with a single job maps regardless of name (covers a workflow `name:`
-/// that differs from the job id the hook recorded); otherwise match by name. A
-/// still-running job (conclusion `null`) is left for a later cycle. Pure.
+/// A single-job run maps regardless of name: its workflow `name:` may differ from the job
+/// id the hook recorded.
 fn match_conclusions(
     pending: &[PendingConclusion],
     api_jobs: &[crate::shared::github::RunJob],
@@ -224,7 +180,6 @@ mod tests {
 
     #[test]
     fn match_conclusions_by_name_single_job_and_skips_running() {
-        // Multi-job run: match by name; the still-running one (null) is skipped.
         let pend = [pending("build"), pending("test")];
         let jobs = [api("build", Some("success")), api("test", None)];
         let got = match_conclusions(&pend, &jobs);
@@ -234,7 +189,6 @@ mod tests {
             ("build", "success")
         );
 
-        // Single-job run: mapped regardless of name (a custom workflow `name:`).
         let got = match_conclusions(
             &[pending("deploy")],
             &[api("Deploy to prod", Some("failure"))],
@@ -242,7 +196,6 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].conclusion, "failure");
 
-        // No matching API job in a multi-job run → nothing resolved.
         assert!(
             match_conclusions(
                 &[pending("nope")],
