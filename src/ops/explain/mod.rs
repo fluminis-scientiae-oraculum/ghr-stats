@@ -1,29 +1,6 @@
-//! `ghr-stats explain` — findings, not gauges.
-//!
-//! `status` answers *is the fleet healthy*. This answers *why isn't it*, in the
-//! form the incident that motivated this work actually needed: a claim, and the
-//! **boundary** to investigate. Establishing which side of the fence a fault sits
-//! on was the single most expensive part of that investigation, and a fleet
-//! monitor is uniquely placed to shortcut it, because it is the one process
-//! holding both the local process truth and GitHub's opinion at the same instant.
-//!
-//! It is a pure derivation over the same
-//! [`FleetStatus`](crate::shared::models::FleetStatus) snapshot `status`
-//! reasons over — deliberately no new IPC query. A second query would be a second
-//! chance for the two verbs to disagree, and "healthy" from one while the other
-//! lists findings is a worse failure than either being wrong alone.
-//!
-//! # Layout
-//!
-//! The findings divide on what the claim RESTS ON: [`faults`] reads runner rows
-//! the snapshot carries and asserts something is wrong with them; [`gaps`] asserts
-//! things about rows and readings that are missing. That is the line that decides
-//! how a claim can be worded and what evidence can back it, so it is the line the
-//! files follow. Severity is orthogonal and would have been the wrong cut —
-//! [`gaps`] holds a `Medium` finding alongside two `Info` ones.
-//!
-//! What stays here is the vocabulary every finding is written in, the ordering
-//! that puts the worst first, and the plain-text rendering.
+//! `ghr-stats explain`: derived from the same snapshot `status` reasons over, with
+//! no IPC query of its own, so the two verbs cannot disagree. [`faults`] makes
+//! claims about runner rows present; [`gaps`] about rows and readings missing.
 
 mod faults;
 mod gaps;
@@ -37,12 +14,7 @@ use crate::shared::config::Config;
 use crate::shared::models::{Mode, Verdict};
 use crate::shared::util::BUILD_VERSION;
 
-/// Which side of the fence to investigate — the load-bearing field of a finding.
-///
-/// An agent that knows *something is wrong* still has to guess where to look;
-/// this is the guess the tool can make better than the caller. It is also the
-/// shared vocabulary the other machine-facing verbs speak, so it is deliberately
-/// small and closed.
+/// Which side of the fence to investigate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Boundary {
@@ -56,10 +28,8 @@ pub(crate) enum Boundary {
     Config,
 }
 
-/// How much a finding should move the reader. Ranked by how *invisible* the
-/// problem is elsewhere, not by how loud it sounds: divergence outranks a plainly
-/// offline runner because every other surface already shows the offline one in
-/// red, while divergence is precisely the failure that reads as green everywhere.
+/// Ranked by how invisible the problem is elsewhere: divergence outranks offline
+/// because every other surface already shows an offline runner in red.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Severity {
@@ -90,36 +60,21 @@ impl Boundary {
     }
 }
 
-/// One thing worth telling the caller.
-///
-/// `id` is `&'static str` rather than `String` because the set of findings is
-/// closed at compile time: an id is a name in this verb's vocabulary, not data
-/// read from anywhere, so it cannot be typo'd into existence at runtime.
-///
-/// `claim` is the assertion, `evidence` is what it rests on, and
-/// `suggested_checks` is what to do about it. Keeping them separate is the point:
-/// an agent can act on the claim, a human can audit the evidence, and neither has
-/// to parse a paragraph to find the other.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Finding {
     pub id: &'static str,
     pub severity: Severity,
     pub boundary: Boundary,
     pub claim: String,
-    /// The observations the claim rests on — always concrete counts, names or
-    /// timestamps, never a restatement of the claim.
+    /// Concrete counts, names or timestamps; never a restatement of the claim.
     pub evidence: Vec<String>,
-    /// When the condition began, ISO-8601 UTC. `None` when the snapshot carries
-    /// no duration to work back from; never guessed.
+    /// ISO-8601 UTC. `None` when the snapshot has no duration to work back from.
     pub first_seen: Option<String>,
-    /// What to look at, in the order worth looking. Ordered by the `boundary`,
-    /// since that is the whole reason the field exists.
     pub suggested_checks: Vec<String>,
 }
 
-/// The `explain` payload. Carries `mode` and `verdict` from the snapshot it was
-/// derived from, so an empty `findings` array is never ambiguous: the reader can
-/// see whether we had nothing to report or nothing to report *with*.
+/// Carries `mode` so an empty `findings` distinguishes "nothing to report" from
+/// "nothing to report with".
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Explanation {
     pub schema_version: u32,
@@ -130,8 +85,7 @@ pub(crate) struct Explanation {
     pub findings: Vec<Finding>,
 }
 
-/// Run the verb. Returns the snapshot's verdict, so `explain` and `status` exit
-/// with the same code for the same fleet.
+/// Returns the snapshot's verdict, so `explain` exits like `status`.
 pub fn run(args: &ExplainArgs, cfg: &Config) -> Result<Verdict> {
     let explanation = explain(&crate::ops::status::snapshot(cfg));
 
@@ -143,8 +97,6 @@ pub fn run(args: &ExplainArgs, cfg: &Config) -> Result<Verdict> {
     Ok(explanation.verdict)
 }
 
-/// Derive the explanation from a snapshot. Pure — the whole verb is testable
-/// without a socket, a database, or a fleet.
 fn explain(snap: &Snapshot) -> Explanation {
     let s = &snap.status;
     Explanation {
@@ -157,12 +109,8 @@ fn explain(snap: &Snapshot) -> Explanation {
     }
 }
 
-/// Every finding this build can make, worst first — so a caller that reads only
-/// the head of the list still reads the thing that matters most. Pure.
-///
-/// The order is written out here rather than derived from [`Severity`], because
-/// it is a claim about which finding is most worth reading FIRST, not a sort key:
-/// two findings can share a severity and still have a right order between them.
+/// Worst first. Hand-ordered rather than sorted by [`Severity`]: findings of
+/// equal severity still have a right order.
 fn findings(snap: &Snapshot) -> Vec<Finding> {
     [
         faults::divergence(&snap.status),
@@ -176,8 +124,6 @@ fn findings(snap: &Snapshot) -> Vec<Finding> {
     .collect()
 }
 
-/// Plain-text rendering. No colour and no box drawing, for the same reason
-/// `status` has none: the only difference from `--json` should be the shape.
 fn human(e: &Explanation) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -216,12 +162,7 @@ fn human(e: &Explanation) -> String {
     out
 }
 
-/// Snapshot builders shared by all three test modules.
-///
-/// They live here rather than in either child because a fixture duplicated per
-/// file is a fixture that drifts per file, and these encode the shape the
-/// findings are written against — `github_offline_seconds: Some(600)` against a
-/// `generated_at_epoch` of 0 is what makes the `first_seen` assertions readable.
+/// Snapshot builders shared by the explain test modules.
 #[cfg(test)]
 mod fixtures {
     use crate::ops::status::{Snapshot, Source};
@@ -250,12 +191,10 @@ mod fixtures {
         }
     }
 
-    /// A persistent snapshot — the collector answered.
     pub(super) fn status(mode: Mode, runners: Vec<RunnerStatus>) -> Snapshot {
         with_source(mode, runners, Source::Collector)
     }
 
-    /// A fallback snapshot, with the reason we fell back.
     pub(super) fn fell_back(reason: EphemeralReason, runners: Vec<RunnerStatus>) -> Snapshot {
         with_source(Mode::Ephemeral, runners, Source::LocalScan(reason))
     }
@@ -294,8 +233,6 @@ mod tests {
     use crate::shared::ipc::client::EphemeralReason;
     use crate::shared::models::Liveness;
 
-    /// Findings are emitted worst-first, so a caller that reads only the head of
-    /// the list still reads the thing that matters most.
     #[test]
     fn findings_are_ordered_worst_first() {
         let s = fell_back(

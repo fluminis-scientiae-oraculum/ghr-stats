@@ -1,16 +1,5 @@
-//! What GitHub said — the reconcile thread's rows.
-//!
-//! Three tables, one writer: `api_runner_sample` (the per-tick audit trail),
-//! `api_runner_state` (the liveness edge an alert debounces on) and
-//! `api_reconcile_state` (per-org fetch health). Reading them is a separate job
-//! from reading the local sampler's tables, and the 2026-07-25 outage is why:
-//! the fleet looked healthy for four hours because the local view was the only
-//! one anything consumed, and a GitHub reading that has gone quiet must be
-//! visibly aged rather than silently served as current.
-//!
-//! That adjudication happens HERE, once, in [`latest_api_runners`] — the reader
-//! hands out a [`GhView`] that has already decided fresh-vs-stale, so no
-//! downstream consumer can forget to check an age.
+//! GitHub reconcile reads. Freshness is adjudicated here once, so consumers get a
+//! [`GhView`] and never check an age.
 
 use std::collections::HashMap;
 
@@ -19,20 +8,8 @@ use rusqlite::Connection;
 use crate::shared::error::Result;
 use crate::shared::models::{ApiReconcileState, ApiRunnerState, ApiState, GhView};
 
-/// GitHub's latest view of every runner, keyed by `(org, agent_id)`. GitHub's
-/// `agent_id` is unique only within an org, so the org must be part of the key —
-/// two runners in different orgs can share an id.
-///
-/// Latest **per runner**, not per global tick. The old query took `max(ts)` over
-/// the whole table and returned only rows at that instant, which had two bad
-/// consequences: an org that failed a single reconcile had no row at the newest
-/// ts, so its runners' GitHub series *vanished* from the export rather than
-/// reporting a value; and there was no age bound at all, so if the reconcile
-/// thread died the last successful tick was served as current forever.
-///
-/// `max_age` closes both. Each runner keeps its own most recent reading, and
-/// anything older than the window is returned as [`GhView::Stale`] — visibly
-/// aged, never silently presented as live.
+/// Newest reading per runner, not per global tick, keyed `(org, agent_id)` since agentId is unique
+/// only within an org. Readings older than `max_age` are [`GhView::Stale`].
 pub fn latest_api_runners(
     conn: &Connection,
     now: i64,
@@ -57,8 +34,6 @@ pub fn latest_api_runners(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// The persisted GitHub-side liveness edges, keyed by `(org, agent_id)`. Feeds
-/// `ghr_runner_github_offline_seconds` — the duration an alert debounces on.
 pub fn api_runner_states(conn: &Connection) -> Result<HashMap<(String, i64), ApiRunnerState>> {
     let mut stmt = conn.prepare_cached(
         "SELECT org, agent_id, online, since_ts, last_seen_ts FROM api_runner_state",
@@ -80,8 +55,6 @@ pub fn api_runner_states(conn: &Connection) -> Result<HashMap<(String, i64), Api
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Per-org reconcile health, newest state per org. Empty before the first
-/// reconcile tick.
 pub fn api_reconcile_states(conn: &Connection) -> Result<Vec<ApiReconcileState>> {
     let mut stmt = conn.prepare_cached(
         "SELECT org, last_ok_ts, last_try_ts, ok, http_status, error_kind, configured \
@@ -121,46 +94,32 @@ mod tests {
         assert!(latest_api_runners(&mem_db(), 200, 180).unwrap().is_empty());
     }
 
-    /// The regression that made the 2026-07-25 outage undiagnosable: with a
-    /// global `max(ts)`, an org absent from the newest tick had no row at that
-    /// instant, so its runners' GitHub series VANISHED from the export rather
-    /// than reporting a value. A missing series and a zero are indistinguishable
-    /// to a scrape, which is exactly the wrong answer at 2am.
     #[test]
     fn an_org_missing_from_the_newest_tick_keeps_its_last_reading() {
         let conn = mem_db();
-        // Tick 100: both orgs answered.
         api_sample(&conn, 100, "org-a", 1, 1, 0);
         api_sample(&conn, 100, "org-b", 1, 1, 0);
-        // Tick 200: only org-a answered (org-b's token broke).
+        // Tick 200: only org-a answered.
         api_sample(&conn, 200, "org-a", 1, 1, 0);
 
         let m = latest_api_runners(&conn, 200, 180).unwrap();
-        // org-b is still PRESENT, carrying its older reading and an honest age.
         let b = m[&("org-b".to_string(), 1)];
         assert_eq!(b.online(), Some(true));
         assert!(matches!(b, GhView::Fresh { age_s: 100, .. }));
-        // org-a is current.
         assert!(matches!(
             m[&("org-a".to_string(), 1)],
             GhView::Fresh { age_s: 0, .. }
         ));
     }
 
-    /// Past the window a reading is reported as stale, never served as current.
-    /// Without this a dead reconcile thread kept exporting confident values
-    /// forever.
     #[test]
     fn a_reading_older_than_max_age_is_stale_not_live() {
         let conn = mem_db();
         api_sample(&conn, 100, "o", 1, 1, 0);
 
-        // 60s later, inside a 180s window: still trustworthy.
         let fresh = latest_api_runners(&conn, 160, 180).unwrap();
         assert!(matches!(fresh[&("o".to_string(), 1)], GhView::Fresh { .. }));
 
-        // 6 hours later: we still have the row, but it is not evidence of
-        // anything current — online() must go unknown rather than stay `true`.
         let old = latest_api_runners(&conn, 100 + 21_600, 180).unwrap();
         let v = old[&("o".to_string(), 1)];
         assert!(matches!(v, GhView::Stale { .. }));

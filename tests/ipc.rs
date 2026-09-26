@@ -1,22 +1,7 @@
-//! Integration tests: a real collector, a private socket, and the wire spoken
-//! from the outside.
-//!
-//! **Isolation is the first requirement, not a detail.** This suite runs on
-//! machines that also run a production collector, and `Client::connect_any`
-//! probes the SYSTEM socket (`/run/ghr-stats/serve.sock`) before the user one.
-//! A test that used the client could therefore drive the real fleet's collector
-//! — and issue mutations against the real `/etc` config. So these tests never
-//! call the client: each spawns its own collector under a private
-//! `XDG_RUNTIME_DIR` with its own `--config` and database, and connects to that
-//! explicit path.
-//!
-//! **The frames are built by hand, deliberately.** The binary has no library
-//! target, so the crate's own types are unreachable here — but that constraint
-//! is worth having. Encoding the length prefix and the JSON shapes
-//! independently means a bug shared by `write_frame` and `read_frame`, or a
-//! serde attribute that changes the wire without changing the Rust types, still
-//! fails this file. A test that reuses the implementation it is testing cannot
-//! catch that class at all.
+//! IPC integration tests against a private collector. Never use `Client::connect_any`: it
+//! probes the system socket first, so a test could drive a production collector and mutate
+//! its `/etc` config. Frames are hand-encoded so a bug shared by
+//! `write_frame`/`read_frame`, or a serde wire change, still fails here.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -27,14 +12,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The wire version this suite speaks.
-///
-/// Hard-coded rather than imported — it IS the external contract, and a bump
-/// should break this file loudly enough that someone confirms the change was
-/// intended rather than incidental.
+/// Hard-coded, not imported: a wire bump must break this file loudly.
 const WIRE: u16 = 10;
 
-/// A collector running on its own socket, with its own config and database.
 struct Collector {
     child: Child,
     dir: PathBuf,
@@ -78,10 +58,9 @@ impl Collector {
             .arg("--config")
             .arg(&config)
             .arg("serve")
-            // A private runtime dir is what keeps this off the system socket.
+            // Keeps this off the system socket.
             .env("XDG_RUNTIME_DIR", &dir)
-            // `serve` refuses to run attached to a terminal; under `cargo test`
-            // from an interactive shell the child would inherit one.
+            // `serve` refuses a terminal stdin.
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -99,8 +78,6 @@ impl Collector {
         me
     }
 
-    /// Wait for the collector to bind. Polls rather than sleeping a fixed span:
-    /// a fixed sleep is either flaky on a loaded machine or wasted everywhere.
     fn await_socket(&self) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -118,7 +95,6 @@ impl Collector {
         s
     }
 
-    /// Connect and complete the handshake — the state every real client is in.
     fn session(&self) -> UnixStream {
         let mut s = self.connect();
         let hello = round_trip(&mut s, &json!({"Hello": {"client": WIRE}}));
@@ -155,8 +131,7 @@ fn round_trip(s: &mut UnixStream, msg: &Value) -> Value {
     read_frame(s)
 }
 
-/// Whether this (non-root) process passes the collector's mutation gate: a
-/// member of the `ghr-stats` group. CI, with no such group, exercises refusal.
+/// Member of the `ghr-stats` group. CI, without the group, exercises refusal.
 fn privileged() -> bool {
     Command::new("id")
         .arg("-nG")
@@ -173,14 +148,10 @@ fn the_handshake_reports_both_the_wire_and_the_build_version() {
     let reply = round_trip(&mut s, &json!({"Hello": {"client": WIRE}}));
 
     assert_eq!(reply["Hello"]["server"], WIRE);
-    // The build version is what makes "you upgraded the binary but did not
-    // restart the service" visible; an empty string would hide it.
     let version = reply["Hello"]["version"].as_str().unwrap_or_default();
     assert!(!version.is_empty(), "no collector build version: {reply}");
 }
 
-/// The handshake reports the collector's version to any client; judging a
-/// mismatch is the client's job.
 #[test]
 fn the_handshake_reports_the_servers_version_rather_than_negotiating() {
     let c = Collector::start("mismatch");
@@ -189,9 +160,6 @@ fn the_handshake_reports_the_servers_version_rather_than_negotiating() {
     assert_eq!(reply["Hello"]["server"], WIRE, "{reply}");
 }
 
-/// Reads are unauthenticated BY CONSTRUCTION — `Query` is a separate arm of
-/// `Request` that never reaches the authz gate. This pins the behaviour from
-/// outside the type system that guarantees it.
 #[test]
 fn queries_are_answered_without_authorization() {
     let c = Collector::start("query");
@@ -216,13 +184,6 @@ fn queries_are_answered_without_authorization() {
     );
 }
 
-/// `Retention` over the real wire, on a collector whose database is brand new.
-///
-/// The empty case is the one worth pinning end to end: a fresh store must answer
-/// `null` rather than `0`, because `doctor` renders this straight to an operator
-/// and a 1970 timestamp would read as a real retention window rather than as
-/// "nothing sampled yet". It also proves the variant is serialized as a struct
-/// with a named field, which a unit test on the reader alone cannot show.
 #[test]
 fn retention_reports_an_empty_record_as_null_rather_than_epoch_zero() {
     let c = Collector::start("retention");
@@ -239,10 +200,6 @@ fn retention_reports_an_empty_record_as_null_rather_than_epoch_zero() {
     );
 }
 
-/// The mutation gate, and — when this caller passes it — that a persisted
-/// mutation actually reaches the config file. The reload is the whole point of
-/// routing config edits through the collector rather than writing `/etc`
-/// directly.
 #[test]
 fn the_mutation_gate_matches_the_callers_privilege() {
     let c = Collector::start("mutate");
@@ -274,14 +231,10 @@ fn the_mutation_gate_matches_the_callers_privilege() {
     }
 }
 
-/// A token crosses the wire INBOUND and must never come back out. The org list
-/// is presence-only by design, so a non-root TUI can see which orgs have a PAT
-/// without ever seeing one.
 #[test]
 fn a_token_written_over_the_wire_is_never_returned() {
     if !privileged() {
-        // Without the gate we cannot plant a token to look for. The refusal
-        // path is covered by the test above.
+        // Cannot plant a token without the gate; refusal is covered above.
         return;
     }
     let c = Collector::start("token");
@@ -308,20 +261,12 @@ fn a_token_written_over_the_wire_is_never_returned() {
     );
 }
 
-/// The regression for the total IPC lockout fixed in `4b3b490`.
-///
-/// Asserts PROMPTNESS, not eventual success — that distinction is the test.
-/// Before the fix the accept loop ran `serve_conn` inline, and `serve_conn`
-/// loops until its client hangs up or its read times out (`CONN_TIMEOUT`, 5 s).
-/// So a client that merely HELD a connection open — exactly what the dashboard
-/// does between refreshes — starved every other caller. A test that waited for
-/// eventual success would have passed against the broken design: the second
-/// client does get served, five seconds later. Only a deadline catches it.
+/// Asserts promptness: a client served only after `CONN_TIMEOUT` would pass an
+/// eventual-success check.
 #[test]
 fn an_idle_connection_does_not_starve_another_client() {
     let c = Collector::start("fairness");
 
-    // A client that handshakes and then sits there, sending nothing further.
     let _idle = c.session();
 
     let started = Instant::now();
@@ -333,9 +278,7 @@ fn an_idle_connection_does_not_starve_another_client() {
         reply["ConfiguredTokenOrgs"].is_array(),
         "second client was not served: {reply}"
     );
-    // Comfortably under CONN_TIMEOUT (5 s) so the assertion means "was not
-    // waiting on the idle connection", and comfortably over any plausible
-    // scheduling delay so it is not flaky.
+    // Well under CONN_TIMEOUT (5 s), well over scheduling jitter.
     assert!(
         elapsed < Duration::from_secs(2),
         "second client waited {elapsed:?} behind an idle connection — the accept \
@@ -343,8 +286,6 @@ fn an_idle_connection_does_not_starve_another_client() {
     );
 }
 
-/// Several held-open connections must not wedge the collector either — the
-/// dashboard, a `tail`, and a `status` can legitimately overlap.
 #[test]
 fn concurrent_clients_are_all_served() {
     let c = Collector::start("concurrent");

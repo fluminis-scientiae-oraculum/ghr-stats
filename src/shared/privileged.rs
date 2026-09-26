@@ -1,13 +1,5 @@
-//! Privileged host operations, in two tiers:
-//!
-//! 1. **Per-command escalation**: [`run`] executes a [`PrivilegedCall`] directly
-//!    when root, else via `sudo`. `sudo` prompts on `/dev/tty`, so the TUI calls
-//!    it only while suspended.
-//! 2. **A root process**: [`require_root`] for flows that write across scopes
-//!    (`/etc`, `/usr/local/bin`, runner `.env` files) over several steps.
-//!
-//! [`PrivilegedCall`] is the closed registry of everything this binary runs
-//! elevated; `docs/privileged.md` is its operator-facing summary.
+//! Elevated commands: [`run`] executes a [`PrivilegedCall`] as root or via `sudo` (which prompts on
+//! `/dev/tty`, so the TUI calls it only while suspended). Registry summary: `docs/privileged.md`.
 
 use std::fmt;
 use std::os::unix::process::CommandExt;
@@ -17,15 +9,14 @@ use std::process::Command;
 use crate::shared::collectors::runners::RunnerUnit;
 use crate::shared::runner_files::Ownership;
 
-/// The account a command drops to: a runner's own files are removed as that
-/// runner, so a planted symlink can only reach what the runner could delete anyway.
+/// Runner-owned files are removed as the runner, so a planted symlink reaches only what it
+/// could delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunAs {
     pub uid: u32,
     pub gid: u32,
 }
 
-/// `systemctl` verbs this tool may invoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnitVerb {
     Start,
@@ -43,19 +34,21 @@ impl UnitVerb {
     }
 }
 
-/// Every command ghr-stats can run with elevated privilege, and the only thing
-/// [`run`] accepts. [`fmt::Display`] renders the exact argv, so a confirm prompt
-/// and the command that runs are the same value.
+/// Closed registry of elevated commands; `Display` renders the exact argv shown in confirm prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrivilegedCall {
-    /// `systemctl <verb> <unit>`.
-    Systemctl { verb: UnitVerb, unit: RunnerUnit },
-    /// `rm -rf -- <dir>`, as the runner.
-    PurgeDir { dir: PathBuf, owner: RunAs },
-    /// `find <dir> -type f -delete`, as the runner: empties a dir, keeps the dir.
-    TrimFilesIn { dir: PathBuf, owner: RunAs },
-    /// `install -o <uid> -g <gid> -m <mode> <src> <dst>`: replace a runner's
-    /// `.env`, keeping the ownership and mode it had.
+    Systemctl {
+        verb: UnitVerb,
+        unit: RunnerUnit,
+    },
+    PurgeDir {
+        dir: PathBuf,
+        owner: RunAs,
+    },
+    TrimFilesIn {
+        dir: PathBuf,
+        owner: RunAs,
+    },
     InstallEnvFile {
         src: PathBuf,
         dst: PathBuf,
@@ -64,8 +57,7 @@ pub(crate) enum PrivilegedCall {
 }
 
 impl PrivilegedCall {
-    /// The exact `(program, args)` this call executes, passed to `execve` as a
-    /// vector, never through a shell.
+    /// Passed to `execve` as a vector, never through a shell.
     fn argv(&self) -> (&'static str, Vec<String>) {
         let path = |p: &PathBuf| p.to_string_lossy().into_owned();
         match self {
@@ -129,15 +121,9 @@ impl fmt::Display for PrivilegedCall {
     }
 }
 
-/// The result of a privileged shell-out.
 pub(crate) enum Outcome {
     Ok,
-    /// The command ran but failed (exit code + first stderr line).
-    Failed {
-        code: Option<i32>,
-        stderr: String,
-    },
-    /// The command could not be spawned at all (e.g. `sudo` not installed).
+    Failed { code: Option<i32>, stderr: String },
     Spawn(String),
 }
 
@@ -146,7 +132,6 @@ impl Outcome {
         matches!(self, Outcome::Ok)
     }
 
-    /// A short, actionable line describing the result of `what`.
     pub(crate) fn describe(&self, what: &str) -> String {
         match self {
             Outcome::Ok => format!("{what}: done"),
@@ -164,9 +149,7 @@ impl Outcome {
     }
 }
 
-/// Require a root *process*, or the absolute-path re-run hint for `resume`. For
-/// the flows that gate once then do privileged work across several steps (the
-/// hook wizard, `systemd install --system`, system-scope `uninstall`).
+/// Root process, or the absolute-path `sudo` re-run hint for `resume`.
 pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
     if is_root() {
         Ok(())
@@ -175,7 +158,6 @@ pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
     }
 }
 
-/// Run a registered privileged command: directly if root, else via `sudo`.
 pub(crate) fn run(call: &PrivilegedCall) -> Outcome {
     let (program, args) = call.argv();
     let mut cmd = match (is_root(), call.runs_as()) {
@@ -204,14 +186,11 @@ pub(crate) fn run(call: &PrivilegedCall) -> Outcome {
     }
 }
 
-/// Whether we are already running as root.
 pub(crate) fn is_root() -> bool {
     uzers::get_effective_uid() == 0
 }
 
-/// This binary's ABSOLUTE path — the basis for every "re-run as root" hint, so
-/// they work even when ghr-stats was `cargo install`ed to `~/.cargo/bin` (which
-/// is NOT on sudo's `secure_path`). Falls back to the bare name if unknown.
+/// Absolute, because `~/.cargo/bin` is not on sudo's `secure_path`.
 pub(crate) fn exe_path() -> String {
     std::env::current_exe()
         .ok()
@@ -219,14 +198,12 @@ pub(crate) fn exe_path() -> String {
         .unwrap_or_else(|| "ghr-stats".to_string())
 }
 
-/// A "re-run me as root" hint carrying the binary's absolute path.
 pub(crate) fn sudo_hint(subcommand: &str) -> String {
     format!("sudo {} {subcommand}", exe_path())
         .trim_end()
         .to_string()
 }
 
-/// The first non-empty line of captured stderr, trimmed.
 fn first_line(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -312,9 +289,6 @@ mod tests {
 
     #[test]
     fn sudo_hint_carries_an_absolute_path() {
-        // The whole point of the hint: `sudo ghr-stats …` fails on a user-wide
-        // install because sudo's secure_path excludes ~/.cargo/bin, so the hint
-        // must name the binary by absolute path.
         let hint = sudo_hint("uninstall");
         assert!(hint.starts_with("sudo /"), "not absolute: {hint}");
         assert!(hint.ends_with(" uninstall"));

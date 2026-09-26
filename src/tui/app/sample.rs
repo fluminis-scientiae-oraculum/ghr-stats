@@ -1,14 +1,6 @@
-//! Filling [`App`] from the world, once per tick.
-//!
-//! Two sources, deliberately kept in one file because a tick reads both and
-//! neither is meaningful alone: the LIVE in-memory fleet probe that drives the
-//! now-view, and the [`super::DataSource`] read that backs history. Nothing here
-//! writes to disk — the single-writer invariant belongs to `serve`.
-//!
-//! The one subtlety worth stating up front is the keying. All per-runner LOCAL
-//! state is keyed by install `dir`, never by `agent_id`, because agentId is
-//! unique only within an org and collides across the fleet; GitHub's view is
-//! joined back by `(org, agent_id)`, where `org` disambiguates.
+//! Fills [`App`] each tick from the live fleet probe and [`super::DataSource`]; never writes.
+//! Per-runner local state is keyed by install dir, since agentId is unique only
+//! within an org; GitHub's view joins back by `(org, agent_id)`.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -22,14 +14,9 @@ use crate::shared::util::now_epoch;
 use super::{App, HISTORY_POINTS, JOB_ROWS, LiveRunner, TREND_POINTS, Tab};
 
 impl App {
-    /// Sample the fleet LIVE (in-memory, display-only) for the now-view, and read
-    /// the DB for history + the GitHub view. Never writes — the single-writer
-    /// invariant is `serve`'s.
     pub(crate) fn refresh(&mut self) {
         let now = now_epoch();
-        // Live now-view: probe runners + host in-memory, like `serve`'s sampler
-        // but without persisting. `walk_work=false` keeps it cheap (the _work
-        // total is a slow trend metric, read from history instead).
+        // `walk_work=false`: the _work total is slow to walk; history supplies it.
         let snap = collectors::collect_local(&self.cfg.runner_roots, now, false);
         let sampled_at = Instant::now();
         let h = snap.host;
@@ -45,24 +32,14 @@ impl App {
         self.rings.push_host(host.clone());
         self.host = Some(host);
 
-        // Attach to a collector that started while we're open (no-op if already
-        // Persistent; a later failed request reverts us to Ephemeral).
         self.source.reconnect_if_ephemeral();
-        // GitHub's view is Persistent-only (from the collector's reconcile).
         let api = self.source.latest_api_runners();
-        // The collector's persisted liveness edges (Persistent only) — the true,
-        // restart-surviving `since_ts` for the "For" duration. Empty in Ephemeral.
         let persisted = self.source.runner_states();
-        // Configured token orgs: the collector's authoritative /etc view when
-        // Persistent (so a non-root TUI reflects the real PATs), else this run's
-        // own loaded config when Ephemeral.
         let orgs = self.source.configured_token_orgs();
         self.configured_orgs =
             orgs.unwrap_or_else(|| self.cfg.github.tokens.keys().cloned().collect());
-        // A hook counts as "ours" if it points under ANY scope's hooks dir —
-        // hooks always install System-scope (they need root), but this dashboard
-        // is normally run non-root, so keying off `Scope::detect()` alone
-        // mislabeled installed/chained hooks as foreign (cross-scope status bug).
+        // Hooks install System-scope but the dashboard usually runs non-root, so
+        // any scope's hooks dir counts as ours.
         let our_dirs = [
             install::hooks_dir(&Scope::System.data_dir()),
             install::hooks_dir(&Scope::User.data_dir()),
@@ -73,13 +50,8 @@ impl App {
         let (mut busy, mut online) = (0u32, 0u32);
         for p in snap.runners {
             let id = p.info.agent_id;
-            // Local identity is the install dir (locally unique), NOT agent_id —
-            // agentId collides across orgs, which cross-contaminated CPU, the
-            // liveness edge, and the sparkline ring. Key all per-runner local
-            // state by `dirkey`; join GitHub's view by `(org, agent_id)`.
             let dirkey = p.info.dir.to_string_lossy().into_owned();
             let cpu_pct = self.cpu.rate(&p.info.dir, p.cpu_usage_usec, sampled_at);
-            // Feed the Ephemeral-mode sparkline ring from the same live sample.
             self.rings.push_runner(
                 dirkey.clone(),
                 HistPoint {
@@ -96,15 +68,11 @@ impl App {
                 Liveness::Idle => online += 1,
                 Liveness::Offline => {}
             }
-            // In-memory liveness edge: keep `since` while unchanged, else now.
             let edge_since = match self.edges.get(&dirkey) {
                 Some((prev, since)) if *prev == p.liveness => *since,
                 _ => now,
             };
             edges.insert(dirkey.clone(), (p.liveness, edge_since));
-            // Prefer the collector's persisted edge (survives TUI restarts) when it
-            // agrees with the live-sampled liveness; else the in-memory edge
-            // (Ephemeral, or a transition the collector hasn't persisted yet).
             let since = pick_since(persisted.get(&dirkey), p.liveness, edge_since);
             runners.push(LiveRunner {
                 liveness: p.liveness,
@@ -126,14 +94,11 @@ impl App {
                 user: p.info.user,
             });
         }
-        // Fleet occupancy for the Ephemeral busy-trend (reproduces busy_series).
         self.rings.push_busy(BusyPoint {
             ts: now,
             busy,
             online,
-            // Ephemeral mode has no collector and therefore no GitHub reconcile.
-            // `None` plots a gap; emitting 0 would draw "GitHub says nothing is
-            // online" for a fleet nobody has asked GitHub about.
+            // Ephemeral has no reconcile: `None` plots a gap; 0 would claim nothing is online.
             github: None,
         });
         self.edges = edges;
@@ -176,10 +141,7 @@ impl App {
     }
 }
 
-/// Choose the "since" timestamp for a runner's current-liveness duration (the
-/// "For" column): the collector's persisted edge when it agrees with the live
-/// liveness (true, restart-surviving), else the TUI's in-memory edge (Ephemeral,
-/// or a transition the collector hasn't persisted yet). Pure + tested.
+/// The collector's persisted edge survives TUI restarts but may lag a live transition.
 fn pick_since(persisted: Option<&RunnerState>, live: Liveness, edge_since: i64) -> i64 {
     match persisted {
         Some(st) if st.liveness == live => st.since_ts,
@@ -203,16 +165,13 @@ mod tests {
     #[test]
     fn pick_since_prefers_persisted_edge_when_liveness_agrees() {
         let persisted = state(Liveness::Busy, 100);
-        // Persisted agrees with live ⇒ use the persisted (restart-surviving) edge.
         assert_eq!(pick_since(Some(&persisted), Liveness::Busy, 900), 100);
     }
 
     #[test]
     fn pick_since_falls_back_on_disagreement_or_absence() {
         let persisted = state(Liveness::Idle, 100);
-        // Live liveness changed since the collector's last write ⇒ in-memory edge.
         assert_eq!(pick_since(Some(&persisted), Liveness::Busy, 900), 900);
-        // No persisted edge (Ephemeral) ⇒ in-memory edge.
         assert_eq!(pick_since(None, Liveness::Busy, 900), 900);
     }
 }

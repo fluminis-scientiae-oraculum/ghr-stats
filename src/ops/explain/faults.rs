@@ -1,22 +1,11 @@
-//! Findings derived from state we HAVE.
-//!
-//! Both findings in here read runner rows that are present in the snapshot and
-//! assert something is wrong with them: the local listener is gone, or it is
-//! alive while GitHub will not dispatch to it. The mirror image is [`super::gaps`],
-//! which asserts things about rows or readings that are *missing*.
-//!
-//! The split is not by severity — [`super::gaps`] holds a `Medium` finding and
-//! this file could hold an `Info` one. It is by whether the claim rests on data
-//! the snapshot carries or on data it lacks, which is what decides how the claim
-//! has to be worded and what evidence can back it.
+//! Findings about runner rows the snapshot carries.
 
 use crate::shared::models::{FleetStatus, Liveness, RunnerStatus};
 use crate::shared::util::to_rfc3339_utc;
 
 use super::{Boundary, Finding, Severity};
 
-/// Runners that are healthy locally while GitHub will not dispatch to them —
-/// the failure this whole release exists to make visible.
+/// Runners healthy locally while GitHub will not dispatch to them.
 pub(super) fn divergence(s: &FleetStatus) -> Option<Finding> {
     let divergent: Vec<&RunnerStatus> = s
         .runners
@@ -37,9 +26,7 @@ pub(super) fn divergence(s: &FleetStatus) -> Option<Finding> {
              ({orgs}) — the shared factor is this host, not any one org.",
             divergent.len()
         ),
-        // Only reached with peers to compare against, or with nothing to compare
-        // against at all; the claim says which, because a one-org host cannot
-        // distinguish "GitHub broke" from "our egress broke" and must not pretend to.
+        // A one-org host cannot tell "GitHub broke" from "our egress broke".
         _ if present.len() > 1 => format!(
             "{} runners in {orgs} are healthy locally but offline to GitHub, while every other \
              org on this host is online — the differing factor is the org.",
@@ -52,8 +39,7 @@ pub(super) fn divergence(s: &FleetStatus) -> Option<Finding> {
         ),
     };
 
-    // Work back from the LONGEST outage, not the newest: the earliest onset is
-    // when the condition started, and the later ones are it spreading.
+    // The longest outage is the onset; shorter ones are the fault spreading.
     let longest = divergent
         .iter()
         .filter_map(|r| r.github_offline_seconds)
@@ -99,10 +85,7 @@ pub(super) fn divergence(s: &FleetStatus) -> Option<Finding> {
     })
 }
 
-/// What to look at, chosen by the boundary. The `network` list leads with this
-/// host because that is what the boundary derivation just ruled *in*; the
-/// `github` list leads with the provider for the same reason. Ordering the checks
-/// by anything else would waste the one inference this verb exists to make.
+/// Leads with the side the boundary ruled in.
 fn checks_for(boundary: Boundary) -> Vec<String> {
     let checks: &[&str] = match boundary {
         Boundary::Network => &[
@@ -120,23 +103,15 @@ fn checks_for(boundary: Boundary) -> Vec<String> {
     checks.iter().map(|c| (*c).to_string()).collect()
 }
 
-/// Which side to investigate, from the *spread* of divergence across the orgs on
-/// this host. This is the comparison the incident's human investigation had to
-/// make by hand, and the only reason the tool can make it is that it sees every
-/// org through one egress at one instant.
+/// From the spread of divergence across this host's orgs, seen through one egress.
 fn divergence_boundary(affected_orgs: usize, orgs_present: usize) -> Boundary {
     if affected_orgs == orgs_present && orgs_present > 1 {
-        // Nothing org-specific survives as an explanation.
         Boundary::Network
     } else {
-        // Peers are fine (or there are none) — the org is the variable.
         Boundary::Github
     }
 }
 
-/// Runners whose listener process is gone. Already visible in red on every other
-/// surface, hence `Medium` — but `explain` would be lying by omission if the one
-/// verb that claims to say *why* skipped the most ordinary cause.
 pub(super) fn offline_locally(s: &FleetStatus) -> Option<Finding> {
     let names = s
         .runners
@@ -167,8 +142,7 @@ pub(super) fn offline_locally(s: &FleetStatus) -> Option<Finding> {
             format!("liveness=offline for {}/{}", names.len(), s.runners.len()),
             match longest {
                 Some(secs) => format!("longest offline for {secs}s"),
-                // Ephemeral has no persisted edge to measure from, so it reports
-                // 0 — say nothing rather than report "offline for 0s".
+                // Ephemeral mode has no persisted edge and reports 0.
                 None => "no state duration available (no collector history)".to_string(),
             },
         ],
@@ -181,9 +155,7 @@ pub(super) fn offline_locally(s: &FleetStatus) -> Option<Finding> {
     })
 }
 
-/// The orgs represented by a set of runners, deduplicated and ordered, so the
-/// rendered claim is byte-stable across runs (a diffing agent must not see churn
-/// that came from a hash order).
+/// Sorted so the rendered claim is byte-stable across runs.
 fn orgs_of<'a>(runners: impl Iterator<Item = &'a RunnerStatus>) -> Vec<&'a str> {
     let mut orgs: Vec<&str> = runners.map(|r| r.org.as_str()).collect();
     orgs.sort_unstable();
@@ -198,8 +170,6 @@ mod tests {
     use super::*;
     use crate::shared::models::{Liveness, Mode};
 
-    /// The incident's own shape: one org dark, peers on the same host fine. The
-    /// peer comparison is what makes this `github` and not `network`.
     #[test]
     fn one_org_dark_while_peers_are_fine_points_at_github() {
         let s = status(
@@ -218,8 +188,6 @@ mod tests {
         assert!(f.claim.contains("the differing factor is the org"));
     }
 
-    /// Every org on the host dark at once: no org-specific explanation survives,
-    /// so the shared factor — this host's path to GitHub — is what to check.
     #[test]
     fn every_org_dark_at_once_points_at_the_network() {
         let s = status(
@@ -234,8 +202,6 @@ mod tests {
         assert!(f.claim.contains("org-a, org-b"));
     }
 
-    /// A single-org host has no peer to compare against, and must say so rather
-    /// than pass its guess off as the peer comparison it could not run.
     #[test]
     fn a_single_org_host_admits_it_cannot_rule_out_the_network() {
         let s = status(
@@ -247,7 +213,6 @@ mod tests {
         assert!(f.claim.contains("no peer to rule the network out"));
     }
 
-    /// The boundary rule itself, at its edges.
     #[test]
     fn boundary_is_network_only_when_every_one_of_several_orgs_is_affected() {
         assert_eq!(divergence_boundary(3, 3), Boundary::Network);
@@ -255,8 +220,6 @@ mod tests {
         assert_eq!(divergence_boundary(1, 1), Boundary::Github);
     }
 
-    /// An unknown GitHub view is not divergence — the same rule `status` applies
-    /// to the verdict. `explain` must not page on our own ignorance either.
     #[test]
     fn an_unknown_github_view_yields_no_divergence_finding() {
         let s = status(
@@ -283,9 +246,6 @@ mod tests {
         assert!(!f.claim.contains("a1"));
     }
 
-    /// The claim asserts; the evidence has to be checkable independently of it.
-    /// Naming the healthy peers is the whole basis of the github-vs-network call,
-    /// so a reader must be able to audit that call without rerunning the tool.
     #[test]
     fn the_divergence_finding_evidences_the_peer_comparison_it_relied_on() {
         let s = status(
@@ -306,8 +266,6 @@ mod tests {
         assert!(f.suggested_checks.iter().any(|c| c.contains("status page")));
     }
 
-    /// The onset is the EARLIEST, so it must come from the longest outage. Taking
-    /// the newest would report the moment the fault spread, not when it began.
     #[test]
     fn first_seen_comes_from_the_longest_outage_not_the_latest() {
         let mut recent = runner("b0", "org-b", Liveness::Idle, Some(true));
@@ -323,17 +281,12 @@ mod tests {
         );
     }
 
-    /// The checks are ordered BY the boundary — that ordering is the payload, not
-    /// decoration. A network verdict that opened with "check the provider status
-    /// page" would discard the inference that produced the verdict.
     #[test]
     fn suggested_checks_lead_with_the_side_the_boundary_named() {
         assert!(checks_for(Boundary::Network)[0].contains("this host's egress"));
         assert!(checks_for(Boundary::Github)[0].contains("provider status page"));
     }
 
-    /// Machine-stable output: the org list in a claim must not depend on hash
-    /// order, or a diffing agent sees churn that is not a change.
     #[test]
     fn org_lists_are_sorted_and_deduplicated() {
         let rs = [

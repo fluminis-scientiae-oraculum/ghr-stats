@@ -1,21 +1,5 @@
-//! Findings derived from what the snapshot LACKS.
-//!
-//! Three degrees of the same absence, and the whole point is that they are
-//! distinguished rather than collapsed:
-//!
-//! - [`github_view_stale`] — the org reconciled before and has stopped. It
-//!   worked, so something changed.
-//! - [`org_never_reconciled`] — it never worked, which is a standing
-//!   configuration fact and not an incident.
-//! - [`github_view_unavailable`] — we could not reach the collector that holds
-//!   the GitHub view at all, so nothing above could even be assessed.
-//!
-//! Reporting silence as all-clear is the failure this release exists to prevent,
-//! so every one of these emits a finding rather than letting an empty list speak.
-//! Severity is orthogonal to the seam: `github_view_stale` is `Medium` while the
-//! other two are `Info`. What groups them is that the claim rests on missing
-//! data, which is what constrains how it can be worded and what evidence can
-//! back it. Findings about data we HAVE live in [`super::faults`].
+//! Findings about what the snapshot lacks. Each emits a finding so that silence
+//! never reads as all-clear.
 
 use crate::ops::status::{Snapshot, Source};
 use crate::shared::ipc::client::EphemeralReason;
@@ -23,17 +7,10 @@ use crate::shared::util::to_rfc3339_utc;
 
 use super::{Boundary, Finding, Severity};
 
-/// Runners the collector holds no CURRENT GitHub reading for, in an org that has
-/// reconciled successfully at some point. It worked and stopped, which is a
-/// different problem from never having been configured — see
-/// [`org_never_reconciled`], which is the standing-condition half of this split.
-///
-/// Freshness is not re-adjudicated here: the reader already decided it once and
-/// hands out `github_online: None` for a view that is stale or unknown. Re-testing
-/// an age against a threshold in a second place is how the two would disagree.
+/// Runners with no current GitHub reading in an org that has reconciled before.
+/// Freshness is already adjudicated upstream (`github_online: None`); no re-test here.
 pub(super) fn github_view_stale(snap: &Snapshot) -> Option<Finding> {
-    // Only the collector has a GitHub view at all; in a local scan every reading
-    // is absent for one reason, already reported once by `github_view_unavailable`.
+    // A local scan's missing readings are reported once, by `github_view_unavailable`.
     if !matches!(snap.source, Source::Collector) {
         return None;
     }
@@ -94,11 +71,7 @@ pub(super) fn github_view_stale(snap: &Snapshot) -> Option<Finding> {
     })
 }
 
-/// Orgs that have NEVER reconciled successfully. Deliberately `Info`: a host can
-/// legitimately carry an org it holds no token for — a personal account, say —
-/// and that is a standing configuration fact, not an incident. Ranking it with
-/// the failures would make `explain` cry wolf on every single run, which is how
-/// a findings list stops being read.
+/// `Info`: an org with no token (e.g. a personal account) is a standing fact.
 pub(super) fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
     if !matches!(snap.source, Source::Collector) {
         return None;
@@ -136,8 +109,6 @@ pub(super) fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
             ),
             format!("{runners} runners have no GitHub side to compare against"),
         ],
-        // "Never" has no onset to report, and inventing the collector's start
-        // time here would be a guess dressed as a measurement.
         first_seen: None,
         suggested_checks: vec![
             "whether a read-only PAT is configured for each of these orgs".to_string(),
@@ -147,15 +118,8 @@ pub(super) fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
     })
 }
 
-/// State the limit rather than let an empty `findings` array read as all-clear.
-///
-/// Without a collector there is no GitHub view at all, so the highest-severity
-/// finding above is not *absent* — it is unassessable. Reporting silence here is
-/// the same all-green lie, one layer up.
-///
-/// The claim is built from the provenance rather than assumed, because the four
-/// ways to end up without a collector have four different remedies, and three of
-/// them are actively worsened by being told to install one that is already there.
+/// Without a collector the GitHub-side findings are unassessable, not absent. Each
+/// reason gets its own remedy: most must not be told to install a running collector.
 pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
     let checks: Vec<String> = match source {
         Source::Collector => Vec::new(),
@@ -218,10 +182,7 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
                 .to_string(),
         ),
     };
-    // The word is the branchable token; the detail, when the reason carries one,
-    // is what turns "the handshake failed" into something to act on. Evidence is
-    // where it belongs — the claim states the situation, evidence carries the
-    // observation, and only one of those may be a verbatim error string.
+    // Error text goes in evidence only, never the claim or the branchable word.
     let mut evidence = vec![format!("ipc: {}", reason_word(source))];
     if let Some(why) = reason_detail(source) {
         evidence.push(format!("handshake error: {why}"));
@@ -232,15 +193,12 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
         boundary,
         claim,
         evidence,
-        // The fallback is observed now; how long it has been true is not knowable
-        // from a snapshot that could not reach the thing that would know.
         first_seen: None,
         suggested_checks: checks,
     })
 }
 
-/// A stable machine-readable token for why we fell back, so an agent can branch
-/// on the cause without matching on prose that may be reworded.
+/// Stable token an agent can branch on.
 fn reason_word(source: &Source) -> &'static str {
     match source {
         Source::Collector => "connected",
@@ -248,9 +206,6 @@ fn reason_word(source: &Source) -> &'static str {
     }
 }
 
-/// The underlying failure behind the fallback, when the reason carries one.
-/// Kept separate from [`reason_word`] so the stable token an agent branches on
-/// never has a verbatim error string spliced into it.
 fn reason_detail(source: &Source) -> Option<&str> {
     match source {
         Source::Collector => None,
@@ -281,8 +236,6 @@ mod tests {
         snap
     }
 
-    /// Ephemeral mode cannot see GitHub at all, so silence would read as
-    /// all-clear — the exact failure this release exists to prevent.
     #[test]
     fn ephemeral_mode_states_that_it_could_not_look() {
         let s = fell_back(
@@ -296,10 +249,6 @@ mod tests {
         assert!(f.claim.contains("systemd install"));
     }
 
-    /// The reason a collector was unreachable decides the advice. Telling an
-    /// operator to install a collector that is running — and only needs a
-    /// restart, or a permission fixed — is worse than saying nothing: it sends
-    /// them to fix the one thing that is not broken.
     #[test]
     fn a_reachable_but_unusable_collector_is_never_reported_as_absent() {
         for (reason, expect_boundary, expect_phrase) in [
@@ -339,10 +288,6 @@ mod tests {
         }
     }
 
-    /// `explain` had the same hole `doctor` did: the handshake error was warn-
-    /// logged and dropped, so the finding said only "handshake-failed". It goes
-    /// in EVIDENCE, not the claim — the claim states the situation, evidence
-    /// carries the observation, and only one of those may be a raw error string.
     #[test]
     fn an_unusable_collector_evidences_the_handshake_error() {
         let s = fell_back(
@@ -365,7 +310,6 @@ mod tests {
             "{:?}",
             f.evidence
         );
-        // The branchable token stays clean — no error text spliced into it.
         assert!(
             !f.claim.contains("unexpected handshake reply"),
             "{}",
@@ -373,7 +317,6 @@ mod tests {
         );
     }
 
-    /// A reason with no detail must not grow an empty evidence line.
     #[test]
     fn a_reason_without_a_detail_adds_no_evidence_line() {
         let s = fell_back(
@@ -383,8 +326,6 @@ mod tests {
         assert_eq!(findings(&s)[0].evidence, ["ipc: no-collector"]);
     }
 
-    /// The drift claim must quote BOTH versions — one of them alone does not
-    /// tell the operator which side to move.
     #[test]
     fn the_version_drift_claim_names_both_wire_versions() {
         let s = fell_back(
@@ -399,9 +340,6 @@ mod tests {
         );
     }
 
-    /// Never-configured is a standing fact, not an incident. This host carries an
-    /// org it can never reconcile, so ranking it above Info would make `explain`
-    /// cry wolf on every single run — which is how a findings list stops being read.
     #[test]
     fn a_never_reconciled_org_is_info_and_carries_no_onset() {
         let s = with_orgs(
@@ -414,15 +352,10 @@ mod tests {
             .expect("finding");
         assert_eq!(f.severity, Severity::Info);
         assert_eq!(f.boundary, Boundary::Config);
-        // "Never" has no onset; inventing the collector's start time would be a
-        // guess dressed as a measurement.
         assert_eq!(f.first_seen, None);
         assert!(f.claim.contains("personal"));
     }
 
-    /// "Worked and stopped" is a different problem from "never worked", and only
-    /// the first is a change worth chasing. The split is what keeps the standing
-    /// config gap out of the Medium band.
     #[test]
     fn a_stale_view_is_reported_only_for_an_org_that_has_reconciled_before() {
         let s = with_orgs(
@@ -443,9 +376,6 @@ mod tests {
         assert_eq!(stale.first_seen.as_deref(), Some("1969-12-31T23:45:00Z"));
     }
 
-    /// Neither collector-only finding may fire from a local scan: without a
-    /// collector there are no orgs and no adjudicated freshness, so both would be
-    /// asserting things about data that was never fetched.
     #[test]
     fn collector_only_findings_stay_silent_in_a_local_scan() {
         let s = fell_back(

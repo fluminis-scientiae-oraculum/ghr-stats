@@ -1,22 +1,4 @@
-//! The four edge streams: what CHANGED between consecutive samples.
-//!
-//! Four queries, one argument. Each is a `LAG` over its own partition, so the
-//! `LIMIT` bounds the collector's work rather than only the reply — a six-hour
-//! window on this fleet is ~90 000 local samples, and a limit applied after
-//! materialising them would bound neither.
-//!
-//! They live together because they share the invariant, not because they share a
-//! producer: an edge exists only where BOTH a row and its predecessor fall inside
-//! the window, so a change to how an edge is bounded lands on all four at once.
-//! The parent owns the window that bounds them.
-//!
-//! Each stream keeps its own reading of "a change", and the differences are
-//! deliberate. A GitHub edge means GitHub told us something different from the
-//! last time it told us anything — so a reconcile GAP produces no edge, because
-//! we did not observe a change, we stopped observing. `--runner` narrows
-//! reconcile edges to that runner's ORGS rather than filtering them out, since
-//! "could we reach GitHub for this runner's org" is the context that makes the
-//! runner's own edges readable.
+//! The four `LAG`-derived edge streams. A change to how an edge is bounded must land on all four.
 
 use rusqlite::{Connection, params};
 
@@ -29,14 +11,6 @@ use crate::shared::util::to_rfc3339_utc;
 
 use super::filters;
 
-/// Job starts and completions in the window, newest first.
-///
-/// One `job_event` row yields up to TWO edges at different instants, so the two
-/// ends are selected separately and unioned rather than derived from one row —
-/// a job that started inside the window and has not finished contributes only
-/// its start, and one that finished inside a window it started before
-/// contributes only its completion. Filtering the union (rather than each half)
-/// keeps the org/runner predicate written once.
 pub(super) fn job_edges(
     conn: &Connection,
     q: &TimelineQuery,
@@ -75,14 +49,6 @@ pub(super) fn job_edges(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Local liveness edges — a runner's process state changing between two
-/// consecutive samples.
-///
-/// The first sample inside the window has no predecessor and so yields no edge:
-/// it establishes the baseline. A change that happened exactly at the window's
-/// opening tick is therefore attributed to before the window, which is the
-/// conservative direction — better to omit an edge we cannot date than to
-/// invent one from a value we never observed.
 pub(super) fn liveness_edges(
     conn: &Connection,
     q: &TimelineQuery,
@@ -114,13 +80,7 @@ pub(super) fn liveness_edges(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// GitHub-side online edges, from the reconcile samples.
-///
-/// Derived from consecutive READINGS, not from the local tick grid: an edge
-/// means GitHub told us something different from last time it told us anything.
-/// A reconcile gap therefore produces no edge — we did not observe a change, we
-/// stopped observing, and those are different claims. The gap itself shows up as
-/// a `Reconcile` edge if the fetch failed, and as staleness in `--samples`.
+/// From consecutive readings, not the local tick grid: a reconcile gap is not a change.
 pub(super) fn github_edges(
     conn: &Connection,
     q: &TimelineQuery,
@@ -151,13 +111,7 @@ pub(super) fn github_edges(
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Per-org reconcile edges — whether we were in a position to hold an opinion
-/// about GitHub at all.
-///
-/// `--runner` does NOT filter these out: they are the context that makes the
-/// runner's own edges readable. Narrowing to one runner instead narrows to the
-/// org(s) that runner belongs to, so the reply still answers "could we reach
-/// GitHub for this runner's org at the time".
+/// `--runner` narrows these to that runner's orgs rather than dropping them.
 pub(super) fn reconcile_edges(
     conn: &Connection,
     q: &TimelineQuery,

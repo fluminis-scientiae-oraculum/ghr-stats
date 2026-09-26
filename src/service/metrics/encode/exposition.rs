@@ -1,25 +1,11 @@
-//! What a metrics backend gets: the same snapshot in two syntaxes.
-//!
-//! Prometheus text for the pull endpoint (`metrics::pull`) and a flat JSON array
-//! for the push sink (`metrics::push`). They are one module because they are one
-//! decision — every series added to the exposition is added to both, and their
-//! histories are identical down to the commit. Neither judges; a `verdict` string
-//! rides along in the JSON payload, but it is read from the counts rather than
-//! adjudicated here.
-//!
-//! [`super::RunnerMetric::labels`] and [`esc`] live here rather than with the row
-//! type because they are Prometheus label syntax, not properties of a runner.
-//!
-//! The tests below are all exposition assertions — they pin the rendered strings,
-//! including the headline guard that `busy`/`idle`/`offline` keep their exact
-//! pre-0.2.0 values so that upgrading shifts nobody's dashboard.
+//! Prometheus text (pull) and flat JSON (push) renderings of a [`Snapshot`]. Every series
+//! goes in both.
 
 use crate::shared::models::Liveness;
 
 use super::{RunnerMetric, Snapshot};
 
 impl RunnerMetric {
-    /// The common `agent_id`/`name`/`org` label set, escaped.
     fn labels(&self) -> String {
         format!(
             "agent_id=\"{}\",name=\"{}\",org=\"{}\"",
@@ -31,7 +17,7 @@ impl RunnerMetric {
 }
 
 impl Snapshot {
-    /// Render the Prometheus text exposition (format 0.0.4).
+    /// Prometheus text exposition format 0.0.4.
     pub fn to_prometheus(&self) -> String {
         use std::fmt::Write;
         let mut s = String::with_capacity(2048);
@@ -58,10 +44,8 @@ impl Snapshot {
             self.offline,
             self.divergent,
         );
-        // NOTE: `divergent` CROSS-CUTS busy/idle/offline rather than partitioning
-        // them — a divergent runner is also counted as idle or busy. The three
-        // original values keep their exact prior meaning so existing dashboards
-        // do not shift under an upgrade; summing all four would double-count.
+        // `divergent` cross-cuts busy/idle/offline: a divergent runner is also idle or busy,
+        // so summing all four double-counts.
 
         if let Some(ts) = self.last_sample_ts {
             let _ = writeln!(
@@ -149,8 +133,6 @@ impl Snapshot {
             }
         }
 
-        // How old each GitHub reading is. Lets a scrape watch staleness build,
-        // rather than only seeing its aftermath.
         let _ = writeln!(s, "# TYPE ghr_runner_github_sample_age_seconds gauge");
         for r in &self.runners {
             if let Some(age) = r.gh.age_s() {
@@ -162,9 +144,8 @@ impl Snapshot {
             }
         }
 
-        // The alertable quantity. Zero when online; absent when there is no edge
-        // yet. Debounce on THIS, never on the instantaneous bit — the latter
-        // flapped 62 times in three hours during the incident this fixes.
+        // Zero when online, absent with no edge yet. Alert on this, not on the flapping
+        // instantaneous bit.
         let _ = writeln!(s, "# TYPE ghr_runner_github_offline_seconds gauge");
         for r in &self.runners {
             let secs = match (r.gh_offline_seconds, r.gh.online()) {
@@ -196,8 +177,6 @@ impl Snapshot {
             );
         }
 
-        // Reconcile health. Without these, a dead reconcile presents as a calm
-        // fleet and the two alerts above cannot be trusted.
         let _ = writeln!(
             s,
             "# TYPE ghr_api_max_age_seconds gauge\nghr_api_max_age_seconds {}\n\
@@ -233,8 +212,8 @@ impl Snapshot {
         s
     }
 
-    /// Render a flat JSON array (one fleet record + one per runner), shaped for
-    /// OpenObserve's `_json` ingest. `_timestamp` is microseconds.
+    /// Flat JSON array (fleet record, then one per runner) for OpenObserve `_json` ingest;
+    /// `_timestamp` is µs.
     pub fn to_json(&self) -> String {
         use serde_json::{Value, json};
         let ts_us = self.now * 1_000_000;
@@ -254,10 +233,6 @@ impl Snapshot {
             "jobs_running": self.jobs_running,
             "last_sample_ts": self.last_sample_ts,
             "divergent": self.divergent,
-            // Ship the verdict, not just the numbers. A consumer re-deriving
-            // "is this healthy?" from the gauges gets it wrong the same way a
-            // human does — the tool already knows local-up + GitHub-offline is
-            // bad, so it says so.
             "verdict": if self.divergent > 0 || self.offline > 0 { "degraded" } else { "ok" },
             "orgs": self.orgs.iter().map(|o| json!({
                 "org": o.org,
@@ -290,7 +265,6 @@ impl Snapshot {
     }
 }
 
-/// Escape a Prometheus label value (`\`, `"`, newline).
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -332,8 +306,6 @@ mod tests {
         c
     }
 
-    /// Seed a divergent fleet: both runners locally up, GitHub says r1 is
-    /// offline (and has been since ts 500).
     fn seed_divergent() -> Connection {
         let c = seed();
         for (id, online) in [(1, 0), (2, 1)] {
@@ -360,10 +332,6 @@ mod tests {
         c
     }
 
-    /// The headline regression guard. `busy`/`idle`/`offline` must keep their
-    /// exact prior values for a fleet with no divergence, so upgrading does not
-    /// silently shift anyone's dashboards; `divergent` is an ADDITIONAL,
-    /// cross-cutting label, not a fourth partition.
     #[test]
     fn fleet_by_state_is_unchanged_for_a_non_divergent_fleet() {
         let p = Snapshot::gather(&seed(), 1100, "9.9.9", 180)
@@ -375,7 +343,6 @@ mod tests {
         assert!(p.contains("ghr_fleet_by_state{state=\"divergent\"} 0"));
     }
 
-    /// The state that mattered for four hours and had no representation.
     #[test]
     fn a_locally_up_github_offline_runner_is_divergent() {
         let p = Snapshot::gather(&seed_divergent(), 1100, "9.9.9", 180)
@@ -384,32 +351,26 @@ mod tests {
         assert!(p.contains("ghr_fleet_by_state{state=\"divergent\"} 1"));
         assert!(p.contains("ghr_runner_divergent{agent_id=\"1\",name=\"r1\",org=\"acme\"} 1"));
         assert!(p.contains("ghr_runner_divergent{agent_id=\"2\",name=\"r2\",org=\"acme\"} 0"));
-        // Duration from the persisted edge: now(1100) - since_ts(500).
+        // now(1100) - since_ts(500)
         assert!(p.contains(
             "ghr_runner_github_offline_seconds{agent_id=\"1\",name=\"r1\",org=\"acme\"} 600"
         ));
-        // Org rollup — the arithmetic that made the incident obvious.
         assert!(p.contains("ghr_org_runners{org=\"acme\",state=\"total\"} 2"));
         assert!(p.contains("ghr_org_runners{org=\"acme\",state=\"github_online\"} 1"));
-        // Reconcile health, so the alerts above are trustworthy.
         assert!(p.contains("ghr_api_reconcile_ok{org=\"acme\"} 1"));
         assert!(p.contains("ghr_api_reconcile_timestamp_seconds{org=\"acme\"} 1000"));
         assert!(p.contains("ghr_api_max_age_seconds 180"));
     }
 
-    /// Unknown is not divergent, and stale is not divergent. An alert must never
-    /// fire because we stopped being able to ask.
     #[test]
     fn a_stale_or_unknown_github_view_is_not_divergent() {
-        // No api rows at all ⇒ Unknown.
+        // No api rows ⇒ Unknown.
         let p = Snapshot::gather(&seed(), 1100, "9.9.9", 180)
             .unwrap()
             .to_prometheus();
         assert!(!p.contains("ghr_runner_divergent{agent_id=\"1\""));
 
-        // Rows exist but are far older than the window ⇒ Stale, still not
-        // divergent, and the GitHub online series drops out rather than
-        // asserting a stale value.
+        // Rows far older than the window ⇒ Stale.
         let p = Snapshot::gather(&seed_divergent(), 100_000, "9.9.9", 180)
             .unwrap()
             .to_prometheus();
@@ -426,12 +387,11 @@ mod tests {
         assert!(p.contains("ghr_fleet_by_state{state=\"busy\"} 1"));
         assert!(p.contains("ghr_host_load1 1.5"));
         assert!(p.contains("ghr_jobs_running 1"));
-        // state_seconds = now(1100) - since_ts(900) = 200
+        // now(1100) - since_ts(900)
         assert!(p.contains(
             "ghr_runner_state_seconds{agent_id=\"1\",name=\"r1\",org=\"acme\",state=\"busy\"} 200"
         ));
         assert!(p.contains("ghr_runner_cpu_percent{agent_id=\"1\",name=\"r1\",org=\"acme\"} 12.5"));
-        // Working-set headline gauge and the raw cache-inclusive sibling.
         assert!(
             p.contains("ghr_runner_mem_bytes{agent_id=\"1\",name=\"r1\",org=\"acme\"} 1048576")
         );

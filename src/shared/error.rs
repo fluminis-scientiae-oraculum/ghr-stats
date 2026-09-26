@@ -1,6 +1,5 @@
 use thiserror::Error;
 
-/// Library error type. Boundaries (`main`) wrap these with `anyhow` context.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("config: {0}")]

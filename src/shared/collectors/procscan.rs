@@ -16,8 +16,6 @@ pub struct ProcInfo {
     pub starttime_ticks: u64,
 }
 
-/// Enumerate all readable processes. Best-effort: unreadable entries are
-/// skipped, never fatal.
 pub fn scan() -> Vec<ProcInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -29,7 +27,7 @@ pub fn scan() -> Vec<ProcInfo> {
             .to_str()
             .and_then(|s| s.parse::<u32>().ok())
         else {
-            continue; // non-numeric /proc entry
+            continue;
         };
         if let Some(info) = read_proc(&entry.path(), pid) {
             out.push(info);
@@ -67,19 +65,14 @@ fn parse_argv0(cmdline: &[u8]) -> Option<PathBuf> {
     (!first.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(first)))
 }
 
-/// Parse field 22 (start time, in clock ticks) from a `/proc/<pid>/stat` line.
-///
-/// The `comm` field (2) is wrapped in parens and may itself contain spaces and
-/// parens, so we anchor on the *last* `)` and count fields from there: after
-/// it, field 3 (state) is index 0, making start time index 19.
+/// Field 22 (start time, clock ticks) of a `/proc/<pid>/stat` line. `comm` may contain spaces and
+/// parens, so fields are counted from the last `)`: state is index 0, start time index 19.
 pub fn parse_starttime(stat: &str) -> Option<u64> {
     let rparen = stat.rfind(')')?;
     let rest = stat.get(rparen + 1..)?.trim_start();
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Process age in seconds from its start ticks, the system boot time, and the
-/// clock tick rate. Returns `None` if the inputs imply a negative age.
 pub fn uptime_secs(now_epoch: i64, btime: i64, clk_tck: u64, starttime_ticks: u64) -> Option<u64> {
     if clk_tck == 0 {
         return None;
@@ -89,7 +82,7 @@ pub fn uptime_secs(now_epoch: i64, btime: i64, clk_tck: u64, starttime_ticks: u6
     (age >= 0).then_some(age as u64)
 }
 
-/// Read `btime` (boot epoch seconds) from `/proc/stat`.
+/// `btime` (boot time, epoch seconds) from `/proc/stat`.
 pub fn boot_time() -> Option<i64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
     parse_btime(&stat)
@@ -108,10 +101,6 @@ mod tests {
 
     #[test]
     fn starttime_handles_comm_with_spaces_and_parens() {
-        // Synthetic stat line: comm = "(weird ) name)" with spaces + parens.
-        // Fields after the last ')': state=S(3) ... starttime should be 4242.
-        // index: 0:S 1:1 2:1 3:1 4:0 5:-1 6:0 7:0 8:0 9:0 10:0 11:0 12:0
-        //        13:0 14:0 15:0 16:0 17:0 18:0 19:4242
         let line = "1234 (weird ) name) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 4242 99999";
         assert_eq!(parse_starttime(line), Some(4242));
     }
@@ -125,10 +114,7 @@ mod tests {
 
     #[test]
     fn uptime_computation() {
-        // boot at epoch 1000, clk_tck 100, started 5000 ticks => +50s => 1050.
-        // now 1200 => age 150.
         assert_eq!(uptime_secs(1200, 1000, 100, 5000), Some(150));
-        // negative age guarded
         assert_eq!(uptime_secs(1000, 1000, 100, 500_000), None);
         assert_eq!(uptime_secs(1200, 1000, 0, 5000), None);
     }

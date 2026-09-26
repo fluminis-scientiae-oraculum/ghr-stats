@@ -1,16 +1,5 @@
-//! What the runners' hooks reported — the `job_event` log, the tailer's byte
-//! offset into it, and the conclusion that arrives later.
-//!
-//! A job row is not written on a tick. It arrives when a workflow step fires, and
-//! it can stay INCOMPLETE for as long as the job runs, which is why both writes
-//! here are merges rather than inserts: `started` and `completed` for one job key
-//! `COALESCE` into a single row, each filling only the timestamp it carries.
-//!
-//! [`apply_job_conclusions`] sits here despite being called by the reconcile
-//! thread, because the rows are the hooks' — it fills the one column the hook
-//! could not, and touches nothing the hook owns. Its read half,
-//! `reader::jobs_awaiting_conclusion`, sits in the matching child on the read
-//! side for the same reason.
+//! Hook job events, the tailer's byte offset, and the conclusion backfill. A job's
+//! `started` and `completed` arrive separately and merge into one row.
 
 use rusqlite::{Connection, params};
 
@@ -18,8 +7,7 @@ use crate::shared::error::Result;
 use crate::shared::hooks::ingest::HookEvent;
 use crate::shared::models::JobConclusion;
 
-/// Upsert `runner`'s hook job events and advance `stream`'s ingest offset, in
-/// one transaction. `started` and `completed` for one job key merge into one row.
+/// Events and `stream`'s offset commit together, so a failed batch is re-read, not lost.
 pub fn apply_hook_events(
     conn: &mut Connection,
     stream: &str,
@@ -66,9 +54,6 @@ pub fn apply_hook_events(
     Ok(())
 }
 
-/// Write resolved job conclusions back to `job_event` (the API reconcile pass).
-/// One transaction; a row that no longer matches (pruned/renamed) is a harmless
-/// no-op. Only fills the conclusion — never touches the hook-owned timing.
 pub fn apply_job_conclusions(conn: &mut Connection, updates: &[JobConclusion]) -> Result<()> {
     let tx = conn.transaction()?;
     {
@@ -210,7 +195,6 @@ mod tests {
             .unwrap();
         assert_eq!(c.as_deref(), Some("success"));
 
-        // A non-matching update is a harmless no-op — no panic, no new row.
         apply_job_conclusions(
             &mut conn,
             &[JobConclusion {

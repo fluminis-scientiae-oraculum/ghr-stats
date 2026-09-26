@@ -1,19 +1,4 @@
-//! Phase one: DETECT + PLAN, read-only by construction.
-//!
-//! Everything here answers "what is installed, and what would removing it mean"
-//! without touching a single file. That is what makes a bare `uninstall` a safe
-//! dry-run: nothing in this module can delete, so the first phase cannot.
-//!
-//! Two of these probes are deliberately CONFIG-FREE. [`super::Plan::detect`]
-//! reaches for runner roots through [`discover_runners`], which falls back to
-//! systemd auto-detection when no config loads — so hooks can still be reverted
-//! after the config is already gone. And [`config_candidates`] looks in every
-//! place `config` might have written, including the sudo-invoker's home, because
-//! an uninstall that cannot find the file it is meant to remove is not an
-//! uninstall.
-//!
-//! [`cross_scope_probe`] exists so a user-scope run does not silently ignore a
-//! system install; it reports, and never acts on, the other scope.
+//! Detect + plan. Read-only: nothing here can delete.
 
 use std::path::{Path, PathBuf};
 
@@ -24,20 +9,15 @@ use crate::shared::paths::{self, Scope};
 
 use super::{ConfigItem, Domains, Plan};
 
-/// What removing the binary means on this host. Pure result of [`binary_action`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum BinaryAction {
-    /// A `systemd install` copy at this path — safe to remove (even if running).
+    /// A `systemd install` copy; safe to remove even while running.
     Remove(PathBuf),
-    /// Running from a `cargo install` build — we don't own it; print the command.
+    /// A `cargo install` build: Cargo owns it, so print `cargo uninstall`.
     InstructCargo(PathBuf),
-    /// No installed copy found.
     NotInstalled(PathBuf),
 }
 
-/// Decide the binary action from the (would-be) installed path, whether it
-/// exists, and the running exe. Pure + tested. A `cargo install` build is never
-/// deleted by us — Cargo owns `~/.cargo/bin`; we print `cargo uninstall`.
 pub(super) fn binary_action(
     installed: &Path,
     installed_exists: bool,
@@ -54,7 +34,6 @@ pub(super) fn binary_action(
     BinaryAction::NotInstalled(installed.to_path_buf())
 }
 
-/// Whether `exe` lives in a Cargo bin dir (`…/.cargo/bin/<exe>`).
 pub(super) fn is_cargo_bin(exe: &Path) -> bool {
     exe.parent().is_some_and(|p| p.ends_with(".cargo/bin"))
 }
@@ -125,9 +104,8 @@ impl Plan {
     }
 }
 
-/// Runner install roots for hook reversal — a loadable config's roots if present,
-/// else auto-detected from systemd (same as the wizard's Step 1). Config-free so
-/// hooks can be reverted even after the config is gone.
+/// Falls back to systemd auto-detection, so hooks can be reverted after the
+/// config is gone.
 fn discover_runners(config_override: Option<&Path>) -> Vec<crate::shared::models::RunnerInfo> {
     let roots = crate::shared::config::Config::load(config_override)
         .ok()
@@ -137,9 +115,7 @@ fn discover_runners(config_override: Option<&Path>) -> Vec<crate::shared::models
     runners::discover(&roots)
 }
 
-/// Every place the config might live, so uninstall finds it wherever `config`
-/// wrote it: an explicit override, `$GHR_STATS_CONFIG`, the scope's file, and the
-/// sudo-invoker's home (where `sudo ghr-stats config` lands it).
+/// Includes the sudo-invoker's home, where `sudo ghr-stats config` writes.
 fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut push = |p: PathBuf| {
@@ -158,10 +134,7 @@ fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBu
     out
 }
 
-/// The data-domain files (database + WAL/SHM sidecars, event log, serve lock).
-/// The IPC socket is deliberately NOT here: it lives on tmpfs under the unit's
-/// RuntimeDirectory=, torn down by `systemd::uninstall` (the `service` domain),
-/// not left in `data_dir`.
+/// Not the IPC socket: it lives under RuntimeDirectory= and goes with the service.
 fn data_files(scope: Scope) -> Vec<PathBuf> {
     let db = scope.db_path();
     vec![
@@ -173,8 +146,6 @@ fn data_files(scope: Scope) -> Vec<PathBuf> {
     ]
 }
 
-/// Best-effort note when artifacts exist in the OTHER scope than the one we're
-/// acting on — so a user-scope run doesn't silently ignore a system install.
 fn cross_scope_probe(scope: Scope) -> Vec<String> {
     let other = match scope {
         Scope::User => Scope::System,

@@ -1,6 +1,4 @@
-//! The `[?]` help sheet and the informational block — read-only centered popups
-//! (see [`crate::tui::app::Overlay`]), dismissed by any key. Kept separate from
-//! the wizard: help/info carry no state and never write anything.
+//! The `[?]` help sheet and the info block: stateless popups dismissed by any key.
 
 use ratatui::Frame;
 use ratatui::style::{Color, Modifier, Style};
@@ -10,9 +8,6 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::tui::view::centered_rect;
 use crate::tui::viewmodel;
 
-/// The full keymap + action reference + how to run as root. Not per-context: a
-/// single sheet you can open anywhere to see everything the TUI does (the
-/// footer is the per-context quick-ref; this is the manual).
 pub(crate) fn draw_help(f: &mut Frame) {
     let mut lines = vec![
         section("Navigation"),
@@ -81,8 +76,6 @@ pub(crate) fn draw_help(f: &mut Frame) {
     );
 }
 
-/// A read-only info block (title + wrapped body). Used for the privilege
-/// guidance — informational, never an error.
 pub(crate) fn draw_info(f: &mut Frame, title: &str, body: &str) {
     let mut lines = vec![blank()];
     for l in body.lines() {
@@ -131,10 +124,6 @@ fn blank() -> Line<'static> {
     Line::from("")
 }
 
-/// Guidance for running the whole tool as root, spelling out the sudo
-/// `secure_path` gap that bites a user-wide install. Shown (as an informational
-/// block, never an error) when a root-only action is invoked from a non-root
-/// TUI, and in the help sheet. The gate informs; it does not fail.
 pub(crate) fn root_guidance() -> String {
     format!(
         "Installing runner hooks rewrites each runner's .env and writes shared \

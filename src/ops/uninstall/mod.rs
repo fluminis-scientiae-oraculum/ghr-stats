@@ -1,27 +1,6 @@
-//! `ghr-stats uninstall` — the honest inverse of install, safe by default.
-//!
-//! Two phases: DETECT + PLAN (read-only), then CONFIRM + APPLY. A bare
-//! `uninstall` runs only the first phase over every domain — a redacted dry-run
-//! that removes nothing. Domain flags (or `--all`) opt into removal; you confirm
-//! first unless `--yes`.
-//!
-//! Nothing sensitive is ever printed: config tokens are shown as a COUNT, never a
-//! value, and runner `.env` contents are never echoed. Hooks are reverted
-//! detect-first (see [`hooks`]) so a foreign hook is never
-//! stranded. The receipt is stdout-only — uninstall leaves nothing behind.
-//!
-//! Those two phases are the seam, and it is a SAFETY boundary rather than a
-//! layer. [`plan`] holds everything the read-only phase does; [`apply`] holds
-//! EVERY function in this module that can delete something. So "a dry-run removes
-//! nothing" is now checkable by reading one file's imports rather than by
-//! auditing every call site — `std::fs::remove_*` appears in [`apply`] and
-//! nowhere else.
-//!
-//! This file keeps [`run`], the shapes both phases speak, and the receipt.
-//! `Plan::render` takes an `execute: bool` precisely BECAUSE it serves both
-//! phases — the dry-run and the real run print the same inventory, differing only
-//! in tense — so it belongs above the cut rather than in either half. That
-//! sameness is the feature: what you were shown is what gets removed.
+//! `ghr-stats uninstall`: a read-only detect/plan phase, then confirm and apply.
+//! Every removal lives in [`apply`]. Tokens print as a count; `.env` contents never.
+//! One `render` serves both phases, so the dry-run shows exactly what execute removes.
 
 use std::path::{Path, PathBuf};
 
@@ -56,9 +35,7 @@ pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
     };
     let execute = !preview;
 
-    // Refuse a partial system-scope teardown up front: /etc, /var/lib,
-    // /usr/local/bin and the system unit all need a root process. Better to stop
-    // clean than to remove some artifacts and fail on the rest.
+    // Refuse up front rather than remove some system artifacts and fail on the rest.
     if execute && scope == Scope::System && !privileged::is_root() {
         bail!(
             "system-scope uninstall needs root — re-run `{}`",
@@ -90,7 +67,6 @@ pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// The five orthogonal removal domains.
 #[derive(Clone, Copy)]
 struct Domains {
     hooks: bool,
@@ -125,13 +101,11 @@ impl Domains {
     }
 }
 
-/// One config file slated for removal + how many tokens it holds (redacted).
 struct ConfigItem {
     path: PathBuf,
     token_count: Option<usize>,
 }
 
-/// The detected, previewable teardown — built read-only, then rendered + applied.
 struct Plan {
     scope: Scope,
     domains: Domains,
@@ -145,7 +119,6 @@ struct Plan {
 }
 
 impl Plan {
-    /// Anything actually removable (used to short-circuit an all-clean execute).
     fn has_actions(&self) -> bool {
         self.runners.iter().any(|r| {
             matches!(
@@ -264,8 +237,7 @@ fn plan_line(rp: &RunnerHookPlan) -> String {
     }
 }
 
-/// A single destructive-action confirm. Any read error (no TTY) fails safe to
-/// "no" — a headless caller must pass `--yes`.
+/// No TTY fails safe to "no": a headless caller must pass `--yes`.
 fn confirm() -> bool {
     dialoguer::Confirm::new()
         .with_prompt("Remove the above?")
@@ -297,7 +269,6 @@ mod tests {
             binary_action(installed, false, Some(cargo)),
             BinaryAction::InstructCargo(cargo.to_path_buf())
         );
-        // Not installed + not cargo ⇒ nothing to do.
         assert_eq!(
             binary_action(installed, false, Some(Path::new("/opt/ghr-stats"))),
             BinaryAction::NotInstalled(installed.to_path_buf())
@@ -316,7 +287,6 @@ mod tests {
         use crate::cli::UninstallDomain as D;
         let all = Domains::all();
         assert!(all.hooks && all.service && all.config && all.data && all.binary);
-        // `all` positional expands to every domain.
         let a = UninstallArgs {
             domains: vec![D::All],
             yes: false,
@@ -325,7 +295,6 @@ mod tests {
         };
         let d = Domains::from_args(&a);
         assert!(d.hooks && d.service && d.config && d.data && d.binary);
-        // A subset selects exactly those.
         let a = UninstallArgs {
             domains: vec![D::Config, D::Data],
             yes: false,

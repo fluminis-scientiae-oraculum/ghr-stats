@@ -1,13 +1,6 @@
-//! Bounded PAT validation: require a fine-grained
-//! `github_pat_` token, then confirm it can read the org's runners and that they
-//! match locally-discovered runners by agentId. Reject anything else with the
-//! exact minimal-permission guidance.
-//!
-//! GitHub exposes NO bearer-side introspection of a fine-grained token's
-//! *granted* permissions, so a read-validate + agentId-confirm is the achievable
-//! ceiling. We never accept classic tokens (the type whose write caps we could
-//! not have checked), which dissolves that sub-problem rather than engineering
-//! around it.
+//! PAT validation: fine-grained `github_pat_` tokens only, then read the org's runners and
+//! match agentIds. GitHub offers no introspection of a fine-grained token's grants, so this
+//! is the achievable check.
 
 use std::collections::HashSet;
 
@@ -18,7 +11,6 @@ const CLASSIC_PREFIXES: [&str; 5] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
 const GUIDANCE: &str = "use a FINE-GRAINED token (github_pat_…) with Organization → \
      Self-hosted runners: Read (+ Repository → Actions: Read for job results)";
 
-/// The result of validating a PAT for an org.
 pub(crate) enum PatCheck {
     /// Authenticated; `matched` of `local` discovered runners were confirmed.
     Valid {
@@ -29,7 +21,6 @@ pub(crate) enum PatCheck {
     Rejected(String),
 }
 
-/// Prefix gate — pure, no network. Accept only fine-grained tokens.
 pub(crate) fn prefix_check(token: &str) -> Result<(), String> {
     let t = token.trim();
     if t.starts_with(FINE_PREFIX) {
@@ -41,8 +32,6 @@ pub(crate) fn prefix_check(token: &str) -> Result<(), String> {
     Err(format!("unrecognized token — {GUIDANCE}"))
 }
 
-/// Full validation: prefix gate, then read the org's runners and agentId-confirm
-/// against the locally-discovered runners.
 pub(crate) fn validate(token: &str, org: &str, local_ids: &HashSet<i64>) -> PatCheck {
     if let Err(g) = prefix_check(token) {
         return PatCheck::Rejected(g);

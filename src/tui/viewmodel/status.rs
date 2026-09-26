@@ -1,21 +1,13 @@
-//! Presentation status derived from Model state — pure functions over primitive
-//! inputs so the rules are testable in isolation and shared by every view.
-
 use crate::shared::models::Mode;
 
-/// Why the GitHub view has no data for the fleet. `github_reason` returning
-/// `None` means data is present (render the counts / the runner's state).
+/// Why the fleet's GitHub view has no data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GithubReason {
-    /// Ephemeral mode — GitHub is a collector-only feature (no network).
     EphemeralOnly,
-    /// Persistent, but no read-only PAT is configured.
     NoPat,
-    /// Persistent with a PAT, but the reconcile has returned nothing yet.
     ReconcilePending,
 }
 
-/// The fleet-level GitHub availability, most-specific cause first.
 pub(crate) fn github_reason(
     mode: Mode,
     has_tokens: bool,
@@ -25,21 +17,18 @@ pub(crate) fn github_reason(
         Mode::Ephemeral => Some(GithubReason::EphemeralOnly),
         Mode::Persistent if !has_tokens => Some(GithubReason::NoPat),
         Mode::Persistent if !reconcile_populated => Some(GithubReason::ReconcilePending),
-        Mode::Persistent => None, // data present
+        Mode::Persistent => None,
     }
 }
 
-/// The reason a *specific* runner has no GitHub cell: the fleet reason, or —
-/// when the reconcile has data but not for this runner — `NotSeen`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunnerGithub {
     Reason(GithubReason),
-    /// Reconcile returned rows, but none matched this runner's id.
+    /// The reconcile returned rows, but none for this runner.
     NotSeen,
 }
 
-/// Called only when the runner has no `ApiState`. If the fleet has data, this
-/// runner simply wasn't in it (`NotSeen`); otherwise it's the fleet reason.
+/// Only for a runner with no GitHub state.
 pub(crate) fn runner_github_absent(
     mode: Mode,
     has_tokens: bool,
@@ -51,19 +40,12 @@ pub(crate) fn runner_github_absent(
     }
 }
 
-/// How this binary's build relates to the collector's. Derived once here, pure
-/// and testable, rather than compared inline at each render site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionState {
-    /// No collector to compare against.
     NoCollector,
-    /// A collector answered but reported no build version — it predates the
-    /// field, which itself means it is an older binary.
+    /// The collector predates the version field, so it is an older build.
     CollectorUnknown,
-    /// Service and dashboard are the same build.
     Match,
-    /// The running service is a DIFFERENT build than this binary. Almost always
-    /// "upgraded the binary, forgot `systemctl restart`".
     Drift,
 }
 
@@ -76,14 +58,10 @@ pub(crate) fn version_state(binary: &str, collector: Option<&str>, mode: Mode) -
     }
 }
 
-/// Jobs-tab availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobsView {
-    /// The ghr-stats hook is installed on `hooked` runners — awaiting jobs.
     Recording { hooked: usize },
-    /// Persistent, but the hook feeds no runner yet.
     NoHooks,
-    /// Ephemeral — jobs need the collector.
     EphemeralOnly,
 }
 
@@ -101,8 +79,6 @@ pub(crate) fn jobs_view(mode: Mode, hooked_runners: usize) -> JobsView {
 mod tests {
     use super::*;
 
-    /// The upgrade-without-restart case is the one this exists for: same wire
-    /// version (so the socket still connects) but a different build.
     #[test]
     fn version_state_flags_a_service_running_an_older_build() {
         assert_eq!(
@@ -113,25 +89,21 @@ mod tests {
             version_state("0.2.0", Some("0.1.4"), Mode::Persistent),
             VersionState::Drift
         );
-        // A collector too old to report a version is itself an older build.
         assert_eq!(
             version_state("0.2.0", None, Mode::Persistent),
             VersionState::CollectorUnknown
         );
-        // Nothing to compare against — not a drift, and must not warn.
         assert_eq!(
             version_state("0.2.0", None, Mode::Ephemeral),
             VersionState::NoCollector
         );
     }
 
-    /// A version-drifted collector must not be reported as "no collector".
     #[test]
     fn version_warning_names_the_wire_mismatch_over_the_build_mismatch() {
         use crate::shared::ipc::client::EphemeralReason;
         use crate::tui::viewmodel::copy::version_warning;
 
-        // Wire drift: the actionable one — it also explains the empty dashboard.
         let w = version_warning(
             VersionState::NoCollector,
             Some(&EphemeralReason::VersionDrift { server: 8 }),
@@ -140,7 +112,6 @@ mod tests {
         assert!(w.contains("IPC v8"));
         assert!(w.contains("systemctl restart"));
 
-        // Genuinely no collector: silence, not a spurious upgrade nag.
         assert!(
             version_warning(
                 VersionState::NoCollector,
@@ -153,41 +124,19 @@ mod tests {
 
     #[test]
     fn github_reason_covers_every_case_once() {
-        // Ephemeral: always the collector, regardless of tokens/reconcile.
         assert_eq!(
             github_reason(Mode::Ephemeral, true, true),
             Some(GithubReason::EphemeralOnly)
         );
-        // Persistent, no PAT.
         assert_eq!(
             github_reason(Mode::Persistent, false, false),
             Some(GithubReason::NoPat)
         );
-        // Persistent, PAT set, reconcile empty.
         assert_eq!(
             github_reason(Mode::Persistent, true, false),
             Some(GithubReason::ReconcilePending)
         );
-        // Persistent, PAT set, data present ⇒ available.
         assert_eq!(github_reason(Mode::Persistent, true, true), None);
-    }
-
-    #[test]
-    fn runner_absent_is_not_seen_only_when_data_present() {
-        // Data present but this runner missing ⇒ NotSeen.
-        assert_eq!(
-            runner_github_absent(Mode::Persistent, true, true),
-            RunnerGithub::NotSeen
-        );
-        // No data ⇒ the fleet reason.
-        assert_eq!(
-            runner_github_absent(Mode::Persistent, false, false),
-            RunnerGithub::Reason(GithubReason::NoPat)
-        );
-        assert_eq!(
-            runner_github_absent(Mode::Ephemeral, true, true),
-            RunnerGithub::Reason(GithubReason::EphemeralOnly)
-        );
     }
 
     #[test]

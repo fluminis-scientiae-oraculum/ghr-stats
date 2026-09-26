@@ -1,15 +1,5 @@
-//! Actions carried through the typestate (`screen`).
-//!
-//! Each action owns the data it will act on — an *owned snapshot*, not a borrow
-//! of `App` (the 2 s refresh reshuffles `app.runners` while a confirm popup is
-//! open, so a borrow would be a correctness bug). `execute` runs while the TUI
-//! is suspended; privileged actions shell out via [`privileged::run`], which
-//! escalates per command (sudo when not root, prompting on /dev/tty). These
-//! actions need no root *process* — see the two-tier model in `privileged`.
-//!
-//! Each privileged action builds its [`PrivilegedCall`] once and feeds it to
-//! BOTH `prompt` and `execute`, so a confirm popup always names the command that
-//! will actually run.
+//! Actions own a snapshot of their data, not a borrow of `App`: a refresh
+//! reshuffles `app.runners` while the confirm popup is open.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -18,22 +8,18 @@ use crate::shared::collectors::runners::{self, RunnerUnit};
 use crate::shared::privileged::{self, Outcome, PrivilegedCall, RunAs, UnitVerb};
 use crate::tui::input::screen::Tty;
 
-/// What the confirm popup shows for a pending action.
 pub(crate) struct ConfirmPrompt {
     pub title: String,
     pub body: String,
-    /// A destructive action — rendered in red.
     pub danger: bool,
 }
 
-/// The result of running an action while suspended.
 pub(crate) enum ActionOutcome {
     Ok(String),
     Failed(String),
 }
 
 impl ActionOutcome {
-    /// A short line for the status bar.
     pub(crate) fn message(&self) -> String {
         match self {
             ActionOutcome::Ok(m) => format!("✓ {m}"),
@@ -42,7 +28,7 @@ impl ActionOutcome {
     }
 }
 
-/// Bounce a runner's service to reclaim the .NET-runner GC RAM.
+/// Restarting reclaims the .NET runner's GC RAM.
 pub(crate) struct RestartRunner {
     pub unit: RunnerUnit,
     pub agent_id: i64,
@@ -51,8 +37,7 @@ pub(crate) struct RestartRunner {
 }
 
 impl RestartRunner {
-    /// The one command this action runs. Both `prompt` and `execute` go through
-    /// it, so the popup cannot advertise a command other than the one that runs.
+    /// Shared by `prompt` and `execute`, so the popup names the command that runs.
     fn call(&self) -> PrivilegedCall {
         PrivilegedCall::Systemctl {
             verb: UnitVerb::Restart,
@@ -61,8 +46,7 @@ impl RestartRunner {
     }
 }
 
-/// Stop, empty the runner's own `_temp` and `_diag` as the runner user, start.
-/// Idle only, re-checked just before stopping.
+/// Stop, empty `_temp` and `_diag` as the runner user, start. Idle only.
 pub(crate) struct RecycleRunner {
     pub unit: RunnerUnit,
     pub agent_id: i64,
@@ -71,17 +55,13 @@ pub(crate) struct RecycleRunner {
 }
 
 impl RecycleRunner {
-    /// The two dirs recycle reclaims, both scoped to THIS runner's install dir:
-    /// `_temp` under the work folder, and `_diag` at the install ROOT (the runner
-    /// writes its diagnostic logs to `<install>/_diag`, a sibling of the work
-    /// folder — NOT inside it). Never global `/tmp`, never docker.
+    /// The runner writes `_diag` at the install root, beside the work folder, not inside it.
     fn scoped_paths(&self) -> (PathBuf, PathBuf) {
         let temp = self.install_dir.join(&self.work_folder).join("_temp");
         let diag = self.install_dir.join("_diag");
         (temp, diag)
     }
 
-    /// stop → purge → start; the first failing step ends it.
     fn recycle(&self) -> Result<(), String> {
         if !runners::is_idle_now(&self.install_dir) {
             return Err("runner is no longer idle; not recycled".to_string());
@@ -164,11 +144,7 @@ impl RecycleRunner {
     }
 }
 
-/// Install / repair the runner job hooks (Config `[h]`). Runs the interactive
-/// detect → install/chain/instruct flow on the real TTY while suspended, reusing
-/// the CLI wizard's logic (one implementation). Root is checked BEFORE arming —
-/// a non-root TUI gets an informational block instead of this action — and again
-/// inside the flow.
+/// The CLI's interactive hook detect/install flow, run on the real TTY.
 pub(crate) struct InstallHooks {
     pub roots: Vec<PathBuf>,
 }
@@ -192,7 +168,6 @@ impl InstallHooks {
     }
 }
 
-/// Open the config file in `$EDITOR` (Config `[o]`), on the real TTY.
 pub(crate) struct OpenConfig {
     pub path: PathBuf,
 }
@@ -220,8 +195,7 @@ impl OpenConfig {
     }
 }
 
-/// The actions that suspend the TUI to run on the real terminal. Adding an org
-/// and toggling metrics are not here: they run without leaving the dashboard.
+/// Actions that suspend the TUI to run on the real terminal.
 pub(crate) enum ActionKind {
     Restart(RestartRunner),
     Recycle(RecycleRunner),
@@ -263,12 +237,8 @@ mod tests {
             work_folder: "_work".to_string(),
         };
         let (temp, diag) = r.scoped_paths();
-        // `_temp` is under the work folder; `_diag` is at the install ROOT — a
-        // live recycle on the fleet proved the runner writes <install>/_diag,
-        // not <install>/_work/_diag (the original code trimmed the wrong path).
         assert_eq!(temp, PathBuf::from("/srv/runners/r0/_work/_temp"));
         assert_eq!(diag, PathBuf::from("/srv/runners/r0/_diag"));
-        // Both stay under the install dir — never global /tmp, never docker.
         assert!(temp.starts_with(&r.install_dir));
         assert!(diag.starts_with(&r.install_dir));
     }

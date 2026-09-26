@@ -2,26 +2,9 @@ use rusqlite::Connection;
 
 use crate::shared::error::Result;
 
-/// Ordered DDL migrations. Append-only: each new entry bumps the schema by one
-/// and is tracked via SQLite's `PRAGMA user_version`.
+/// Append-only: entry N is schema vN, recorded in `PRAGMA user_version`.
 const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
-/// Apply any migrations newer than the DB's recorded `user_version`.
-///
-/// Refuses a database written by a NEWER build. Migrations are append-only, so
-/// this build knows every schema up to its own and nothing about the ones after
-/// it: it cannot know which columns a later migration made `NOT NULL`, which
-/// table it re-keyed, or what a row it writes would mean to the build that owns
-/// the file. Proceeding is a silent write against a contract we do not have —
-/// and the way that surfaces is the collector failing an INSERT in its sampling
-/// loop hours later, which reads as a runtime bug rather than as the downgrade
-/// it is.
-///
-/// This makes rollback *say so* instead of half-working: to run an older binary,
-/// restore a database it wrote. The guard only binds builds that carry it — an
-/// already-installed older binary has the permissive code and is unaffected — so
-/// it constrains downgrades from here forward, not the rollback path already on
-/// disk.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let target = MIGRATIONS.len() as i64;
@@ -103,7 +86,6 @@ CREATE TABLE ingest_offset (
 );
 "#;
 
-/// v2 — GitHub API reconcile: runner online/busy as GitHub sees it.
 const V2: &str = r#"
 CREATE TABLE api_runner_sample (
     ts       INTEGER NOT NULL,
@@ -117,9 +99,7 @@ CREATE INDEX idx_api_runner_sample_ts ON api_runner_sample(ts);
 CREATE INDEX idx_api_runner_sample_agent ON api_runner_sample(agent_id);
 "#;
 
-/// v3 — per-runner current liveness with the timestamp of the last *change*
-/// (the edge). One row per runner; lets the TUI show "Idle 2h" / "Active 5m"
-/// and survives TUI/daemon restarts (the edge isn't kept only in memory).
+/// `since_ts` is the last liveness change.
 const V3: &str = r#"
 CREATE TABLE runner_state (
     agent_id     INTEGER PRIMARY KEY,
@@ -129,12 +109,8 @@ CREATE TABLE runner_state (
 );
 "#;
 
-/// v4 — key per-runner identity by install `dir`, not `agentId`. GitHub's
-/// `agentId` is unique only *within* an org, so two runners in different orgs
-/// can share one; keying local state by it conflated them (cross-contaminated
-/// CPU% and a shared liveness edge). Add `dir` to the sample and re-key
-/// `runner_state`. Dropping the old `runner_state` rows is safe — they are
-/// transient liveness edges that re-populate on the next sampling tick.
+/// Re-keys local runner state by install `dir`: GitHub's `agentId` is unique only within an org.
+/// Dropping `runner_state` is safe; its edges re-populate on the next tick.
 const V4: &str = r#"
 ALTER TABLE runner_sample ADD COLUMN dir TEXT NOT NULL DEFAULT '';
 DROP TABLE runner_state;
@@ -146,30 +122,13 @@ CREATE TABLE runner_state (
 );
 "#;
 
-/// v5 — `mem_bytes` now holds the working set (anon+shmem); this records the raw
-/// cache-inclusive `memory.current` alongside it so the
-/// `ghr_runner_mem_current_bytes` gauge keeps cache-vs-working-set pressure
-/// observable. Pre-existing rows backfill `NULL` (unknown), which the exporter
-/// simply omits.
+/// `mem_bytes` holds the working set (anon+shmem); `mem_current_bytes` is the cache-inclusive
+/// `memory.current`, NULL on older rows.
 const V5: &str = r#"
 ALTER TABLE runner_sample ADD COLUMN mem_current_bytes INTEGER;
 "#;
 
-/// v6 — make the GitHub view *answerable*, not merely recorded.
-///
-/// `api_runner_sample` already held what GitHub reported at each tick, but three
-/// questions an operator asks during an outage had no answer: how long has this
-/// runner been offline to GitHub (no edge ⇒ no duration, and the instantaneous
-/// bit flaps too much to alert on), did we actually reach GitHub this tick or are
-/// we serving a stale read (no reconcile health ⇒ a dead reconcile presents as a
-/// calm fleet), and what happened over the last hour (no per-tick outcome).
-///
-/// `api_runner_state` mirrors `runner_state` on the GitHub side, keyed by
-/// `(org, agent_id)` — the API join key. Note the deliberate asymmetry with v4,
-/// which re-keyed the LOCAL state to `dir`: `agentId` is unique only *within* an
-/// org, so it is a valid key here precisely because `org` is part of it.
-/// `since_ts` stays monotonic across a flap, which is what makes a debounced
-/// ">15m offline" alert possible at all.
+/// GitHub-side `runner_state`, keyed `(org, agent_id)` since agentId is unique only within an org.
 const V6: &str = r#"
 CREATE TABLE api_runner_state (
     org          TEXT    NOT NULL,
@@ -208,10 +167,6 @@ CREATE INDEX idx_api_runner_sample_org_agent_ts
 mod tests {
     use super::*;
 
-    /// A database from the future is refused, not silently written to. The
-    /// failure it prevents is not at open time — it is an INSERT failing inside
-    /// the collector's sampling loop hours later, against a column a migration
-    /// this build has never seen made `NOT NULL`.
     #[test]
     fn a_database_written_by_a_newer_build_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -221,8 +176,6 @@ mod tests {
 
         let e = migrate(&mut conn).unwrap_err().to_string();
         assert!(e.contains("written by a NEWER ghr-stats"), "{e}");
-        // The message must name both versions: "which binary do I need" is the
-        // only question the operator has at that moment.
         assert!(e.contains(&format!("v{}", MIGRATIONS.len() + 1)), "{e}");
         assert!(e.contains(&format!("v{}", MIGRATIONS.len())), "{e}");
     }
@@ -231,7 +184,6 @@ mod tests {
     fn migrate_creates_tables_and_is_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
-        // Running again must be a no-op, not an error (idempotency).
         migrate(&mut conn).unwrap();
 
         let version: i64 = conn

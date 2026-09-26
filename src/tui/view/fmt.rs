@@ -1,18 +1,4 @@
-//! Value to display token — the vocabulary every view borrows.
-//!
-//! Separated from the drawing because none of it touches a `Frame`. Each function
-//! takes a domain value and returns what the operator reads, which makes the whole
-//! module unit-testable without a terminal; the five tests below are the payoff.
-//!
-//! Two conventions are load-bearing rather than cosmetic. The `Option`-taking
-//! formatters render absence as a dash rather than as a zero, because "we have no
-//! reading" and "the reading is zero" are different facts and a dashboard that
-//! conflates them is exactly the failure this release exists to fix.
-//! [`ellipsize_middle`] trims the MIDDLE because runner names share long prefixes
-//! — cutting the tail would render several distinct runners identically.
-//!
-//! [`liveness_label`] pairs the word with its colour in one place, so the two can
-//! never disagree across views.
+//! Value → display token. Absence renders as `—`, never `0`: no reading is not a zero reading.
 
 use crate::shared::hooks::install::HookStatus;
 pub(crate) use crate::shared::util::fmt_bytes;
@@ -21,7 +7,7 @@ use ratatui::style::Color;
 use crate::shared::models::Liveness;
 use crate::shared::util::now_epoch;
 
-/// Middle-ellipsize a string to at most `max` display chars ("runner-…er-01").
+/// Runner names share long prefixes, so trimming the tail would make them identical.
 pub(crate) fn ellipsize_middle(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -61,7 +47,6 @@ pub(crate) fn fmt_uptime(secs: Option<u64>) -> String {
     }
 }
 
-/// Relative age of a timestamp ("3m ago"), or "—" if absent.
 pub(crate) fn fmt_ago(ts: Option<i64>) -> String {
     let Some(ts) = ts else {
         return "—".to_string();
@@ -78,7 +63,6 @@ pub(crate) fn fmt_ago(ts: Option<i64>) -> String {
     }
 }
 
-/// Short duration ("45s", "2m30s").
 pub(crate) fn fmt_dur(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
@@ -87,7 +71,6 @@ pub(crate) fn fmt_dur(secs: u64) -> String {
     }
 }
 
-/// Display label + colour for a liveness state.
 pub(crate) fn liveness_label(l: Liveness) -> (&'static str, Color) {
     match l {
         Liveness::Busy => ("● busy", Color::Green),
@@ -96,10 +79,7 @@ pub(crate) fn liveness_label(l: Liveness) -> (&'static str, Color) {
     }
 }
 
-/// A timestamp's age relative to `now`, as a short axis label: seconds under a
-/// minute, whole minutes under an hour, else `h`+`m`. "now" at the right edge.
-/// Distinct from [`fmt_dur`] (m+s precision), since an axis label wants round
-/// granularity at the scale it spans, not down-to-the-second noise on a 5h window.
+/// Axis labels want round granularity, unlike [`fmt_dur`]'s m+s precision.
 pub(super) fn rel_label(ts: i64, now: i64) -> String {
     let age = (now - ts).max(0) as u64;
     match age {
@@ -110,7 +90,6 @@ pub(super) fn rel_label(ts: i64, now: i64) -> String {
     }
 }
 
-/// ✓ / ✗ / ? for a runner's hook wiring.
 pub(crate) fn hook_glyph(h: HookStatus) -> &'static str {
     match h {
         HookStatus::Ours => "✓",
@@ -153,7 +132,6 @@ mod tests {
         assert_eq!(rel_label(now - 45, now), "-45s");
         assert_eq!(rel_label(now - 90, now), "-1m");
         assert_eq!(rel_label(now - (5 * 3600 + 9 * 60), now), "-5h9m");
-        // future timestamps (clock skew) clamp to "now", never a positive age
         assert_eq!(rel_label(now + 5, now), "now");
     }
 

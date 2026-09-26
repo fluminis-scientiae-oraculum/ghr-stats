@@ -1,13 +1,4 @@
-//! The answer out: a `Timeline` as plain text.
-//!
-//! Chronological, one line per change, no ANSI — so a terminal reader and `grep`
-//! see the same thing, and an agent that shells out gets the same bytes a human
-//! does.
-//!
-//! [`section`] exists because "500" and "500, and there are more" are different
-//! answers and must not print the same: a truncated stream says so. The three
-//! edge streams are rendered separately for the reason the whole verb exists —
-//! their disagreement is the finding.
+//! A `Timeline` as plain text: chronological, one line per change, no ANSI.
 
 use crate::shared::models::GhView;
 use crate::shared::models::timeline::{
@@ -15,8 +6,6 @@ use crate::shared::models::timeline::{
 };
 use crate::shared::util::BUILD_VERSION;
 
-/// The human rendering. Plain text, chronological, one line per change — so a
-/// terminal reader and `grep` see the same thing.
 pub(super) fn human(t: &Timeline, since: &str) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -26,10 +15,8 @@ pub(super) fn human(t: &Timeline, since: &str) -> String {
         t.window.since, t.generated_at
     );
     if let Some(first) = t.window.truncated_at {
-        // States what is known — where the data starts — and NOT why, which the
-        // collector cannot tell: a pruned history and a young one look identical
-        // from here, and naming a cause we did not observe is the habit this
-        // whole verb exists to break.
+        // Where the data starts, not why: a pruned history and a young one look
+        // identical from here.
         let _ = writeln!(
             out,
             "! window truncated: no data before {} — the window reaches past what is held, \
@@ -46,8 +33,7 @@ pub(super) fn human(t: &Timeline, since: &str) -> String {
         let _ = writeln!(out, "  (nothing changed in this window)");
     }
 
-    // Its own section, not merged above: job churn would otherwise bury the
-    // handful of state changes that explain it.
+    // Own section: job churn would bury the state changes that explain it.
     if !t.jobs.items.is_empty() || t.jobs.limited {
         let _ = writeln!(out, "{}", section("job event", &t.jobs));
         for j in &t.jobs.items {
@@ -80,10 +66,7 @@ pub(super) fn human(t: &Timeline, since: &str) -> String {
     out
 }
 
-/// A section header that states the count AND whether it is the whole count —
-/// "500" and "500, and there are more" are different answers and must not print
-/// the same. Takes the singular noun and pluralises it (both nouns here are
-/// regular), so a one-row window does not read as machine output.
+/// States whether the count is the whole count.
 fn section<T>(singular: &str, b: &Bounded<T>) -> String {
     let n = b.items.len();
     let noun = match n {
@@ -97,9 +80,7 @@ fn section<T>(singular: &str, b: &Bounded<T>) -> String {
     }
 }
 
-/// Which end of a job, and — for a completion — what came of it. An unresolved
-/// conclusion prints as `?` rather than as a guess: the hook knows a job ended,
-/// and only the reconcile learns whether it passed.
+/// An unresolved conclusion prints `?`: only the reconcile learns whether a job passed.
 fn job_word(edge: &JobEdge) -> String {
     match edge {
         JobEdge::Started => "job started".to_string(),
@@ -110,8 +91,6 @@ fn job_word(edge: &JobEdge) -> String {
     }
 }
 
-/// `repo/job`, with either half omitted when the hook did not record it —
-/// printing a bare `/` for a job whose repo is unknown reads like a path.
 fn job_name(j: &JobTransition) -> String {
     match (j.repo.as_str(), j.job.as_str()) {
         ("", "") => "(unnamed)".to_string(),
@@ -121,9 +100,6 @@ fn job_name(j: &JobTransition) -> String {
     }
 }
 
-/// One transition, rendered. Both ends are shown even for the boolean edges,
-/// where the previous value is derived rather than stored — a reader should not
-/// have to know which fields the wire chose to carry.
 fn edge_line(edge: &Edge) -> String {
     match edge {
         Edge::Liveness { runner, from, to } => {
@@ -158,9 +134,6 @@ fn online_word(online: bool) -> &'static str {
     if online { "online" } else { "offline" }
 }
 
-/// GitHub's view at a sample, with its freshness attached. `stale` and `unknown`
-/// are rendered distinctly for the same reason the type keeps them apart: one
-/// means the answer aged out, the other that there was never an answer.
 fn gh_word(view: GhView) -> String {
     match view {
         GhView::Fresh { state, age_s } => format!("{} ({age_s}s)", online_word(state.online)),
@@ -207,8 +180,6 @@ mod tests {
         }
     }
 
-    /// The rendering must show both ends of a GitHub edge even though the wire
-    /// carries only one — otherwise the reader has to know the encoding.
     #[test]
     fn a_github_edge_renders_both_ends() {
         let t = timeline(
@@ -227,13 +198,9 @@ mod tests {
             text.contains("runner-07  github: online → offline"),
             "{text}"
         );
-        // Singular: a one-row window must not read as machine output.
         assert!(text.contains("1 transition\n"), "{text}");
     }
 
-    /// A reconcile failure must name the cause: "the org stopped answering" and
-    /// "the org stopped answering because the PAT is dead" lead to different
-    /// next actions.
     #[test]
     fn a_reconcile_failure_renders_its_cause() {
         let t = timeline(
@@ -254,16 +221,11 @@ mod tests {
         );
     }
 
-    /// An empty window must say it is empty. A bare header over no rows reads as
-    /// a rendering bug, and "nothing changed" is a real and useful answer.
     #[test]
     fn an_empty_window_says_nothing_changed() {
         assert!(human(&timeline(Vec::new(), false), "6h").contains("(nothing changed"));
     }
 
-    /// A truncated section must be visibly truncated. This is the whole reason
-    /// `Bounded` carries the flag: 500 rows and "500 rows, and there are more"
-    /// are different answers.
     #[test]
     fn a_limited_section_is_marked() {
         let t = timeline(
@@ -283,7 +245,6 @@ mod tests {
         assert!(text.contains("r  liveness: idle → busy"), "{text}");
     }
 
-    /// A pruned window must not read as a quiet one.
     #[test]
     fn a_truncated_window_is_called_out() {
         let mut t = timeline(Vec::new(), false);
@@ -291,8 +252,6 @@ mod tests {
         assert!(human(&t, "6h").contains("window truncated"));
     }
 
-    /// Stale and unknown must render differently — the type keeps them apart
-    /// precisely because the operator response differs.
     #[test]
     fn samples_distinguish_stale_from_unknown() {
         let mut t = timeline(Vec::new(), false);

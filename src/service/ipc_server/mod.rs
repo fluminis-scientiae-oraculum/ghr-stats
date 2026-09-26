@@ -1,27 +1,6 @@
-//! The collector half of the IPC: a `UnixListener` on the scope's socket path,
-//! answering read-only queries from a WAL reader connection. Modeled on
-//! `metrics::pull::spawn` — a named thread, a non-fatal bind, and a
-//! `term`-polled (non-blocking) accept loop so a SIGTERM exits promptly.
-//!
-//! This file owns a connection's LIFETIME — bind, accept, admit, serve, drop —
-//! and nothing about what a request means. The two things it hands off are the
-//! two questions it deliberately does not answer:
-//!
-//! - [`auth`] — *who is on the other end*, from the kernel rather than the wire.
-//! - [`dispatch`] — *what the request means*, from the store and the config file.
-//!
-//! The split is not cosmetic: the three have never changed together. Fixing the
-//! lockout below touched only this file, adding `Query::Retention` touched only
-//! [`dispatch`], and the mutation authz model touched only [`auth`]. Their import
-//! lists say the same thing — `nix`/`uzers` appear in one, `rusqlite`/`reader` in
-//! another, `UnixListener`/`thread` in the third, and `Request`/`Response` in all
-//! three because passing those across is the whole interface.
-//!
-//! Each accepted connection is served on **its own thread**, with its own reader
-//! connection. Serving inline instead is what made a live dashboard lock every
-//! other client out: `serve_conn` loops until its read times out, and a TUI that
-//! refreshes inside `CONN_TIMEOUT` — which is the healthy case, by design —
-//! never times out, so `accept` was never reached again.
+//! Collector side of the IPC: read-only queries and authorized config mutations on the
+//! scope's socket. One thread and one WAL reader per connection: a TUI holds its connection
+//! open, so serving inline would starve `accept`.
 
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -45,27 +24,17 @@ mod dispatch;
 use auth::peer_auth;
 use dispatch::handle;
 
-/// How often the non-blocking accept loop wakes to re-check the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
-/// Per-connection I/O timeout. Bounds how long a *silent* client holds a slot;
-/// it is NOT what keeps the accept loop free — a healthy client never reaches it.
+/// Drops a silent client; a busy one never reaches it.
 const CONN_TIMEOUT: Duration = Duration::from_secs(5);
-/// How many connections may be served at once.
-///
-/// The socket is `0666`, so this doubles as the bound on what a local user can
-/// pin. Past it a connection is accepted and dropped immediately: refusing
-/// visibly beats queueing behind an accept loop that will not come back, which
-/// is the failure this cap replaces.
+/// The socket is `0666`, so this also bounds what any local user can pin. Excess
+/// connections are dropped, not queued.
 const MAX_CONNS: usize = 8;
 
-/// The socket this process serves: its own scope's, the one `systemd install`
-/// placed the unit under.
 pub fn socket_path() -> PathBuf {
     Scope::detect().socket_path()
 }
 
-/// Spawn the IPC server thread on an already-bound `listener`. Holds the
-/// [`SharedConfig`] so an authorized mutation reloads it in-process.
 pub fn spawn(
     listener: UnixListener,
     shared: &SharedConfig,
@@ -98,28 +67,19 @@ fn run(
     let live = Arc::new(AtomicUsize::new(0));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     while !term.load(Ordering::SeqCst) {
-        // Reap finished workers so the vector stays bounded by MAX_CONNS rather
-        // than by the number of clients this collector has ever served.
         workers.retain(|w| !w.is_finished());
         match listener.accept() {
             Ok((stream, _addr)) => {
-                // A thread per connection, NOT inline. `serve_conn` runs until
-                // its client hangs up, and a dashboard holds its connection open
-                // for as long as it is on screen — inline, that one client owned
-                // the accept loop and every other client queued behind it
-                // forever.
-                // Check-then-increment is sound without a CAS because this is the
-                // only thread that ever increments; workers only ever decrement.
+                // Only this thread increments, so check-then-increment needs no CAS.
                 if live.load(Ordering::SeqCst) >= MAX_CONNS {
                     tracing::warn!(max = MAX_CONNS, "ipc: at capacity, dropping connection");
-                    continue; // `stream` closes here — the client sees a clean hang-up
+                    continue;
                 }
                 live.fetch_add(1, Ordering::SeqCst);
                 let slot = Slot(Arc::clone(&live));
                 match spawn_conn(stream, db, shared, term, config_path, slot) {
                     Ok(w) => workers.push(w),
-                    // The closure — and with it `slot` — is dropped here, so a
-                    // failed spawn releases its slot without a manual decrement.
+                    // A failed spawn drops `slot` with the closure; no manual decrement.
                     Err(e) => tracing::warn!(error = %e, "ipc: spawn connection thread"),
                 }
             }
@@ -130,22 +90,16 @@ fn run(
             }
         }
     }
-    // `term` is set, and every worker polls it between requests, so each returns
-    // within one read timeout at worst. Join before removing the socket so no
-    // worker is still answering on a path we have already unlinked.
+    // Join before unlinking so no worker still answers on a removed path.
     for w in workers {
         let _ = w.join();
     }
-    // Best-effort: systemd's RuntimeDirectory= also removes this on stop.
+    // systemd's RuntimeDirectory= also removes this on stop.
     let _ = std::fs::remove_file(sock);
     tracing::debug!("ipc stopped");
 }
 
-/// Holds one of the [`MAX_CONNS`] connection slots, releasing it on drop.
-///
-/// A slot released by an explicit decrement at the end of the worker would leak
-/// on any early return or panic, and a leaked slot is permanent — it shrinks the
-/// server's capacity for the life of the process. Drop cannot be skipped.
+/// One of the [`MAX_CONNS`] slots, released on drop so an early return or panic cannot leak it.
 struct Slot(Arc<AtomicUsize>);
 
 impl Drop for Slot {
@@ -154,11 +108,7 @@ impl Drop for Slot {
     }
 }
 
-/// Serve one connection on its own thread, with its own reader connection.
-///
-/// Per-thread rather than shared because `rusqlite::Connection` is not `Sync`,
-/// and opening a WAL reader is cheap — the alternative, one connection behind a
-/// mutex, would re-serialize exactly what this split exists to unserialize.
+/// `rusqlite::Connection` is not `Sync`; one shared behind a mutex would re-serialize clients.
 fn spawn_conn(
     stream: UnixStream,
     db: &Path,
@@ -174,7 +124,7 @@ fn spawn_conn(
     thread::Builder::new()
         .name("ipc-conn".into())
         .spawn(move || {
-            let _slot = slot; // released when this thread ends, however it ends
+            let _slot = slot;
             let conn = store::open_reader(&db);
             if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path, &shared, &term) {
                 tracing::debug!(error = %e, "ipc: connection ended");
@@ -182,9 +132,9 @@ fn spawn_conn(
         })
 }
 
-/// Bind `sock`, replacing a stale socket but refusing one a live collector still
-/// answers on (the serve lock is per database, the socket per scope). Widened to
-/// 0666 so a non-root TUI can connect; the parent dir is root-only-writable.
+/// Replaces a stale socket, refuses a live one (the serve lock is per database, the socket
+/// per scope). Mode 0666 so a non-root TUI can connect; the parent dir is
+/// root-only-writable.
 pub fn bind(sock: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
@@ -203,14 +153,6 @@ pub fn bind(sock: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serve requests on one connection until the client hangs up (EOF), the read
-/// times out (a stalled/idle client is dropped rather than held forever), or
-/// shutdown is signalled. Polls `term` between requests so a pending SIGTERM
-/// exits promptly instead of blocking on a connected client; the live TUI
-/// refreshes well inside `CONN_TIMEOUT`, so it is never dropped mid-use, and it
-/// reconnects on the next refresh if it ever is. A successful mutation triggers
-/// an in-process config reload so a change (e.g. a newly added PAT) reaches the
-/// sampler/reconcile threads without a restart.
 fn serve_conn(
     mut stream: UnixStream,
     conn: Option<&Connection>,
@@ -220,19 +162,14 @@ fn serve_conn(
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONN_TIMEOUT))?;
     stream.set_write_timeout(Some(CONN_TIMEOUT))?;
-    // Resolve the peer's identity once, from the kernel — used to gate mutations.
     let auth = peer_auth(&stream);
     loop {
         if term.load(Ordering::SeqCst) {
-            return Ok(()); // shutdown — release the connection so `serve` can exit
+            return Ok(());
         }
         let req: Request = match ipc::read_frame(&mut stream) {
             Ok(r) => r,
-            // Clean client hang-up between requests.
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            // Read timed out: the client sent no complete frame within the window.
-            // Drop it (freeing the accept loop) rather than hold the sole
-            // connection open indefinitely — a would-be local DoS.
             Err(e)
                 if matches!(
                     e.kind(),
@@ -243,13 +180,9 @@ fn serve_conn(
             }
             Err(e) => return Err(e),
         };
-        // Snapshot per request, so a config mutation that widens the freshness
-        // window takes effect immediately — same live-reload property the
-        // sampler threads have.
+        // Per request, so a mutation that widens the freshness window applies immediately.
         let max_age = shared.snapshot().intervals.api_max_age();
         let resp = handle(&req, conn, auth, config_path, max_age);
-        // A persisted mutation just changed /etc — reload so the running workers
-        // pick it up live (the whole point of the shared, swappable config).
         if matches!(resp, Response::Mutated) {
             shared.store(reload_config(config_path));
             tracing::info!("ipc: config reloaded after mutation");
@@ -258,9 +191,7 @@ fn serve_conn(
     }
 }
 
-/// Reload the collector's config from disk, re-applying systemd root discovery
-/// (as `serve` does at startup) so an empty `runner_roots` still finds the fleet.
-/// An unreadable/invalid file falls back to defaults rather than failing.
+/// Mirrors `serve` startup, which applies systemd root discovery to an empty `runner_roots`.
 fn reload_config(config_path: &Path) -> Config {
     let mut cfg = Config::load(Some(config_path)).unwrap_or_default();
     cfg.runner_roots = crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);

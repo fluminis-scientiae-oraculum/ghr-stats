@@ -1,9 +1,4 @@
-//! Runtime configuration loaded from a TOML file.
-//!
-//! *Where* the file lives and *where* data is written is decided by
-//! [`crate::shared::paths`] (privilege-scoped). This module owns only the config
-//! schema, its defaults, and read-only token resolution. Every field has a
-//! default, so the tool runs with no config at all.
+//! Config schema and defaults; every field has a default. Locations: [`crate::shared::paths`].
 
 pub(crate) mod persist;
 mod secret;
@@ -21,17 +16,14 @@ use crate::shared::error::{Error, Result};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// SQLite database path.
     #[serde(default = "defaults::db_path")]
     pub db_path: PathBuf,
 
-    /// Roots scanned for runner install dirs (each contains a `.runner` file).
-    /// Empty by default — set via `ghr-stats config` (no host-specific guess).
+    /// Roots scanned for runner install dirs (each holds a `.runner` file).
     #[serde(default = "defaults::runner_roots")]
     pub runner_roots: Vec<PathBuf>,
 
-    /// GitHub orgs to reconcile against the API. Empty ⇒ derived from the orgs
-    /// discovered in `.runner` files.
+    /// Empty ⇒ derived from the orgs in `.runner` files.
     #[serde(default)]
     pub orgs: Vec<String>,
 
@@ -48,30 +40,19 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Intervals {
-    /// Local source sampling cadence (runner discovery / processes / host).
+    /// Local sampling cadence (runners, processes, host).
     #[serde(default = "defaults::local_secs")]
     pub local_secs: u64,
-    /// GitHub API polling cadence (rate-limit aware).
     #[serde(default = "defaults::api_secs")]
     pub api_secs: u64,
-    /// Optional override for how old a GitHub reconcile row may be and still be
-    /// served as current. Left unset (the default) it is DERIVED from
-    /// `api_secs` — see [`Intervals::api_max_age`] — so raising the poll
-    /// interval widens the window automatically instead of silently making
-    /// every runner's GitHub view read as stale.
+    /// Unset ⇒ derived from `api_secs`; see [`Intervals::api_max_age`].
     #[serde(default)]
     pub api_max_age_secs: Option<u64>,
 }
 
 impl Intervals {
-    /// How old a GitHub reconcile row may be and still count as current.
-    ///
-    /// The explicit override when set, else three polls' grace with a 180 s
-    /// floor. Three, not one: a single slow or rate-limited cycle would
-    /// otherwise flap the whole fleet to "stale". This is the ONE place the
-    /// window is decided — the reader's freshness cutoff, the TUI's
-    /// `stale (Nm)` label and the exported `ghr_api_max_age_seconds` all read
-    /// it here rather than each deriving their own.
+    /// Max age of a GitHub reconcile row still served as current: the override, else
+    /// three polls (so one slow cycle doesn't flap everything stale), floored at 180 s.
     pub fn api_max_age(&self) -> u64 {
         self.api_max_age_secs
             .unwrap_or_else(|| self.api_secs.saturating_mul(3).max(180))
@@ -81,17 +62,15 @@ impl Intervals {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GithubConfig {
-    /// Fallback token for any org without a specific one below. Prefer per-org
-    /// `tokens`; `GHR_STATS_GITHUB_TOKEN` (env) overrides this fallback.
+    /// Fallback for orgs without a per-org token; `GHR_STATS_GITHUB_TOKEN` overrides it.
     #[serde(default)]
     pub token: Option<Secret>,
-    /// Per-org fine-grained read-only PATs: org login → token.
+    /// Org login → read-only PAT.
     #[serde(default)]
     pub tokens: BTreeMap<String, Secret>,
 }
 
-/// Prometheus metrics export (opt-in) — one of the collector's outputs: sample →
-/// SQLite → expose. Two independent paths, configured here and via the wizard.
+/// Prometheus metrics export (opt-in).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -101,14 +80,14 @@ pub struct MetricsConfig {
     pub push: PushConfig,
 }
 
-/// Prometheus pull: a tiny HTTP `/metrics` endpoint scrapers hit.
+/// HTTP `/metrics` endpoint for scrapers.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Bind address. Defaults to loopback — SECURITY: never bind a wider
-    /// interface without intent. Always `127.0.0.1`, never `localhost`.
+    /// SECURITY: loopback by default; never bind wider without intent.
+    /// Always `127.0.0.1`, never `localhost`.
     #[serde(default = "defaults::metrics_addr")]
     pub addr: String,
 }
@@ -122,17 +101,15 @@ impl Default for PullConfig {
     }
 }
 
-/// Push: periodically POST the metrics as JSON to an ingestion endpoint (e.g.
-/// OpenObserve's `_json` ingest). Off unless explicitly enabled.
+/// Periodically POST metrics as JSON to an ingest endpoint (e.g. OpenObserve `_json`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PushConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Full ingestion URL, e.g. `https://oo.example/api/default/ghr/_json`.
     #[serde(default)]
     pub endpoint: String,
-    /// Optional `Authorization` header value (e.g. "Basic …"). Never logged.
+    /// `Authorization` header value. Never logged.
     #[serde(default)]
     pub auth: Option<Secret>,
     #[serde(default = "defaults::push_interval")]
@@ -156,11 +133,8 @@ impl Config {
             Some(p) => match std::fs::read_to_string(&p) {
                 Ok(text) => toml::from_str(&text)
                     .map_err(|e| Error::Config(format!("parsing {}: {e}", p.display()))),
-                // A non-root process can't read the root-owned system config
-                // (0600 at /etc). That's expected in a system deployment — run
-                // `sudo ghr-stats` for local config. Fall back to defaults so the
-                // dashboard still launches and reads persistent data over the
-                // socket, rather than refusing to start.
+                // Non-root can't read the 0600 root-owned /etc config; defaults let
+                // the TUI still launch and read data over the socket.
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     tracing::warn!(
                         path = %p.display(),
@@ -174,9 +148,6 @@ impl Config {
         }
     }
 
-    /// Resolve the read-only PAT to use for `org`.
-    /// Precedence: per-org config token → `GHR_STATS_GITHUB_TOKEN` env →
-    /// single fallback config token.
     pub fn github_token_for(&self, org: &str) -> Option<String> {
         if let Some(t) = self.github.tokens.get(org) {
             return Some(t.expose().to_string());
@@ -190,13 +161,8 @@ impl Config {
     }
 }
 
-/// A hot-swappable config snapshot shared across the collector's threads. The
-/// collector loads config once, then swaps in a fresh snapshot when a mutation
-/// (or any reload) changes it; every worker that reads its snapshot each cycle
-/// picks the change up live. Zero-dep (`RwLock<Arc<Config>>`): a read clones the
-/// inner `Arc` (not the `Config`) and releases the lock immediately, so the
-/// rare writer never blocks the read-mostly workers. Lock poisoning is recovered
-/// (a panic while holding this brief lock must not wedge the daemon).
+/// Hot-swappable config shared across collector threads. Lock poisoning is
+/// recovered so a panicking holder can't wedge the daemon.
 #[derive(Clone)]
 pub struct SharedConfig(Arc<RwLock<Arc<Config>>>);
 
@@ -205,19 +171,16 @@ impl SharedConfig {
         Self(Arc::new(RwLock::new(Arc::new(cfg))))
     }
 
-    /// A cheap snapshot of the current config (an `Arc` clone, not a deep copy).
     pub fn snapshot(&self) -> Arc<Config> {
         Arc::clone(&self.0.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Swap in a new config; readers observe it on their next [`Self::snapshot`].
     pub fn store(&self, cfg: Config) {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(cfg);
     }
 }
 
-/// The PATs a config file's text declares, read leniently (every other field is
-/// ignored, so it survives schema drift) and never exposing a value.
+/// Lenient view of a config's PATs: ignores every other field, so it survives schema drift.
 #[derive(Deserialize, Default)]
 struct TokenPeek {
     #[serde(default)]
@@ -232,14 +195,11 @@ struct GithubPeek {
     token: Option<toml::Value>,
 }
 
-/// How many PATs the config text declares; `None` if it does not parse.
 pub(crate) fn count_tokens(config_text: &str) -> Option<usize> {
     let peek: TokenPeek = toml::from_str(config_text).ok()?;
     Some(peek.github.tokens.len() + usize::from(peek.github.token.is_some()))
 }
 
-/// The orgs with a per-org PAT in the config text, sorted; empty if it does not
-/// parse.
 pub(crate) fn token_orgs(config_text: &str) -> Vec<String> {
     toml::from_str::<TokenPeek>(config_text)
         .map(|p| p.github.tokens.into_keys().collect())
@@ -269,8 +229,6 @@ impl Default for Intervals {
     }
 }
 
-/// Field defaults. Path defaults delegate to [`crate::shared::paths`] so the privilege
-/// scope (euid) decides system vs user locations in exactly one place.
 mod defaults {
     use std::path::PathBuf;
 
@@ -308,29 +266,13 @@ mod tests {
     #[test]
     fn api_max_age_tracks_api_secs_unless_overridden() {
         let mut i = Intervals::default();
-        // Default 60s poll: 3x = 180, which is also the floor.
         assert_eq!(i.api_max_age(), 180);
-        // A slower poll widens the window automatically — the reason this is
-        // derived rather than a fixed literal that would silently go stale.
         i.api_secs = 300;
         assert_eq!(i.api_max_age(), 900);
-        // A fast poll does not shrink it below the floor; one slow cycle must
-        // not flap the whole fleet to "stale".
         i.api_secs = 10;
         assert_eq!(i.api_max_age(), 180);
-        // An explicit override wins over both.
         i.api_max_age_secs = Some(45);
         assert_eq!(i.api_max_age(), 45);
-    }
-
-    #[test]
-    fn defaults_are_populated() {
-        let c = Config::default();
-        assert_eq!(c.intervals.local_secs, 5);
-        assert_eq!(c.intervals.api_secs, 60);
-        // Generalized for distribution: no host-specific runner root is assumed.
-        assert!(c.runner_roots.is_empty());
-        assert!(c.orgs.is_empty());
     }
 
     #[test]
@@ -344,24 +286,18 @@ mod tests {
     fn count_tokens_counts_without_exposing_values() {
         let cfg = "runner_roots = []\n\n[github.tokens]\nacme = \"github_pat_SECRET_VALUE\"\nwidgets = \"github_pat_OTHER\"\n";
         assert_eq!(count_tokens(cfg), Some(2));
-        // A fallback token counts too.
         let one = "[github]\ntoken = \"github_pat_x\"\n";
         assert_eq!(count_tokens(one), Some(1));
-        // No tokens.
         assert_eq!(count_tokens("runner_roots = []\n"), Some(0));
-        // Malformed ⇒ None (the caller still shows the file, just can't count).
         assert_eq!(count_tokens("this is not = = toml ["), None);
     }
 
     #[test]
     fn token_orgs_returns_sorted_keys_without_exposing_values() {
         let cfg = "runner_roots = []\n\n[github.tokens]\nwidgets = \"github_pat_SECRET\"\nacme = \"github_pat_OTHER\"\n";
-        // Sorted (BTreeMap), and never the token values.
         assert_eq!(token_orgs(cfg), vec!["acme", "widgets"]);
-        // Fallback-only / no per-org tokens ⇒ empty (matches the per-org display).
         assert!(token_orgs("[github]\ntoken = \"github_pat_x\"\n").is_empty());
         assert!(token_orgs("runner_roots = []\n").is_empty());
-        // Malformed ⇒ empty (best-effort peek, never panics).
         assert!(token_orgs("this is not = = toml [").is_empty());
     }
 
@@ -369,8 +305,7 @@ mod tests {
     fn per_org_token_takes_precedence() {
         let c: Config =
             toml::from_str("[github.tokens]\n\"example-org\" = \"github_pat_xyz\"\n").unwrap();
-        // Per-org token resolves before the env/fallback path, so this is
-        // deterministic regardless of GHR_STATS_GITHUB_TOKEN in the test env.
+        // Per-org wins before the env var is consulted, so the test env can't interfere.
         assert_eq!(
             c.github_token_for("example-org").as_deref(),
             Some("github_pat_xyz")

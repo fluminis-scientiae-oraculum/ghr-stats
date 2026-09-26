@@ -1,4 +1,4 @@
-//! The hook tailer thread: what the runners' own hooks reported.
+//! Hook tailer thread.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,9 +13,7 @@ use crate::shared::hooks::{self, ingest};
 
 use super::{Sample, sleep_until};
 
-/// Tail every discovered runner's event log from its persisted offset and send
-/// what is new. The offset is read back from the database each tick, so a batch
-/// the writer failed to commit is simply read again.
+/// Offsets are re-read from the DB each tick, so a batch the writer failed to commit is read again.
 pub(super) fn hooks_loop(
     cfg: &SharedConfig,
     term: &AtomicBool,

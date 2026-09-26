@@ -9,8 +9,6 @@ use rusqlite::Connection;
 
 use crate::shared::error::Result;
 
-/// Open the collector's writer connection (WAL, so readers never block it) and
-/// migrate the schema.
 pub fn open_writer(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -28,11 +26,8 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Open a second, non-writer WAL connection for a background reader (the metrics
-/// exporter and the IPC server). NB: a WAL "reader" still writes the `-shm`/
-/// `-wal` sidecars, so it needs write access to the DB *directory* — this is a
-/// concurrent reader, never `OPEN_READ_ONLY`. `None` (logged) if the DB can't be
-/// opened, so the caller degrades instead of aborting the collector.
+/// A WAL reader still writes the `-shm`/`-wal` sidecars, so it needs write access to the DB
+/// directory; never `OPEN_READ_ONLY`. `None` (logged) lets the caller degrade.
 pub fn open_reader(path: &Path) -> Option<Connection> {
     match Connection::open(path) {
         Ok(c) => {
@@ -46,7 +41,6 @@ pub fn open_reader(path: &Path) -> Option<Connection> {
     }
 }
 
-/// Apply the schema to an in-memory connection, for tests in sibling modules.
 #[cfg(test)]
 pub(crate) fn schema_for_test(conn: &mut Connection) {
     schema::migrate(conn).expect("migrate test db");

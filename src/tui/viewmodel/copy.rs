@@ -1,18 +1,10 @@
-//! Canonical user-facing copy — the single home for the recurring calls-to-action
-//! and the empty-state messages built from the [`super::status`] enums. Nothing
-//! else in the TUI hardcodes these command strings.
-
 use super::status::{GithubReason, JobsView, RunnerGithub};
 
-/// Install the collector service (Ephemeral → Persistent).
 pub(crate) const INSTALL_COLLECTOR: &str = "ghr-stats systemd install";
-/// Add a read-only PAT via the Config tab.
 pub(crate) const ADD_PAT: &str = "add a read-only PAT on the Config tab [a]";
-/// Install or chain the runner job hook.
 pub(crate) const INSTALL_HOOKS: &str =
     "install or chain it on the Config tab with [h] (as root), or run `sudo ghr-stats config`";
 
-/// The Detail-panel GitHub cell text when there's no state for the runner.
 pub(crate) fn runner_github_cell(rg: RunnerGithub) -> String {
     match rg {
         RunnerGithub::Reason(GithubReason::EphemeralOnly) => {
@@ -28,7 +20,6 @@ pub(crate) fn runner_github_cell(rg: RunnerGithub) -> String {
     }
 }
 
-/// The Summary-line GitHub hint when the fleet view is absent.
 pub(crate) fn github_summary_hint(reason: GithubReason) -> String {
     match reason {
         GithubReason::EphemeralOnly => {
@@ -41,7 +32,6 @@ pub(crate) fn github_summary_hint(reason: GithubReason) -> String {
     }
 }
 
-/// The Jobs-tab empty-state body.
 pub(crate) fn jobs_empty(view: JobsView) -> String {
     match view {
         JobsView::EphemeralOnly => format!(
@@ -59,7 +49,6 @@ pub(crate) fn jobs_empty(view: JobsView) -> String {
     }
 }
 
-/// The Trends-tab "still filling" empty state (Ephemeral rings before ~2 points).
 pub(crate) fn collecting_trends() -> String {
     format!(
         "Collecting… — trends fill as live samples arrive.\n\nInstall the collector for history \
@@ -67,7 +56,6 @@ pub(crate) fn collecting_trends() -> String {
     )
 }
 
-/// The Detail sparkline "still filling" empty state.
 pub(crate) fn collecting_sparkline() -> String {
     format!(
         "Collecting… — the sparkline fills as live samples arrive.\n\nInstall the collector for \
@@ -75,17 +63,10 @@ pub(crate) fn collecting_sparkline() -> String {
     )
 }
 
-/// The `_work` trend cell in Ephemeral mode (the expensive walk is collector-only).
 pub(crate) fn work_persistent_only() -> &'static str {
     "  Persistent only — install the collector to trend _work size"
 }
 
-/// The Config tab's version advisory, when there is something worth saying.
-///
-/// The version-drift and IPC-drift cases are the same underlying mistake seen
-/// from two sides: the binary was upgraded and the service was not restarted.
-/// One says the builds differ; the other says the wire versions differ badly
-/// enough that the dashboard fell back to Ephemeral entirely.
 pub(crate) fn version_warning(
     state: super::status::VersionState,
     ephemeral: Option<&crate::shared::ipc::client::EphemeralReason>,
@@ -93,8 +74,7 @@ pub(crate) fn version_warning(
     use super::status::VersionState;
     use crate::shared::ipc::client::EphemeralReason;
 
-    // A wire mismatch is the more actionable report: it explains not just a
-    // version difference but why there is no collector data at all.
+    // Wire drift first: it also explains why there is no collector data.
     if let Some(EphemeralReason::VersionDrift { server }) = ephemeral {
         return Some(format!(
             "A collector IS running but speaks IPC v{server} (this build speaks v{}). \

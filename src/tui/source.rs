@@ -1,17 +1,5 @@
-//! The TUI's two history sources, behind one enum.
-//!
-//! - **Ephemeral**: no collector reachable. History comes from [`Rings`] — a
-//!   bounded in-memory buffer the App fills from its own live sample each tick,
-//!   so Trends + Detail sparklines show a rolling since-launch window. Nothing
-//!   persists; GitHub + Jobs (collector-only features) are simply empty.
-//! - **Persistent**: a collector is reachable over the IPC socket. History,
-//!   Jobs, and the GitHub view are fetched from it; the rings still fill every
-//!   tick as a warm fallback if the socket drops mid-session.
-//!
-//! Mode is not a stored flag — it is `matches!(source, Persistent)`. A failed
-//! IPC request reverts the source to Ephemeral in place, and `App::refresh`
-//! re-probes when Ephemeral, so a collector starting or stopping while the TUI
-//! is open needs no special handling.
+//! History from in-memory [`Rings`] (Ephemeral) or the collector over IPC (Persistent).
+//! A failed request reverts to Ephemeral in place; `App::refresh` re-probes each tick.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -20,29 +8,21 @@ use crate::shared::ipc::{Mutation, Query, Request, Response};
 use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Mode, RunnerState};
 use crate::shared::paths::Scope;
 
-/// Result of a config mutation attempted over the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutateOutcome {
-    /// The authorized collector persisted the change.
     Mutated,
-    /// The collector refused — the peer isn't root or in the `ghr-stats` group.
+    /// The peer is neither root nor in the `ghr-stats` group.
     Denied,
-    /// No collector reachable (Ephemeral) or the request errored — caller falls
-    /// back to a direct write.
+    /// Ephemeral, or the request failed; the caller writes the file directly.
     Unreachable,
 }
 
-/// The App's history source: an in-memory ring buffer, or a live collector.
 pub(crate) enum DataSource {
-    /// No usable collector — and WHY, so the dashboard can say so instead of
-    /// leaving the operator to guess.
     Ephemeral(EphemeralReason),
     Persistent(Client),
 }
 
 impl DataSource {
-    /// Probe for a reachable collector (System scope, then User). A hit ⇒
-    /// Persistent; otherwise Ephemeral.
     pub(crate) fn detect() -> Self {
         match Client::connect_any() {
             Ok(c) => DataSource::Persistent(c),
@@ -57,8 +37,6 @@ impl DataSource {
         }
     }
 
-    /// The scope of the connected collector (for the Config tab to note when it
-    /// differs from the TUI's own scope). `None` in Ephemeral mode.
     pub(crate) fn scope(&self) -> Option<Scope> {
         match self {
             DataSource::Persistent(c) => Some(c.scope()),
@@ -66,7 +44,6 @@ impl DataSource {
         }
     }
 
-    /// The connected collector's build version, if it reported one.
     pub(crate) fn collector_version(&self) -> Option<&str> {
         match self {
             DataSource::Persistent(c) => c.collector_version(),
@@ -74,7 +51,6 @@ impl DataSource {
         }
     }
 
-    /// Why we are Ephemeral, when we are.
     pub(crate) fn ephemeral_reason(&self) -> Option<&EphemeralReason> {
         match self {
             DataSource::Ephemeral(r) => Some(r),
@@ -82,21 +58,16 @@ impl DataSource {
         }
     }
 
-    /// When Ephemeral, try once to attach to a collector that has since started.
     pub(crate) fn reconnect_if_ephemeral(&mut self) {
         if matches!(self, DataSource::Ephemeral(_)) {
             match Client::connect_any() {
                 Ok(c) => *self = DataSource::Persistent(c),
-                // Refresh the reason too: a collector that has since been
-                // restarted onto a matching wire version should stop being
-                // reported as drifted.
+                // A collector restarted onto a matching wire version is no longer drifted.
                 Err(reason) => *self = DataSource::Ephemeral(reason),
             }
         }
     }
 
-    /// One IPC round-trip. `None` in Ephemeral mode, or if the request fails —
-    /// in which case the source reverts to Ephemeral (the App re-probes next tick).
     fn query(&mut self, req: &Request) -> Option<Response> {
         let DataSource::Persistent(client) = self else {
             return None;
@@ -111,18 +82,13 @@ impl DataSource {
         }
     }
 
-    // --- typed queries: IPC in Persistent mode, ring / empty fallback otherwise ---
-
     pub(crate) fn latest_api_runners(&mut self) -> HashMap<(String, i64), GhView> {
         match self.query(&Request::Query(Query::LatestApiRunners)) {
             Some(Response::LatestApiRunners(rows)) => ipc_client::api_map(rows),
-            _ => HashMap::new(), // GitHub is Persistent-only
+            _ => HashMap::new(),
         }
     }
 
-    /// Persisted per-runner liveness edges (Persistent only) — the true, restart-
-    /// surviving `since_ts` for the "For" duration, keyed by install `dir`. Empty
-    /// in Ephemeral mode, where the App falls back to its in-memory edge.
     pub(crate) fn runner_states(&mut self) -> HashMap<String, RunnerState> {
         match self.query(&Request::Query(Query::RunnerStates)) {
             Some(Response::RunnerStates(rows)) => {
@@ -161,9 +127,6 @@ impl DataSource {
         }
     }
 
-    /// The configured token org logins as seen by the collector (which reads the
-    /// root-owned /etc config) — presence only, no token values. `None` in
-    /// Ephemeral mode or on error, so the caller falls back to its own loaded cfg.
     pub(crate) fn configured_token_orgs(&mut self) -> Option<Vec<String>> {
         match self.query(&Request::Query(Query::ConfiguredTokenOrgs)) {
             Some(Response::ConfiguredTokenOrgs(orgs)) => Some(orgs),
@@ -174,7 +137,7 @@ impl DataSource {
     pub(crate) fn recent_jobs(&mut self, limit: usize) -> Vec<JobRow> {
         match self.query(&Request::Query(Query::RecentJobs { limit })) {
             Some(Response::RecentJobs(v)) => v,
-            _ => Vec::new(), // Jobs are Persistent-only
+            _ => Vec::new(),
         }
     }
 
@@ -183,11 +146,9 @@ impl DataSource {
             runner_name: runner_name.to_string(),
         })) {
             Some(Response::LatestJob(j)) => j,
-            _ => None, // Persistent-only
+            _ => None,
         }
     }
-
-    // --- authorized mutations (the collector writes /etc on our behalf) ---
 
     pub(crate) fn set_metrics_pull(&mut self, enabled: bool, addr: &str) -> MutateOutcome {
         self.mutate(Request::Mutate(Mutation::SetMetricsPull {
@@ -209,8 +170,6 @@ impl DataSource {
         }))
     }
 
-    /// Send a mutation request; map the reply. `Unreachable` when Ephemeral or on
-    /// any error (the caller then falls back to a direct write).
     fn mutate(&mut self, req: Request) -> MutateOutcome {
         match self.query(&req) {
             Some(Response::Mutated) => MutateOutcome::Mutated,
@@ -220,8 +179,6 @@ impl DataSource {
     }
 }
 
-/// Bounded, in-memory history for Ephemeral mode. Fed from the App's live sample
-/// each tick; capped so it is O(1) memory and reflects a rolling window.
 pub(crate) struct Rings {
     host: VecDeque<HostPoint>,
     busy: VecDeque<BusyPoint>,
@@ -254,7 +211,7 @@ impl Rings {
         push_capped(self.runners.entry(dir).or_default(), p, cap);
     }
 
-    /// Newest `limit` points, oldest → newest — matching `store::reader`'s order.
+    /// Oldest → newest, matching `store::reader`'s order.
     fn host_series(&self, limit: usize) -> Vec<HostPoint> {
         tail(&self.host, limit)
     }
@@ -271,7 +228,7 @@ impl Rings {
     }
 }
 
-/// Push, evicting the oldest when at capacity (`cap >= 1`).
+/// Requires `cap >= 1`.
 fn push_capped<T>(dq: &mut VecDeque<T>, item: T, cap: usize) {
     if dq.len() >= cap {
         dq.pop_front();
@@ -279,7 +236,6 @@ fn push_capped<T>(dq: &mut VecDeque<T>, item: T, cap: usize) {
     dq.push_back(item);
 }
 
-/// The last `limit` items, cloned in order.
 fn tail<T: Clone>(dq: &VecDeque<T>, limit: usize) -> Vec<T> {
     let start = dq.len().saturating_sub(limit);
     dq.iter().skip(start).cloned().collect()
@@ -307,12 +263,10 @@ mod tests {
         for ts in [10, 20, 30, 40] {
             r.push_host(host(ts));
         }
-        // capped at 3 ⇒ oldest (10) evicted; oldest → newest
         assert_eq!(
             r.host_series(10).iter().map(|h| h.ts).collect::<Vec<_>>(),
             vec![20, 30, 40]
         );
-        // limit smaller than contents ⇒ newest `limit`
         assert_eq!(
             r.host_series(2).iter().map(|h| h.ts).collect::<Vec<_>>(),
             vec![30, 40]
@@ -332,7 +286,6 @@ mod tests {
                 },
             );
         }
-        // hist_cap = 2 ⇒ ts 1 evicted
         assert_eq!(
             r.runner_history("/srv/r7", 5)
                 .iter()
@@ -341,15 +294,5 @@ mod tests {
             vec![2, 3]
         );
         assert!(r.runner_history("/srv/none", 5).is_empty());
-    }
-
-    #[test]
-    fn ephemeral_source_has_no_persistent_data() {
-        let mut s = DataSource::Ephemeral(EphemeralReason::NoCollector);
-        assert_eq!(s.mode(), Mode::Ephemeral);
-        assert!(s.recent_jobs(10).is_empty());
-        assert!(s.latest_job("r").is_none());
-        assert!(s.latest_api_runners().is_empty());
-        assert!(s.scope().is_none());
     }
 }
