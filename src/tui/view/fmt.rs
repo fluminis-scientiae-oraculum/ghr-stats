@@ -64,10 +64,11 @@ pub(crate) fn fmt_ago(ts: Option<i64>) -> String {
 }
 
 pub(crate) fn fmt_dur(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{}s", secs / 60, secs % 60)
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3_600 => format!("{}m{}s", secs / 60, secs % 60),
+        3_600..86_400 => format!("{}h{}m", secs / 3_600, secs % 3_600 / 60),
+        _ => format!("{}d{}h", secs / 86_400, secs % 86_400 / 3_600),
     }
 }
 
@@ -112,7 +113,8 @@ mod tests {
         assert_eq!(fmt_dur(5), "5s");
         assert_eq!(fmt_dur(59), "59s");
         assert_eq!(fmt_dur(90), "1m30s");
-        assert_eq!(fmt_dur(3661), "61m1s");
+        assert_eq!(fmt_dur(3661), "1h1m");
+        assert_eq!(fmt_dur(3 * 86_400 + 7_200), "3d2h");
     }
 
     #[test]

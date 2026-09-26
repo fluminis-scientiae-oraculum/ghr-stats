@@ -138,11 +138,13 @@ fn describe(p: &Progress) -> String {
     }
 }
 
+/// The snapshot the wait was about: only `--org`'s runners, when given.
 fn report(args: &WaitArgs, status: &FleetStatus) -> Result<()> {
+    let status = crate::ops::status::scoped(status.clone(), args.org.as_deref(), None);
     if args.json {
-        crate::ops::emit_json(status)?;
+        crate::ops::emit_json(&status)?;
     } else {
-        crate::ops::emit(&crate::ops::status::human(status))?;
+        crate::ops::emit(&crate::ops::status::human(&status))?;
     }
     Ok(())
 }

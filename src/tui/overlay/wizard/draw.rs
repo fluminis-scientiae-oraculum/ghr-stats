@@ -144,7 +144,7 @@ fn input_line(label: &str, input: &Input, masked: bool) -> Line<'static> {
     } else {
         value.chars().collect()
     };
-    let cursor = input.visual_cursor().min(shown.len());
+    let cursor = input.cursor().min(shown.len());
     let before: String = shown[..cursor].iter().collect();
     let (at, after): (String, String) = if cursor < shown.len() {
         (

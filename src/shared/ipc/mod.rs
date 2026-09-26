@@ -1,6 +1,6 @@
 //! Collector↔client IPC: synchronous, length-prefixed JSON over a Unix socket.
 //! A frame is a `u32`-LE length then a `serde_json` body; one request, one response.
-//! No variant carries a GitHub token or config value.
+//! Only `Mutation::AddOrgToken` carries a token, client to collector; no response carries one.
 //! No subscribe path: the accept loop drops callers past `MAX_CONNS`, so long-lived
 //! streams would lock out other clients; live feeds poll a `Query` with a cursor.
 

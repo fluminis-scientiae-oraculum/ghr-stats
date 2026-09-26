@@ -12,11 +12,11 @@ use crate::shared::models::{FleetCounts, FleetStatus, Liveness, Mode, RunnerStat
 use crate::shared::util::{BUILD_VERSION, now_epoch, to_rfc3339_utc};
 
 pub fn run(args: &StatusArgs, cfg: &Config) -> Result<Verdict> {
-    let mut status = snapshot(cfg).status;
-
-    filter(&mut status, args);
-    // Recompute over the surviving rows so a filter cannot inherit another org's verdict.
-    status.verdict = verdict_for(&status);
+    let status = scoped(
+        snapshot(cfg).status,
+        args.org.as_deref(),
+        args.runner.as_deref(),
+    );
 
     if args.json {
         crate::ops::emit_json(&status)?;
@@ -59,17 +59,25 @@ pub(crate) fn snapshot(cfg: &Config) -> Snapshot {
     }
 }
 
-fn filter(status: &mut FleetStatus, args: &StatusArgs) {
-    if let Some(org) = &args.org {
-        status.runners.retain(|r| &r.org == org);
-        status.orgs.retain(|o| &o.org == org);
+/// `status` narrowed to one org and/or runner, with counts and verdict recomputed over
+/// what is left, so a filter never inherits another org's verdict.
+pub(crate) fn scoped(
+    mut status: FleetStatus,
+    org: Option<&str>,
+    runner: Option<&str>,
+) -> FleetStatus {
+    if let Some(org) = org {
+        status.runners.retain(|r| r.org == org);
+        status.orgs.retain(|o| o.org == org);
     }
-    if let Some(name) = &args.runner {
-        status.runners.retain(|r| &r.name == name);
+    if let Some(name) = runner {
+        status.runners.retain(|r| r.name == name);
         let orgs: Vec<String> = status.runners.iter().map(|r| r.org.clone()).collect();
         status.orgs.retain(|o| orgs.contains(&o.org));
     }
     status.fleet = counts(&status.runners);
+    status.verdict = verdict_for(&status);
+    status
 }
 
 fn counts(runners: &[RunnerStatus]) -> FleetCounts {
@@ -230,33 +238,21 @@ mod tests {
 
     #[test]
     fn filtering_to_a_healthy_org_recomputes_the_verdict() {
-        let mut s = status(vec![
+        let s = status(vec![
             runner("a", "good", Liveness::Idle, Some(false)),
             runner("b", "bad", Liveness::Idle, Some(true)),
         ]);
         assert_eq!(s.verdict, Verdict::Degraded);
 
-        let args = StatusArgs {
-            json: false,
-            org: Some("good".into()),
-            runner: None,
-        };
-        filter(&mut s, &args);
-        s.verdict = verdict_for(&s);
+        let s = scoped(s, Some("good"), None);
         assert_eq!(s.verdict, Verdict::Ok);
         assert_eq!(s.fleet.runners, 1);
     }
 
     #[test]
     fn an_empty_result_is_unknown_not_ok() {
-        let mut s = status(vec![runner("a", "o", Liveness::Idle, Some(false))]);
-        let args = StatusArgs {
-            json: false,
-            org: Some("nonexistent".into()),
-            runner: None,
-        };
-        filter(&mut s, &args);
-        s.verdict = verdict_for(&s);
+        let s = status(vec![runner("a", "o", Liveness::Idle, Some(false))]);
+        let s = scoped(s, Some("nonexistent"), None);
         assert_eq!(s.verdict, Verdict::Unknown);
         assert_eq!(s.verdict.exit_code(), 2);
     }

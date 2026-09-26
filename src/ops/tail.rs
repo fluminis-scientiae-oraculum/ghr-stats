@@ -81,6 +81,8 @@ pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
     let mut transitions = Cursor::default();
     let mut jobs = Cursor::default();
     let mut out = std::io::stdout();
+    let mut first = true;
+    let mut down = false;
 
     loop {
         let started = Instant::now();
@@ -93,14 +95,28 @@ pub fn run(args: &TailArgs, cfg: &Config) -> Result<Availability> {
         };
         let timeline = match fetch(&query) {
             Some(t) => t,
-            None => {
+            None if first => {
                 eprintln!(
                     "cannot tail: no usable collector — the transition record lives there, and \
                      a local scan can only see the present"
                 );
                 return Ok(Availability::Unavailable);
             }
+            // Likely a collector restart: keep `since` so the next answer covers the outage.
+            None => {
+                if !down {
+                    eprintln!("collector unreachable; retrying");
+                    down = true;
+                }
+                std::thread::sleep(interval);
+                continue;
+            }
         };
+        if down {
+            eprintln!("collector back");
+            down = false;
+        }
+        first = false;
 
         match emit(&mut out, &timeline, &mut transitions, &mut jobs) {
             Ok(()) => {}

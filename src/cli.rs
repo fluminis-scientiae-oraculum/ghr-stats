@@ -210,8 +210,9 @@ pub enum Command {
     #[command(
         long_about = "Interactive configuration, run with sudo. Discovers runners under a root \
         you choose; adds read-only fine-grained PATs per org (validated before saving; each \
-        needs Organization → Self-hosted runners: Read, plus Repository → Actions: Read for job \
-        success/failure in the Jobs view); optionally enables Prometheus metrics; writes the \
+        needs Organization → Self-hosted runners: Read, or Repository → Administration: Read \
+        for repository runners, plus Repository → Actions: Read for job success/failure in the \
+        Jobs view); optionally enables Prometheus metrics; writes the \
         root-owned 0600 system config at /etc/ghr-stats/config.toml; then offers to \
         install/repair each runner's job hooks, never clobbering a foreign hook (it chains \
         after it or prints a snippet instead).\n\n\

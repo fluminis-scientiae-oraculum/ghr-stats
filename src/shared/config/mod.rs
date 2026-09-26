@@ -220,7 +220,8 @@ impl Config {
     pub fn require_readable(&self) -> Result<()> {
         match &self.provenance {
             Provenance::Unreadable(p) => Err(Error::Config(format!(
-                "{} is not readable by this user, so its settings are unknown — re-run with sudo",
+                "{} is not readable by this user, so its settings are unknown — run as root, \
+                 or point --config or GHR_STATS_CONFIG at a file this user can read",
                 p.display()
             ))),
             Provenance::File(_) | Provenance::Absent => Ok(()),

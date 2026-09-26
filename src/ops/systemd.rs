@@ -142,7 +142,7 @@ fn render_unit(bin: &Path, scope: Scope) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={bin} serve\n\
+         ExecStart=\"{bin}\" serve\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          RuntimeDirectory=ghr-stats\n\
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn system_unit_runs_serve_and_wants_multi_user() {
         let u = render_unit(Path::new("/usr/local/bin/ghr-stats"), Scope::System);
-        assert!(u.contains("ExecStart=/usr/local/bin/ghr-stats serve"));
+        assert!(u.contains(r#"ExecStart="/usr/local/bin/ghr-stats" serve"#));
         assert!(u.contains("WantedBy=multi-user.target"));
         assert!(u.contains("Type=simple"));
         assert!(u.contains("RuntimeDirectory=ghr-stats"));
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn user_unit_wants_default_target() {
         let u = render_unit(Path::new("/home/x/.local/bin/ghr-stats"), Scope::User);
-        assert!(u.contains("ExecStart=/home/x/.local/bin/ghr-stats serve"));
+        assert!(u.contains(r#"ExecStart="/home/x/.local/bin/ghr-stats" serve"#));
         assert!(u.contains("WantedBy=default.target"));
         assert!(u.contains("RuntimeDirectory=ghr-stats"));
     }

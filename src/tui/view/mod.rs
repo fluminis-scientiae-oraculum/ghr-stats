@@ -27,6 +27,7 @@ pub(crate) use fmt::{
 
 pub(crate) fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    *app.hits.borrow_mut() = Hits::default();
     if area.width < 40 || area.height < 8 {
         f.render_widget(
             Paragraph::new("terminal too small\n(min 40×8)")
@@ -117,13 +118,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(label, dim));
         x += w;
     }
-    {
-        let mut hits = app.hits.borrow_mut();
-        hits.footer = clicks;
-        hits.footer_row = area.y;
-    }
     let keymap = Paragraph::new(Line::from(spans));
-    match app.status.as_deref() {
+    let keymap_area = match app.status.as_deref() {
         Some(s) => {
             let sw = (s.chars().count() as u16).saturating_add(3).min(area.width);
             let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(sw)]).split(area);
@@ -136,9 +132,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 .alignment(Alignment::Right),
                 cols[1],
             );
+            cols[0]
         }
-        None => f.render_widget(keymap, area),
-    }
+        None => {
+            f.render_widget(keymap, area);
+            area
+        }
+    };
+    // Only hints actually drawn are clickable.
+    clicks.retain(|&(_, _, end)| end <= keymap_area.x + keymap_area.width);
+    let mut hits = app.hits.borrow_mut();
+    hits.footer = clicks;
+    hits.footer_row = area.y;
 }
 
 fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -200,15 +205,13 @@ pub(crate) fn draw_confirm(f: &mut Frame, prompt: &ConfirmPrompt) {
     } else {
         Color::Yellow
     };
-    let lines = vec![
-        Line::from(""),
-        Line::from(prompt.body.clone()),
-        Line::from(""),
-        Line::from(Span::styled(
-            " [y] confirm    [n] cancel ",
-            Style::new().add_modifier(Modifier::REVERSED),
-        )),
-    ];
+    let mut lines = vec![Line::from("")];
+    lines.extend(prompt.body.lines().map(|l| Line::from(l.to_string())));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " [y] confirm    [n] cancel ",
+        Style::new().add_modifier(Modifier::REVERSED),
+    )));
     let popup = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::bordered()
             .border_style(Style::new().fg(border))

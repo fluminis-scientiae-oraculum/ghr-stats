@@ -26,7 +26,7 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     println!("  • read each runner's .runner under the root you choose");
     println!(
         "  • optionally validate a read-only fine-grained PAT per org \
-         (Self-hosted runners: Read; + Actions: Read for job results)"
+         (Self-hosted runners or Administration: Read; + Actions: Read for job results)"
     );
     println!("  • optionally enable Prometheus metrics");
     println!(

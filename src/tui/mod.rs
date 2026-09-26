@@ -29,7 +29,7 @@ const REFRESH: Duration = Duration::from_millis(2000);
 
 /// `config_path` is the `--config` override, so the wizard writes back to the loaded file.
 pub fn run(cfg: &Config, config_path: Option<&Path>) -> Result<()> {
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init()?;
     let mouse = MouseCapture::enable();
     let result = event_loop(&mut terminal, cfg, config_path);
     drop(mouse); // before ratatui leaves the alternate screen
@@ -81,6 +81,8 @@ fn event_loop(
                     Next::Mode(mode)
                 }
                 Event::Key(k) if k.kind == KeyEventKind::Press => route_key(mode, &mut app, k.code),
+                // An overlay is modal: a click must not act on the dashboard under it.
+                Event::Mouse(_) if app.overlay_open() => Next::Mode(mode),
                 Event::Mouse(m) => route_mouse(mode, &mut app, m),
                 _ => Next::Mode(mode),
             };

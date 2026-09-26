@@ -64,7 +64,8 @@ pub(super) fn github_view_stale(snap: &Snapshot) -> Option<Finding> {
         first_seen: oldest.map(|age| to_rfc3339_utc(s.generated_at_epoch - age)),
         suggested_checks: vec![
             "ghr_api_reconcile_ok and ghr_api_reconcile_error on the metrics endpoint".to_string(),
-            "whether the org's PAT expired or lost Self-hosted runners: Read".to_string(),
+            "whether the org's PAT expired or lost Self-hosted runners or Administration: Read"
+                .to_string(),
             "whether these runners were removed from the org on GitHub's side".to_string(),
         ],
     })
@@ -137,7 +138,7 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
         ],
         Source::LocalScan(EphemeralReason::Unusable { .. } | EphemeralReason::QueryFailed) => vec![
             "`journalctl -u ghr-stats` for the collector's own errors".to_string(),
-            "whether another client is holding the collector's only connection".to_string(),
+            "whether other clients hold every one of the collector's connection slots".to_string(),
             "that the socket belongs to a live collector and is not stale".to_string(),
         ],
     };

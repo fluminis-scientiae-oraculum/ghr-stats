@@ -3,12 +3,12 @@
 use crate::ops::explain::Boundary;
 use crate::shared::ipc::client::{Client, EphemeralReason};
 use crate::shared::ipc::{self, Query, Request, Response};
-use crate::shared::models::{FleetStatus, Verdict};
+use crate::shared::models::FleetStatus;
 use crate::shared::util::{BUILD_VERSION, to_rfc3339_utc};
 
 use super::{Check, Outcome, skipped};
 
-pub(super) fn collector_checks() -> Vec<Check> {
+pub(super) fn collector_checks(max_age: u64) -> Vec<Check> {
     let mut client = match Client::connect_any() {
         Ok(c) => c,
         Err(reason) => {
@@ -32,7 +32,7 @@ pub(super) fn collector_checks() -> Vec<Check> {
     }];
 
     match client.request(&Request::Query(Query::FleetStatus)) {
-        Ok(Response::FleetStatus(s)) => checks.push(reconcile_check(&s)),
+        Ok(Response::FleetStatus(s)) => checks.push(reconcile_check(&s, max_age)),
         // Handshook, then refused the query: a collector fault, not an absence.
         _ => checks.push(Check {
             id: "reconcile",
@@ -89,18 +89,16 @@ fn version_outcome(collector: &str) -> Outcome {
     }
 }
 
-/// An org that never reconciled passes: it has no PAT, or its runners are enterprise-level.
-fn reconcile_check(s: &FleetStatus) -> Check {
+/// Stale means no successful reconcile within the freshness window; an org that never
+/// reconciled passes (no PAT, or enterprise-level runners) and is listed.
+fn reconcile_check(s: &FleetStatus, max_age: u64) -> Check {
     let mut stale = Vec::new();
     let mut never = Vec::new();
     let mut ok = 0usize;
     for o in &s.orgs {
         match o.reconcile_age_s {
             None => never.push(o.org.clone()),
-            Some(age) if o.verdict == Verdict::Ok => {
-                let _ = age;
-                ok += 1;
-            }
+            Some(age) if u64::try_from(age).is_ok_and(|a| a <= max_age) => ok += 1,
             Some(age) => stale.push(format!("{} ({age}s ago)", o.org)),
         }
     }
@@ -155,6 +153,7 @@ fn history_check(client: &mut Client) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::Verdict;
 
     #[test]
     fn a_collector_on_a_different_build_fails_with_the_restart() {
@@ -208,7 +207,7 @@ mod tests {
             ],
             runners: Vec::new(),
         };
-        match reconcile_check(&s).outcome {
+        match reconcile_check(&s, 180).outcome {
             Outcome::Pass { detail } => {
                 assert!(detail.contains("1 org(s) reconciling"), "{detail}");
                 assert!(detail.contains("personal"), "{detail}");
