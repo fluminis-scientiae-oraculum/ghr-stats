@@ -1,3 +1,4 @@
+use crate::shared::ipc::client::Behind;
 use crate::shared::models::Mode;
 
 /// Why the fleet's GitHub view has no data.
@@ -46,7 +47,7 @@ pub(crate) enum VersionState {
     /// The collector predates the version field, so it is an older build.
     CollectorUnknown,
     Match,
-    Drift,
+    Drift(Option<Behind>),
 }
 
 pub(crate) fn version_state(binary: &str, collector: Option<&str>, mode: Mode) -> VersionState {
@@ -54,7 +55,7 @@ pub(crate) fn version_state(binary: &str, collector: Option<&str>, mode: Mode) -
         (Mode::Ephemeral, _) => VersionState::NoCollector,
         (Mode::Persistent, None) => VersionState::CollectorUnknown,
         (Mode::Persistent, Some(v)) if v == binary => VersionState::Match,
-        (Mode::Persistent, Some(_)) => VersionState::Drift,
+        (Mode::Persistent, Some(v)) => VersionState::Drift(Behind::of_builds(v, binary)),
     }
 }
 
@@ -87,7 +88,11 @@ mod tests {
         );
         assert_eq!(
             version_state("0.2.0", Some("0.1.4"), Mode::Persistent),
-            VersionState::Drift
+            VersionState::Drift(Some(Behind::Service))
+        );
+        assert_eq!(
+            version_state("0.2.0", Some("0.10.0"), Mode::Persistent),
+            VersionState::Drift(Some(Behind::Binary))
         );
         assert_eq!(
             version_state("0.2.0", None, Mode::Persistent),
@@ -110,7 +115,7 @@ mod tests {
         )
         .expect("wire drift must warn");
         assert!(w.contains("IPC v8"));
-        assert!(w.contains("systemctl restart"));
+        assert!(w.contains("systemd install"));
 
         assert!(
             version_warning(

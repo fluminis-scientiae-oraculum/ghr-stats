@@ -2,7 +2,7 @@
 //! never reads as all-clear.
 
 use crate::ops::status::{Snapshot, Source};
-use crate::shared::ipc::client::EphemeralReason;
+use crate::shared::ipc::client::{Behind, EphemeralReason};
 use crate::shared::util::to_rfc3339_utc;
 
 use super::{Boundary, Finding, Severity};
@@ -127,9 +127,8 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
             "`ghr-stats systemd install --system` (or `--user`)".to_string(),
             "`systemctl status ghr-stats` in case it is installed but stopped".to_string(),
         ],
-        Source::LocalScan(EphemeralReason::VersionDrift { .. }) => vec![
-            "`systemctl restart ghr-stats` — the binary was upgraded, the service was not"
-                .to_string(),
+        Source::LocalScan(EphemeralReason::VersionDrift { server }) => vec![
+            Behind::of_wire(*server).remedy(),
             "`ghr-stats --version` against the version the unit's ExecStart points at".to_string(),
         ],
         Source::LocalScan(EphemeralReason::Denied) => vec![
@@ -154,11 +153,9 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
             Boundary::Config,
             format!(
                 "A collector IS running but speaks IPC v{server} while this binary speaks \
-                 v{client} — an upgraded binary whose service was never restarted. Every \
-                 GitHub-side answer is unavailable until `systemctl restart ghr-stats` \
-                 (or `--user`) reloads it. The fleet itself is fine; this is a client/server \
-                 mismatch.",
-                client = crate::shared::ipc::VERSION
+                 v{client}, so every GitHub-side answer is unavailable until they match. The \
+                 fleet itself is fine; this is a client/server mismatch.",
+                client = crate::shared::ipc::VERSION,
             ),
         ),
         Source::LocalScan(EphemeralReason::Denied) => (
@@ -255,7 +252,7 @@ mod tests {
             (
                 EphemeralReason::VersionDrift { server: 8 },
                 Boundary::Config,
-                "systemctl restart ghr-stats",
+                "until they match",
             ),
             (
                 EphemeralReason::Denied,
@@ -281,7 +278,7 @@ mod tests {
                 f.claim
             );
             assert!(
-                !f.claim.contains("systemd install"),
+                !f.claim.contains("Install it with"),
                 "advised installing a collector that is already running: {}",
                 f.claim
             );

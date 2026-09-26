@@ -44,7 +44,7 @@ impl Client {
                         ?scope,
                         server,
                         client = VERSION,
-                        "collector IPC version mismatch — restart the service after upgrading the binary"
+                        "collector IPC version mismatch — re-run `systemd install` from the newer binary"
                     );
                     reason = EphemeralReason::VersionDrift { server };
                 }
@@ -181,6 +181,57 @@ impl EphemeralReason {
         }
     }
 }
+
+/// Which side of a collector/binary mismatch is the older build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Behind {
+    Service,
+    Binary,
+}
+
+impl Behind {
+    pub(crate) fn of_wire(server: u16) -> Behind {
+        if server < VERSION {
+            Behind::Service
+        } else {
+            Behind::Binary
+        }
+    }
+
+    /// `None` when the builds match or either is not a plain `x.y.z`.
+    pub(crate) fn of_builds(service: &str, binary: &str) -> Option<Behind> {
+        let parse =
+            |v: &str| -> Option<Vec<u64>> { v.split('.').map(|n| n.parse().ok()).collect() };
+        let (service, binary) = (parse(service)?, parse(binary)?);
+        (service != binary).then(|| {
+            if service < binary {
+                Behind::Service
+            } else {
+                Behind::Binary
+            }
+        })
+    }
+
+    /// The service runs its own installed copy, so a restart alone never picks up an upgrade.
+    pub(crate) fn remedy(self) -> String {
+        match self {
+            Behind::Service => format!(
+                "re-install the service from this binary: {} (or `systemd install --user` for a \
+                 user service)",
+                crate::shared::privileged::sudo_hint("systemd install --system")
+            ),
+            Behind::Binary => {
+                "this binary is older than the running service: upgrade it, or use the \
+                 service's installed copy"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// The remedy when the builds differ but which is older is unknown.
+pub(crate) const REINSTALL_FROM_NEWER: &str =
+    "re-run `systemd install` from the newer of the two binaries";
 
 enum ConnectErr {
     Unreachable,

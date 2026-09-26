@@ -1,7 +1,7 @@
 //! Checks only the collector can answer; each starts by opening the socket.
 
 use crate::ops::explain::Boundary;
-use crate::shared::ipc::client::{Client, EphemeralReason};
+use crate::shared::ipc::client::{Behind, Client, EphemeralReason, REINSTALL_FROM_NEWER};
 use crate::shared::ipc::{self, Query, Request, Response};
 use crate::shared::models::FleetStatus;
 use crate::shared::util::{BUILD_VERSION, to_rfc3339_utc};
@@ -51,11 +51,10 @@ fn unreachable_outcome(reason: &EphemeralReason) -> Outcome {
     match reason {
         EphemeralReason::VersionDrift { server } => Outcome::Fail {
             detail: format!(
-                "the collector speaks wire v{server}, this binary speaks v{} — almost always a \
-                 binary upgraded without restarting the service",
+                "the collector speaks wire v{server}, this binary speaks v{}",
                 ipc::VERSION
             ),
-            fix: "sudo systemctl restart ghr-stats.service".to_string(),
+            fix: Behind::of_wire(*server).remedy(),
         },
         other => Outcome::Fail {
             detail: match other.detail() {
@@ -84,7 +83,8 @@ fn version_outcome(collector: &str) -> Outcome {
                  still share wire v{}, so nothing has broken yet",
                 ipc::VERSION
             ),
-            fix: "sudo systemctl restart ghr-stats.service".to_string(),
+            fix: Behind::of_builds(collector, BUILD_VERSION)
+                .map_or_else(|| REINSTALL_FROM_NEWER.to_string(), Behind::remedy),
         }
     }
 }
@@ -163,7 +163,7 @@ mod tests {
                     detail.contains("0.0.1") && detail.contains(BUILD_VERSION),
                     "{detail}"
                 );
-                assert!(fix.contains("systemctl restart"), "{fix}");
+                assert!(fix.contains("systemd install"), "{fix}");
             }
             other => panic!("expected a failure, got {other:?}"),
         }
@@ -241,12 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn wire_drift_keeps_the_restart_as_its_fix() {
+    fn an_older_service_is_fixed_by_reinstalling_it_from_this_binary() {
         match unreachable_outcome(&EphemeralReason::VersionDrift { server: 9 }) {
             Outcome::Fail { detail, fix } => {
                 assert!(detail.contains("wire v9"), "{detail}");
                 assert!(detail.contains(&format!("v{}", ipc::VERSION)), "{detail}");
-                assert!(fix.contains("systemctl restart"), "{fix}");
+                assert!(fix.contains("systemd install"), "{fix}");
             }
             other => panic!("expected a failure, got {other:?}"),
         }
