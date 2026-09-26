@@ -7,7 +7,7 @@ use rusqlite::{Connection, params};
 
 use crate::shared::error::Result;
 use crate::shared::models::timeline::{Bounded, Timeline, TimelinePoint, TimelineQuery, Window};
-use crate::shared::models::{ApiState, GhView, Liveness};
+use crate::shared::models::{ApiState, GhView};
 use crate::shared::util::to_rfc3339_utc;
 
 mod edges;
@@ -85,7 +85,7 @@ fn timeline_samples(
             ts,
             org: r.get(1)?,
             runner: r.get(2)?,
-            liveness: Liveness::from_db(&r.get::<_, String>(3)?),
+            liveness: r.get(3)?,
             github,
         })
     })?;
@@ -106,6 +106,7 @@ fn earliest_sample(conn: &Connection, q: &TimelineQuery) -> Result<Option<i64>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::models::Liveness;
     use crate::shared::models::timeline::{Edge, ReconcileEdge};
 
     fn mem_db() -> Connection {

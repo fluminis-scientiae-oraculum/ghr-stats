@@ -317,11 +317,12 @@ pub enum SystemdAction {
 
 #[derive(Subcommand, Debug)]
 pub enum DbAction {
-    /// Prune samples older than the retention window.
+    /// Delete samples older than N days now, in small batches (the collector also
+    /// prunes on its own per `retention_days`). Job history is kept.
     Prune {
         /// Keep samples newer than this many days.
-        #[arg(long, default_value_t = 14)]
-        days: u64,
+        #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u16).range(1..))]
+        days: u16,
     },
 }
 

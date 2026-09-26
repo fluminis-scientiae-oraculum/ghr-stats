@@ -34,7 +34,7 @@ impl ApiErrorKind {
         }
     }
 
-    /// Low-cardinality `kind` label of `ghr_api_reconcile_errors_total`; also the stored
+    /// Low-cardinality `kind` label of `ghr_api_reconcile_error`; also the stored
     /// `error_kind`.
     pub fn label(&self) -> String {
         match self {
@@ -51,10 +51,11 @@ impl ApiErrorKind {
         match self {
             ApiErrorKind::Unauthorized => "token is invalid or expired",
             ApiErrorKind::Forbidden => {
-                "token lacks 'Self-hosted runners: read', or org approval is pending"
+                "token lacks 'Self-hosted runners: read' (or 'Administration: read' on a \
+                 repository), or org approval is pending"
             }
             ApiErrorKind::NotFound => {
-                "org not found, or this token cannot see it (wrong resource owner?)"
+                "org or repository not found, or this token cannot see it (wrong resource owner?)"
             }
             ApiErrorKind::Http(_) => "unexpected status",
             ApiErrorKind::Transport => "could not reach GitHub",

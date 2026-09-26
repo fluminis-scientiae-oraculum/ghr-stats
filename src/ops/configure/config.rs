@@ -1,7 +1,7 @@
 //! Config-file half of the wizard. Every write is an in-place [`persist`] edit
 //! that preserves every other setting in the file.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -9,6 +9,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
 
 use crate::shared::config::persist;
+use crate::shared::github::RunnerScope;
 use crate::shared::github::validate::{self, PatCheck};
 use crate::shared::models::RunnerInfo;
 
@@ -53,12 +54,11 @@ pub(super) fn manage_tokens(
     {
         return Ok(plan);
     }
+    let local: Vec<(RunnerScope, i64)> = discovered
+        .iter()
+        .map(|r| (r.scope.clone(), r.agent_id))
+        .collect();
     for org in &candidates {
-        let local_ids: HashSet<i64> = discovered
-            .iter()
-            .filter(|r| &r.org == org)
-            .map(|r| r.agent_id)
-            .collect();
         if existing.contains(org) {
             let choice = Select::with_theme(theme)
                 .with_prompt(format!("  {org} already has a PAT — action?"))
@@ -67,7 +67,7 @@ pub(super) fn manage_tokens(
                 .interact()?;
             match choice {
                 1 => {
-                    if let Some(t) = prompt_validated_pat(theme, org, &local_ids)? {
+                    if let Some(t) = prompt_validated_pat(theme, org, &local)? {
                         plan.set.insert(org.clone(), t);
                     }
                 }
@@ -78,7 +78,7 @@ pub(super) fn manage_tokens(
                 _ => {}
             }
         } else if confirm(theme, &format!("  Add a token for {org}?"), false)?
-            && let Some(t) = prompt_validated_pat(theme, org, &local_ids)?
+            && let Some(t) = prompt_validated_pat(theme, org, &local)?
         {
             plan.set.insert(org.clone(), t);
         }
@@ -89,7 +89,7 @@ pub(super) fn manage_tokens(
 fn prompt_validated_pat(
     theme: &ColorfulTheme,
     org: &str,
-    local_ids: &HashSet<i64>,
+    local: &[(RunnerScope, i64)],
 ) -> Result<Option<String>> {
     loop {
         let token = Password::with_theme(theme)
@@ -99,7 +99,7 @@ fn prompt_validated_pat(
         if token.is_empty() {
             return Ok(None);
         }
-        match validate::validate(&token, org, local_ids) {
+        match validate::validate(&token, org, local) {
             PatCheck::Valid {
                 runners,
                 matched,
@@ -191,14 +191,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let cfg: crate::shared::config::Config = toml::from_str(&text).unwrap();
         // Per-org tokens take precedence over env/fallback, so these are deterministic.
-        assert_eq!(
-            cfg.github_token_for("acme").as_deref(),
-            Some("github_pat_NEW")
-        );
-        assert_eq!(
-            cfg.github_token_for("beta").as_deref(),
-            Some("github_pat_B")
-        );
+        assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_NEW"));
+        assert_eq!(cfg.dotcom_token("beta").as_deref(), Some("github_pat_B"));
         assert!(!cfg.github.tokens.contains_key("widgets"));
         assert!(!text.contains("github_pat_W"));
         assert!(cfg.metrics.push.enabled);

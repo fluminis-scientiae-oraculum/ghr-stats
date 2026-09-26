@@ -16,7 +16,8 @@ use super::{Sample, WORK_WALK_EVERY, sleep_until};
 
 pub(super) fn local_loop(cfg: &SharedConfig, term: &AtomicBool, tx: &Sender<Sample>) {
     let mut cpu = CpuRateTracker::new();
-    let mut tick: u64 = 0;
+    // Starts at 1 so the first sample is not held up by a `_work` walk.
+    let mut tick: u64 = 1;
     let mut next = Instant::now();
 
     while !term.load(Ordering::SeqCst) {

@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::cgroup;
 use super::procscan::{self, ProcInfo};
+use crate::shared::github::RunnerScope;
 use crate::shared::models::{Liveness, RunnerInfo};
 use crate::shared::runner_files;
 
@@ -153,8 +154,7 @@ fn roots_from_workdirs(show_output: &str) -> Vec<PathBuf> {
 fn read_runner(dir: &Path) -> anyhow::Result<RunnerInfo> {
     let (raw, _) = runner_files::read_text(dir, ".runner", DOT_RUNNER_CAP)?;
     let parsed: DotRunner = serde_json::from_str(strip_bom(&raw))?;
-    let org = org_from_github_url(&parsed.github_url)
-        .ok_or_else(|| anyhow::anyhow!("no org in gitHubUrl {:?}", parsed.github_url))?;
+    let scope = RunnerScope::parse(&parsed.github_url).map_err(anyhow::Error::msg)?;
     let uid = std::fs::metadata(dir)?.uid();
     let user = uzers::get_user_by_uid(uid)
         .map(|u| u.name().to_string_lossy().into_owned())
@@ -162,7 +162,8 @@ fn read_runner(dir: &Path) -> anyhow::Result<RunnerInfo> {
     Ok(RunnerInfo {
         agent_id: parsed.agent_id,
         name: parsed.agent_name,
-        org,
+        org: scope.login().to_string(),
+        scope,
         group: parsed.pool_name,
         dir: dir.to_path_buf(),
         work_folder: parsed.work_folder.unwrap_or_else(|| "_work".to_string()),
@@ -312,17 +313,6 @@ fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
-/// First path segment of `gitHubUrl`: the org, or the owner of a repo-level runner.
-fn org_from_github_url(url: &str) -> Option<String> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let mut segs = after_scheme.trim_end_matches('/').split('/');
-    let _host = segs.next()?;
-    match segs.next() {
-        Some(s) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
-    }
-}
-
 fn clock_ticks() -> u64 {
     match nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK) {
         Ok(Some(hz)) if hz > 0 => hz as u64,
@@ -358,24 +348,6 @@ mod tests {
     }
 
     #[test]
-    fn org_from_url_variants() {
-        assert_eq!(
-            org_from_github_url("https://github.com/example-org").as_deref(),
-            Some("example-org")
-        );
-        assert_eq!(
-            org_from_github_url("https://github.com/owner/repo").as_deref(),
-            Some("owner")
-        );
-        assert_eq!(
-            org_from_github_url("https://github.com/example-org/").as_deref(),
-            Some("example-org")
-        );
-        assert_eq!(org_from_github_url("https://github.com/"), None);
-        assert_eq!(org_from_github_url("https://github.com"), None);
-    }
-
-    #[test]
     fn bom_is_stripped() {
         let with_bom = "\u{feff}{\"x\":1}";
         assert_eq!(strip_bom(with_bom), "{\"x\":1}");
@@ -392,8 +364,8 @@ mod tests {
         assert_eq!(p.agent_id, 42);
         assert_eq!(p.agent_name, "runner-01");
         assert_eq!(
-            org_from_github_url(&p.github_url).as_deref(),
-            Some("example-org")
+            RunnerScope::parse(&p.github_url).unwrap().login(),
+            "example-org"
         );
         assert_eq!(p.pool_name.as_deref(), Some("Default Group"));
     }

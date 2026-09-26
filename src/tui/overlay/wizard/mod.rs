@@ -1,12 +1,11 @@
 //! In-TUI config wizard typestate. `write` exists only on `Wizard<Confirmed>`, reachable
 //! only from a successful `validate`, so an unvalidated PAT cannot be persisted.
 
-use std::collections::HashSet;
-
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
+use crate::shared::github::RunnerScope;
 use crate::shared::github::validate::{self, PatCheck};
 
 mod draw;
@@ -14,7 +13,8 @@ mod draw;
 pub(crate) use draw::draw;
 
 pub(crate) struct WizardCtx {
-    pub local_ids: HashSet<i64>,
+    /// This host's runners as `(scope, agentId)`.
+    pub local: Vec<(RunnerScope, i64)>,
 }
 
 pub(crate) enum TokenOp<'a> {
@@ -141,9 +141,9 @@ impl Wizard<PatInput> {
     fn edit(&mut self, key: KeyEvent) {
         self.state.pat.handle_event(&Event::Key(key));
     }
-    fn validate(self, local_ids: &HashSet<i64>) -> PatNext {
+    fn validate(self, local: &[(RunnerScope, i64)]) -> PatNext {
         let pat = self.state.pat.value().to_string();
-        match validate::validate(&pat, &self.state.org, local_ids) {
+        match validate::validate(&pat, &self.state.org, local) {
             PatCheck::Valid { matched, local, .. } => PatNext::Confirm(Wizard {
                 state: Confirmed {
                     org: self.state.org,
@@ -233,7 +233,7 @@ impl WizardMode {
             },
             WizardMode::PatInput(mut w) => match key.code {
                 KeyCode::Esc => Step::Close(false),
-                KeyCode::Enter => match w.validate(&ctx.local_ids) {
+                KeyCode::Enter => match w.validate(&ctx.local) {
                     PatNext::Confirm(confirmed) => Step::Stay(WizardMode::Confirmed(confirmed)),
                     PatNext::Reject(retry) => Step::Stay(WizardMode::PatInput(retry)),
                 },
@@ -281,9 +281,7 @@ mod tests {
 
     #[test]
     fn org_then_pat_flow_without_network() {
-        let ctx = WizardCtx {
-            local_ids: HashSet::new(),
-        };
+        let ctx = WizardCtx { local: Vec::new() };
         let mut mode = WizardMode::new();
         mode = step(mode, ev(KeyCode::Char('a')), &ctx);
         assert!(matches!(mode, WizardMode::OrgInput(_)));
@@ -300,9 +298,7 @@ mod tests {
 
     #[test]
     fn remove_org_flow_confirms_and_saves() {
-        let ctx = WizardCtx {
-            local_ids: HashSet::new(),
-        };
+        let ctx = WizardCtx { local: Vec::new() };
         let mut mode = step(WizardMode::new(), ev(KeyCode::Char('r')), &ctx);
         assert!(matches!(mode, WizardMode::RemoveOrgInput(_)));
         mode = step(mode, ev(KeyCode::Enter), &ctx);
@@ -328,9 +324,7 @@ mod tests {
 
     #[test]
     fn empty_org_cannot_advance() {
-        let ctx = WizardCtx {
-            local_ids: HashSet::new(),
-        };
+        let ctx = WizardCtx { local: Vec::new() };
         let mode = step(WizardMode::new(), ev(KeyCode::Char('a')), &ctx);
         let mode = step(mode, ev(KeyCode::Enter), &ctx);
         assert!(matches!(mode, WizardMode::OrgInput(_)));

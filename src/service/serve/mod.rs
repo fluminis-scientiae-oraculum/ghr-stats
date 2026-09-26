@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::bounded;
 use nix::fcntl::{Flock, FlockArg};
+use rusqlite::Connection;
 
 use crate::service::store::{open_reader, open_writer, writer};
 use crate::shared::collectors::{self};
-use crate::shared::config::{Config, SharedConfig};
+use crate::shared::config::{Config, Retention, SharedConfig};
 use crate::shared::hooks::ingest::HookEvent;
 use crate::shared::models::{ApiOrgOutcome, HostSample, JobConclusion, RunnerSample};
 
@@ -143,40 +144,12 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
         );
     }
 
+    let mut pruner = Pruner::new();
     for msg in rx.iter() {
-        match msg {
-            Sample::Local { runners, host } => {
-                match writer::write_local(&mut db, &runners, &host) {
-                    Ok(()) => tracing::debug!(runners = runners.len(), "local sample persisted"),
-                    Err(e) => tracing::error!(error = %e, "local write failed"),
-                }
-            }
-            Sample::Api { ts, outcomes } => {
-                match writer::write_api_runners(&mut db, ts, &outcomes) {
-                    Ok(()) => {
-                        tracing::debug!(orgs = outcomes.len(), "api reconcile persisted")
-                    }
-                    Err(e) => tracing::error!(error = %e, "api write failed"),
-                }
-            }
-            Sample::Hook {
-                stream,
-                runner,
-                events,
-                offset,
-            } => match writer::apply_hook_events(&mut db, &stream, &runner, &events, offset) {
-                Ok(()) => {
-                    tracing::debug!(stream = %stream, events = events.len(), offset, "hook events persisted")
-                }
-                Err(e) => tracing::error!(error = %e, stream = %stream, "hook write failed"),
-            },
-            Sample::JobConclusions { updates } => {
-                match writer::apply_job_conclusions(&mut db, &updates) {
-                    Ok(()) => tracing::debug!(n = updates.len(), "job conclusions reconciled"),
-                    Err(e) => tracing::error!(error = %e, "job conclusion write failed"),
-                }
-            }
+        if let Err(e) = msg.persist(&mut db) {
+            tracing::error!(error = %e, sample = msg.kind(), "write failed");
         }
+        pruner.step(&mut db, shared.snapshot().retention_days);
     }
 
     let _ = local.join();
@@ -188,6 +161,83 @@ pub fn run(cfg: &Config, config_override: Option<&Path>) -> Result<()> {
     let _ = ipc.join();
     tracing::info!("serve stopped");
     Ok(())
+}
+
+impl Sample {
+    fn persist(&self, db: &mut Connection) -> crate::shared::error::Result<()> {
+        match self {
+            Sample::Local { runners, host } => writer::write_local(db, runners, host),
+            Sample::Api { ts, outcomes } => writer::write_api_runners(db, *ts, outcomes),
+            Sample::Hook {
+                stream,
+                runner,
+                events,
+                offset,
+            } => writer::apply_hook_events(db, stream, runner, events, *offset),
+            Sample::JobConclusions { updates } => writer::apply_job_conclusions(db, updates),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Sample::Local { .. } => "local",
+            Sample::Api { .. } => "api",
+            Sample::Hook { .. } => "hook",
+            Sample::JobConclusions { .. } => "job-conclusions",
+        }
+    }
+}
+
+/// Deletes samples past `retention_days` hourly, in slices of at most
+/// [`Pruner::SLICE`] between writes, so a large backlog never holds the write lock long.
+struct Pruner {
+    due: Instant,
+    removed: usize,
+}
+
+impl Pruner {
+    const EVERY: Duration = Duration::from_secs(3600);
+    const SLICE: Duration = Duration::from_millis(200);
+    const BATCH: usize = 5_000;
+
+    fn new() -> Self {
+        Self {
+            due: Instant::now(),
+            removed: 0,
+        }
+    }
+
+    fn step(&mut self, db: &mut Connection, retention: Retention) {
+        if Instant::now() < self.due {
+            return;
+        }
+        let Some(cutoff) = retention.cutoff(crate::shared::util::now_epoch()) else {
+            self.due = Instant::now() + Self::EVERY;
+            return;
+        };
+        let started = Instant::now();
+        loop {
+            match writer::prune_batch(db, cutoff, Self::BATCH) {
+                Ok(0) => {
+                    if self.removed > 0 {
+                        tracing::info!(removed = self.removed, "retention: pruned old samples");
+                    }
+                    self.removed = 0;
+                    self.due = Instant::now() + Self::EVERY;
+                    return;
+                }
+                Ok(n) => self.removed += n,
+                Err(e) => {
+                    tracing::error!(error = %e, "retention prune failed");
+                    self.due = Instant::now() + Self::EVERY;
+                    return;
+                }
+            }
+            if started.elapsed() >= Self::SLICE {
+                return;
+            }
+        }
+    }
 }
 
 fn sleep_until(deadline: Instant, term: &AtomicBool) {

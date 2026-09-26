@@ -77,8 +77,10 @@ pub fn write_local(
     Ok(())
 }
 
-/// Keeps `job_event`. A new time-series table must be added to `SAMPLE_TABLES`.
-pub fn prune(conn: &mut Connection, cutoff_ts: i64) -> Result<usize> {
+/// Delete up to `batch` samples older than `cutoff_ts` from each time-series table in one
+/// transaction; returns how many went. Keeps `job_event`. A new time-series table must be
+/// added to `SAMPLE_TABLES`.
+pub fn prune_batch(conn: &mut Connection, cutoff_ts: i64, batch: usize) -> Result<usize> {
     const SAMPLE_TABLES: [&str; 5] = [
         "runner_sample",
         "host_sample",
@@ -90,8 +92,11 @@ pub fn prune(conn: &mut Connection, cutoff_ts: i64) -> Result<usize> {
     let mut removed = 0;
     for table in SAMPLE_TABLES {
         removed += tx.execute(
-            &format!("DELETE FROM {table} WHERE ts < ?1"),
-            params![cutoff_ts],
+            &format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE ts < ?1 LIMIT ?2)"
+            ),
+            params![cutoff_ts, batch as i64],
         )?;
     }
     tx.commit()?;
@@ -125,7 +130,8 @@ mod tests {
         conn.execute("INSERT INTO job_event (run_id) VALUES (42)", [])
             .unwrap();
 
-        let removed = prune(&mut conn, 300).unwrap();
+        let removed = prune_batch(&mut conn, 300, 1000).unwrap();
+        assert_eq!(prune_batch(&mut conn, 300, 1000).unwrap(), 0);
         assert_eq!(removed, 2);
         let runners: i64 = conn
             .query_row("SELECT count(*) FROM runner_sample", [], |r| r.get(0))

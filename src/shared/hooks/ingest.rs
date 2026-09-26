@@ -48,18 +48,7 @@ impl HookEvent {
 /// is not an event for one of `owner`'s repositories yields `None`.
 pub fn parse_event_line(line: &str, owner: &str) -> Option<HookEvent> {
     let event: HookEvent = serde_json::from_str(line.trim()).ok()?;
-    is_repo_of(&event.job().repo, owner).then_some(event)
-}
-
-fn is_repo_of(repo: &str, owner: &str) -> bool {
-    let Some((o, name)) = repo.split_once('/') else {
-        return false;
-    };
-    o.eq_ignore_ascii_case(owner)
-        && !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    crate::shared::github::is_repo_of(&event.job().repo, owner).then_some(event)
 }
 
 /// Complete lines of the event log in `dir` from `offset`, one chunk at most.

@@ -6,6 +6,17 @@ use crate::shared::models::{FleetCounts, FleetStatus, Mode, OrgStatus, RunnerSta
 use super::Snapshot;
 
 impl Snapshot {
+    /// No runners is an inability to answer, not health.
+    pub fn verdict(&self) -> Verdict {
+        if self.runners.is_empty() {
+            Verdict::Unknown
+        } else if self.divergent > 0 || self.offline > 0 {
+            Verdict::Degraded
+        } else {
+            Verdict::Ok
+        }
+    }
+
     pub fn to_status(&self, mode: Mode) -> FleetStatus {
         let reconcile_age = |org: &str| -> Option<i64> {
             self.reconcile
@@ -57,14 +68,7 @@ impl Snapshot {
             })
             .collect();
 
-        // No runners is an inability to answer, not health.
-        let verdict = if self.runners.is_empty() {
-            Verdict::Unknown
-        } else if self.divergent > 0 || self.offline > 0 {
-            Verdict::Degraded
-        } else {
-            Verdict::Ok
-        };
+        let verdict = self.verdict();
 
         FleetStatus {
             schema_version: 1,

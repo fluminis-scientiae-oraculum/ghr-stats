@@ -85,7 +85,11 @@ impl App {
 
     fn wizard_ctx(&self) -> wizard::WizardCtx {
         wizard::WizardCtx {
-            local_ids: self.runners.iter().map(|r| r.agent_id).collect(),
+            local: self
+                .runners
+                .iter()
+                .map(|r| (r.scope.clone(), r.agent_id))
+                .collect(),
         }
     }
 

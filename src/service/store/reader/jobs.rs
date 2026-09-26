@@ -39,14 +39,18 @@ pub fn recent_jobs(conn: &Connection, limit: usize) -> Result<Vec<JobRow>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-pub fn jobs_awaiting_conclusion(conn: &Connection, limit: usize) -> Result<Vec<PendingConclusion>> {
+pub fn jobs_awaiting_conclusion(
+    conn: &Connection,
+    completed_since: i64,
+    limit: usize,
+) -> Result<Vec<PendingConclusion>> {
     let mut stmt = conn.prepare_cached(
         "SELECT org, repo, run_id, run_attempt, job, runner_name FROM job_event \
-         WHERE completed_at IS NOT NULL AND conclusion IS NULL \
+         WHERE completed_at >= ?1 AND conclusion IS NULL \
                AND org <> '' AND repo <> '' \
-         ORDER BY completed_at DESC LIMIT ?1",
+         ORDER BY completed_at ASC LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![limit as i64], |r| {
+    let rows = stmt.query_map(params![completed_since, limit as i64], |r| {
         Ok(PendingConclusion {
             org: r.get(0)?,
             repo: r.get(1)?,
@@ -136,8 +140,9 @@ mod tests {
         )
         .unwrap();
 
-        let p = jobs_awaiting_conclusion(&conn, 10).unwrap();
+        let p = jobs_awaiting_conclusion(&conn, 0, 10).unwrap();
         assert_eq!(p.len(), 1);
+        assert!(jobs_awaiting_conclusion(&conn, 21, 10).unwrap().is_empty());
         assert_eq!(
             (
                 p[0].run_id,

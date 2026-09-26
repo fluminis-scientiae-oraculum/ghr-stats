@@ -21,11 +21,13 @@ pub use status::{FleetCounts, FleetStatus, Mode, OrgStatus, RunnerStatus, Verdic
 
 /// Static identity of a runner from its `.runner` file (`agentId`, `agentName`,
 /// `gitHubUrl` → org, `poolName`, `workFolder`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInfo {
     pub agent_id: i64,
     pub name: String,
+    /// The scope's login: org, repository owner or enterprise.
     pub org: String,
+    pub scope: crate::shared::github::RunnerScope,
     pub group: Option<String>,
     pub dir: PathBuf,
     pub work_folder: String,
@@ -51,12 +53,18 @@ impl Liveness {
             Liveness::Offline => "offline",
         }
     }
+}
 
-    pub fn from_db(s: &str) -> Liveness {
-        match s {
-            "busy" => Liveness::Busy,
-            "idle" => Liveness::Idle,
-            _ => Liveness::Offline,
+/// An unknown stored label is an error, never a guessed state.
+impl rusqlite::types::FromSql for Liveness {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match v.as_str()? {
+            "busy" => Ok(Liveness::Busy),
+            "idle" => Ok(Liveness::Idle),
+            "offline" => Ok(Liveness::Offline),
+            other => Err(rusqlite::types::FromSqlError::Other(
+                format!("unknown liveness {other:?}").into(),
+            )),
         }
     }
 }

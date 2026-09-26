@@ -4,12 +4,14 @@
 
 use std::collections::HashSet;
 
-use super::list_org_runners;
+use super::{GitHubHost, Owner, RunnerScope, describe_failure, runners};
+use crate::shared::config::Secret;
 
 const FINE_PREFIX: &str = "github_pat_";
 const CLASSIC_PREFIXES: [&str; 5] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
 const GUIDANCE: &str = "use a FINE-GRAINED token (github_pat_…) with Organization → \
-     Self-hosted runners: Read (+ Repository → Actions: Read for job results)";
+     Self-hosted runners: Read, or Repository → Administration: Read for repository \
+     runners (+ Repository → Actions: Read for job results)";
 
 pub(crate) enum PatCheck {
     /// Authenticated; `matched` of `local` discovered runners were confirmed.
@@ -32,20 +34,38 @@ pub(crate) fn prefix_check(token: &str) -> Result<(), String> {
     Err(format!("unrecognized token — {GUIDANCE}"))
 }
 
-pub(crate) fn validate(token: &str, org: &str, local_ids: &HashSet<i64>) -> PatCheck {
+/// Validate `token` for `org` against this host's runners, given as `(scope, agentId)`:
+/// every scope registered under `org` is listed, and only `org`'s runners are matched.
+pub(crate) fn validate(token: &str, org: &str, local: &[(RunnerScope, i64)]) -> PatCheck {
     if let Err(g) = prefix_check(token) {
         return PatCheck::Rejected(g);
     }
-    match list_org_runners(token, org) {
-        Ok(api) => {
-            let matched = api.iter().filter(|r| local_ids.contains(&r.id)).count();
-            PatCheck::Valid {
-                runners: api.len(),
-                matched,
-                local: local_ids.len(),
-            }
+    let mine: Vec<&(RunnerScope, i64)> = local
+        .iter()
+        .filter(|(s, _)| s.login().eq_ignore_ascii_case(org))
+        .collect();
+    let mut scopes: Vec<RunnerScope> = mine.iter().map(|(s, _)| s.clone()).collect();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        scopes.push(RunnerScope {
+            host: GitHubHost::dotcom(),
+            owner: Owner::Org(org.to_string()),
+        });
+    }
+    let secret = Secret::from(token.trim().to_string());
+    let mut api = Vec::new();
+    for scope in &scopes {
+        match runners(scope, &secret) {
+            Ok(r) => api.extend(r),
+            Err(kind) => return PatCheck::Rejected(describe_failure(org, kind)),
         }
-        Err(e) => PatCheck::Rejected(e.to_string()),
+    }
+    let ids: HashSet<i64> = mine.iter().map(|(_, id)| *id).collect();
+    PatCheck::Valid {
+        runners: api.len(),
+        matched: api.iter().filter(|r| ids.contains(&r.id)).count(),
+        local: ids.len(),
     }
 }
 

@@ -89,6 +89,7 @@ impl App {
                 agent_id: id,
                 name: p.info.name,
                 org: p.info.org,
+                scope: p.info.scope,
                 group: p.info.group,
                 dir: p.info.dir,
                 user: p.info.user,
