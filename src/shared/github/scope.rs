@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// A GitHub host: `github.com`, a GHE.com data-residency tenant, or a GHES server.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GitHubHost(String);
@@ -104,6 +106,72 @@ impl RunnerScope {
     }
 }
 
+/// A `[github.tokens]` key: `login` (github.com) or `host/login`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct TokenKey {
+    host: GitHubHost,
+    login: String,
+}
+
+impl TokenKey {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (host, login) = match s.split_once('/') {
+            Some((h, l)) => (GitHubHost::parse(h)?, l),
+            None => (GitHubHost::dotcom(), s),
+        };
+        Ok(Self {
+            host,
+            login: self::login(login, s)?,
+        })
+    }
+
+    /// The key a runner registered to `scope` is looked up under.
+    pub fn for_scope(scope: &RunnerScope) -> Self {
+        Self {
+            host: scope.host.clone(),
+            login: scope.login().to_string(),
+        }
+    }
+
+    pub fn host(&self) -> &GitHubHost {
+        &self.host
+    }
+
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+
+    pub fn matches(&self, host: &GitHubHost, login: &str) -> bool {
+        &self.host == host && self.login.eq_ignore_ascii_case(login)
+    }
+}
+
+impl fmt::Display for TokenKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.is_dotcom() {
+            f.write_str(&self.login)
+        } else {
+            write!(f, "{}/{}", self.host, self.login)
+        }
+    }
+}
+
+impl TryFrom<String> for TokenKey {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        Self::parse(&s)
+    }
+}
+
+impl From<TokenKey> for String {
+    fn from(k: TokenKey) -> String {
+        k.to_string()
+    }
+}
+
 fn login(s: &str, url: &str) -> Result<String, String> {
     let ok =
         !s.is_empty() && s.len() <= 39 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
@@ -168,6 +236,20 @@ mod tests {
             "https://github.com/o/..",
         ] {
             assert!(RunnerScope::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn token_keys_name_a_login_optionally_on_a_host() {
+        let dotcom = TokenKey::parse("Example-Org").unwrap();
+        assert!(dotcom.matches(&GitHubHost::dotcom(), "example-org"));
+        assert_eq!(dotcom.to_string(), "Example-Org");
+        let ghes = TokenKey::parse("ghe.example.com/eng").unwrap();
+        assert!(ghes.matches(&GitHubHost::parse("ghe.example.com").unwrap(), "eng"));
+        assert!(!ghes.matches(&GitHubHost::dotcom(), "eng"));
+        assert_eq!(ghes.to_string(), "ghe.example.com/eng");
+        for bad in ["", "a/b/c", "org name", "ghe.example.com/"] {
+            assert!(TokenKey::parse(bad).is_err(), "{bad}");
         }
     }
 

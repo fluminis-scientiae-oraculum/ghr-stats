@@ -7,17 +7,15 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::cli::TimelineArgs;
-use crate::shared::config::Config;
 use crate::shared::ipc::client::Client;
 use crate::shared::ipc::{Query, Request, Response};
 use crate::shared::models::timeline::TimelineQuery;
 use crate::shared::util::now_epoch;
 
 mod render;
-mod since;
+pub(crate) mod since;
 
 use render::human;
-use since::parse_since;
 
 /// Bounds one call's output, not storage (`db prune` keeps 14 days by default).
 const MAX_WINDOW_SECS: u64 = 7 * 86_400;
@@ -36,14 +34,10 @@ impl From<Availability> for ExitCode {
     }
 }
 
-pub fn run(args: &TimelineArgs, _cfg: &Config) -> Result<Availability> {
-    let window = parse_since(&args.since)?;
+pub fn run(args: &TimelineArgs) -> Result<Availability> {
+    let window = args.since;
     if window.clamped {
-        eprintln!(
-            "note: --since {} exceeds the {}d maximum window; using 7d",
-            args.since,
-            MAX_WINDOW_SECS / 86_400
-        );
+        eprintln!("note: --since is capped at {window}");
     }
 
     let mut client = match Client::connect_any() {
@@ -78,9 +72,9 @@ pub fn run(args: &TimelineArgs, _cfg: &Config) -> Result<Availability> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&timeline)?);
+        crate::ops::emit_json(&timeline)?;
     } else {
-        print!("{}", human(&timeline, &args.since));
+        crate::ops::emit(&human(&timeline, &window.to_string()))?;
     }
     Ok(Availability::Answered)
 }

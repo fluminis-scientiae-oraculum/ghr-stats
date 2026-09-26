@@ -112,8 +112,9 @@ pub(crate) struct App {
     pub(crate) runners: Vec<LiveRunner>,
     pub(crate) host: Option<HostPoint>,
     pub(crate) tab: Tab,
-    /// `Some(row)` when Summary is drilled into Detail for `runners[row]`.
-    pub(crate) drill: Option<usize>,
+    /// The install dir of the runner Summary is drilled into. Keyed by dir, not row:
+    /// the list is rebuilt every refresh.
+    pub(crate) drill: Option<PathBuf>,
     /// Render writes back ratatui's auto-scroll offset; `select_or_open` needs it fresh.
     pub(crate) table: RefCell<TableState>,
     pub(crate) detail_history: Vec<HistPoint>,
@@ -207,7 +208,8 @@ impl App {
     }
 
     pub(crate) fn detail_runner(&self) -> Option<&LiveRunner> {
-        self.drill.and_then(|i| self.runners.get(i))
+        let dir = self.drill.as_ref()?;
+        self.runners.iter().find(|r| &r.dir == dir)
     }
 
     pub(crate) fn restart_action(&self) -> Result<ActionKind, String> {

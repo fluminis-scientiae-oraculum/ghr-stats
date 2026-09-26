@@ -39,7 +39,9 @@ pub(crate) enum Progress {
 
 pub fn run(args: &WaitArgs, cfg: &Config) -> Result<Outcome> {
     let interval = Duration::from_secs(cfg.intervals.local_secs.max(1));
-    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(args.timeout))
+        .ok_or_else(|| anyhow::anyhow!("--timeout {} is too large", args.timeout))?;
 
     let mut last: Option<Progress> = None;
     let mut first = true;
@@ -136,11 +138,13 @@ fn describe(p: &Progress) -> String {
     }
 }
 
+/// The snapshot the wait was about: only `--org`'s runners, when given.
 fn report(args: &WaitArgs, status: &FleetStatus) -> Result<()> {
+    let status = crate::ops::status::scoped(status.clone(), args.org.as_deref(), None);
     if args.json {
-        println!("{}", serde_json::to_string_pretty(status)?);
+        crate::ops::emit_json(&status)?;
     } else {
-        print!("{}", crate::ops::status::human(status));
+        crate::ops::emit(&crate::ops::status::human(&status))?;
     }
     Ok(())
 }

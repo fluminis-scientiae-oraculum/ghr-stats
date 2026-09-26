@@ -27,7 +27,7 @@ pub(super) fn hooks_step(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Re
     if !confirm(theme, "Install / repair runner hooks now?", false)? {
         return Ok(());
     }
-    apply_hooks(theme, discovered)
+    with_root(|root| apply_hooks(theme, discovered, &root))
 }
 
 /// The TUI's `[h]` action, run while the TUI is suspended on the real TTY.
@@ -49,20 +49,30 @@ pub(crate) fn install_hooks_for_tui(roots: &[PathBuf]) -> Result<()> {
         "Installing / repairing job hooks for {} runners (detect-first, never clobbering).\n",
         discovered.len()
     );
-    apply_hooks(&theme, &discovered)
+    with_root(|root| apply_hooks(&theme, &discovered, &root))
+}
+
+fn with_root(f: impl FnOnce(privileged::Root) -> Result<()>) -> Result<()> {
+    match privileged::require_root("config") {
+        Ok(root) => f(root),
+        Err(hint) => {
+            println!(
+                "  runner hooks need root — the scripts go in the system hooks dir, and \
+                 each runner's .env belongs to its runner user.\n  Re-run:  {hint}"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// No initial confirm: the caller has already consented.
-fn apply_hooks(theme: &ColorfulTheme, discovered: &[RunnerInfo]) -> Result<()> {
-    if let Err(hint) = privileged::require_root("config") {
-        println!(
-            "  runner hooks need root — the scripts go in the system hooks dir, and \
-             each runner's .env belongs to its runner user.\n  Re-run:  {hint}"
-        );
-        return Ok(());
-    }
+fn apply_hooks(
+    theme: &ColorfulTheme,
+    discovered: &[RunnerInfo],
+    root: &privileged::Root,
+) -> Result<()> {
     let our_dir = install::hooks_dir(&Scope::detect().data_dir());
-    let (started, completed) = match install::install_scripts(&our_dir) {
+    let (started, completed) = match install::install_scripts(&our_dir, root) {
         Ok(p) => p,
         Err(e) => {
             println!(

@@ -6,14 +6,20 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::cli::SystemdAction;
-use crate::shared::config::Config;
 use crate::shared::paths::{ADMIN_GROUP, Scope};
 
 const UNIT_NAME: &str = "ghr-stats.service";
 
-pub fn run(action: SystemdAction, _cfg: &Config) -> Result<()> {
+pub fn run(action: SystemdAction) -> Result<()> {
     match action {
-        SystemdAction::Install { system, user } => install(resolve_scope(system, user)),
+        SystemdAction::Install { system, user } => install(match resolve_scope(system, user) {
+            Scope::System => Install::System(
+                crate::shared::privileged::require_root("systemd install --system").map_err(
+                    |hint| anyhow::anyhow!("system install needs root — re-run `{hint}`"),
+                )?,
+            ),
+            Scope::User => Install::User,
+        }),
         SystemdAction::Uninstall => uninstall(resolve_scope(false, false)),
     }
 }
@@ -26,13 +32,17 @@ pub(crate) fn resolve_scope(system: bool, user: bool) -> Scope {
     }
 }
 
-fn install(scope: Scope) -> Result<()> {
-    if scope == Scope::System
-        && let Err(hint) = crate::shared::privileged::require_root("systemd install --system")
-    {
-        bail!("system install needs root — re-run `{hint}`");
-    }
+/// A system install is reachable only with proof of root.
+enum Install {
+    System(crate::shared::privileged::Root),
+    User,
+}
 
+fn install(target: Install) -> Result<()> {
+    let scope = match target {
+        Install::System(_) => Scope::System,
+        Install::User => Scope::User,
+    };
     let bin = scope.bin_path();
     let src = std::env::current_exe().context("locating the running binary")?;
     copy_bin(&src, &bin)?;
@@ -132,7 +142,7 @@ fn render_unit(bin: &Path, scope: Scope) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={bin} serve\n\
+         ExecStart=\"{bin}\" serve\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          RuntimeDirectory=ghr-stats\n\
@@ -201,7 +211,7 @@ mod tests {
     #[test]
     fn system_unit_runs_serve_and_wants_multi_user() {
         let u = render_unit(Path::new("/usr/local/bin/ghr-stats"), Scope::System);
-        assert!(u.contains("ExecStart=/usr/local/bin/ghr-stats serve"));
+        assert!(u.contains(r#"ExecStart="/usr/local/bin/ghr-stats" serve"#));
         assert!(u.contains("WantedBy=multi-user.target"));
         assert!(u.contains("Type=simple"));
         assert!(u.contains("RuntimeDirectory=ghr-stats"));
@@ -211,7 +221,7 @@ mod tests {
     #[test]
     fn user_unit_wants_default_target() {
         let u = render_unit(Path::new("/home/x/.local/bin/ghr-stats"), Scope::User);
-        assert!(u.contains("ExecStart=/home/x/.local/bin/ghr-stats serve"));
+        assert!(u.contains(r#"ExecStart="/home/x/.local/bin/ghr-stats" serve"#));
         assert!(u.contains("WantedBy=default.target"));
         assert!(u.contains("RuntimeDirectory=ghr-stats"));
     }

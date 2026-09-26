@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::cli::DoctorArgs;
 use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
+use crate::shared::config::Intervals;
 use crate::shared::models::Verdict;
 use crate::shared::util::{BUILD_VERSION, now_epoch, to_rfc3339_utc};
 
@@ -55,9 +56,9 @@ pub(crate) struct Report {
 pub fn run(args: &DoctorArgs, config_path: Option<&Path>) -> Result<Verdict> {
     let report = diagnose(args, config_path);
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        crate::ops::emit_json(&report)?;
     } else {
-        print!("{}", human(&report));
+        crate::ops::emit(&human(&report))?;
     }
     Ok(report.verdict)
 }
@@ -77,7 +78,11 @@ fn diagnose(args: &DoctorArgs, config_path: Option<&Path>) -> Report {
         .unwrap_or_default();
 
     let mut checks = vec![host::config_check(&source, &orgs)];
-    checks.extend(collector::collector_checks());
+    let max_age = source.cfg().map_or_else(
+        || Intervals::default().api_max_age(),
+        |c| c.intervals.api_max_age(),
+    );
+    checks.extend(collector::collector_checks(max_age));
     checks.extend(host::config_dependent(&source, args, &discovered, &orgs));
 
     Report {

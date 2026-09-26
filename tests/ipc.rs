@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 /// Hard-coded, not imported: a wire bump must break this file loudly.
-const WIRE: u16 = 10;
+const WIRE: u16 = 11;
 
 struct Collector {
     child: Child,
@@ -207,14 +207,14 @@ fn the_mutation_gate_matches_the_callers_privilege() {
 
     let reply = round_trip(
         &mut s,
-        &json!({"Mutate": {"SetMetricsPull": {"enabled": true, "addr": "127.0.0.1:9999"}}}),
+        &json!({"Mutate": {"SetMetricsPull": {"enabled": true}}}),
     );
 
     if privileged() {
         assert_eq!(reply, json!("Mutated"), "authorized mutation refused");
         let written = std::fs::read_to_string(&c.config).expect("read config");
         assert!(
-            written.contains("9999"),
+            written.contains("[metrics.pull]"),
             "mutation was acknowledged but not persisted:\n{written}"
         );
     } else {
@@ -225,7 +225,7 @@ fn the_mutation_gate_matches_the_callers_privilege() {
         );
         let written = std::fs::read_to_string(&c.config).expect("read config");
         assert!(
-            !written.contains("9999"),
+            !written.contains("[metrics.pull]"),
             "refused mutation still touched the config:\n{written}"
         );
     }

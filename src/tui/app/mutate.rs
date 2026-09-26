@@ -48,26 +48,21 @@ impl App {
                 let source = &mut self.source;
                 // One closure for both ops: two could not both borrow `source` mutably.
                 let apply = |op: wizard::TokenOp| -> Result<(), String> {
-                    match op {
-                        wizard::TokenOp::Set { org, token } => match source
-                            .add_org_token(org, token)
-                        {
-                            MutateOutcome::Mutated => Ok(()),
-                            MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
-                            MutateOutcome::Unreachable => {
-                                crate::shared::config::persist::set_org_token(&target, org, token)
-                                    .map_err(|e| e.to_string())
+                    use crate::shared::config::persist;
+                    let (outcome, direct): (_, &dyn Fn() -> crate::shared::error::Result<()>) =
+                        match op {
+                            wizard::TokenOp::Set { org, token } => {
+                                (source.add_org_token(org, token), &move || {
+                                    persist::set_org_token(&target, org, token)
+                                })
                             }
-                        },
-                        wizard::TokenOp::Remove { org } => match source.remove_org_token(org) {
-                            MutateOutcome::Mutated => Ok(()),
-                            MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
-                            MutateOutcome::Unreachable => {
-                                crate::shared::config::persist::remove_org_token(&target, org)
-                                    .map_err(|e| e.to_string())
+                            wizard::TokenOp::Remove { org } => {
+                                (source.remove_org_token(org), &move || {
+                                    persist::remove_org_token(&target, org)
+                                })
                             }
-                        },
-                    }
+                        };
+                    resolve(outcome, direct)
                 };
                 match mode.on_key(key, &ctx, apply) {
                     wizard::Step::Stay(next) => self.overlay = Some(Overlay::Wizard(next)),
@@ -99,18 +94,15 @@ impl App {
     }
 
     pub(crate) fn toggle_metrics(&mut self) {
+        if let Err(e) = self.cfg.require_readable() {
+            self.status = Some(format!("✗ {e}"));
+            return;
+        }
         let enabled = !self.cfg.metrics.pull.enabled;
-        let addr = self.cfg.metrics.pull.addr.clone();
-        let result = match self.source.set_metrics_pull(enabled, &addr) {
-            MutateOutcome::Mutated => Ok(()),
-            MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
-            MutateOutcome::Unreachable => crate::shared::config::persist::set_metrics_pull(
-                &self.config_target(),
-                enabled,
-                &addr,
-            )
-            .map_err(|e| e.to_string()),
-        };
+        let target = self.config_target();
+        let result = resolve(self.source.set_metrics_pull(enabled), &|| {
+            crate::shared::config::persist::set_metrics_pull(&target, enabled, None)
+        });
         match result {
             Ok(()) => {
                 // Mirrored, not reloaded: a non-root TUI cannot re-read root-owned /etc.
@@ -130,5 +122,18 @@ impl App {
             self.cfg = cfg;
         }
         self.refresh();
+    }
+}
+
+/// The collector's answer, or the direct write when no collector is there to ask.
+fn resolve(
+    outcome: MutateOutcome,
+    direct: &dyn Fn() -> crate::shared::error::Result<()>,
+) -> Result<(), String> {
+    match outcome {
+        MutateOutcome::Mutated => Ok(()),
+        MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
+        MutateOutcome::Failed(e) => Err(e),
+        MutateOutcome::Unreachable => direct().map_err(|e| e.to_string()),
     }
 }

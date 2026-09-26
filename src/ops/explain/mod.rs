@@ -90,9 +90,9 @@ pub fn run(args: &ExplainArgs, cfg: &Config) -> Result<Verdict> {
     let explanation = explain(&crate::ops::status::snapshot(cfg));
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&explanation)?);
+        crate::ops::emit_json(&explanation)?;
     } else {
-        print!("{}", human(&explanation));
+        crate::ops::emit(&human(&explanation))?;
     }
     Ok(explanation.verdict)
 }

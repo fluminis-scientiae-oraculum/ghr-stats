@@ -36,7 +36,8 @@ pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
     let execute = !preview;
 
     // Refuse up front rather than remove some system artifacts and fail on the rest.
-    if execute && scope == Scope::System && !privileged::is_root() {
+    let root = privileged::require_root("uninstall").ok();
+    if execute && scope == Scope::System && root.is_none() {
         bail!(
             "system-scope uninstall needs root — re-run `{}`",
             privileged::sudo_hint("uninstall")
@@ -63,7 +64,7 @@ pub fn run(args: &UninstallArgs, config_override: Option<&Path>) -> Result<()> {
         return Ok(());
     }
     println!();
-    plan.apply();
+    plan.apply(root.as_ref());
     Ok(())
 }
 

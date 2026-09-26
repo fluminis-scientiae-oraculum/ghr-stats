@@ -120,7 +120,11 @@ impl<'t> Suspension<'t> {
 }
 
 impl Drop for Suspension<'_> {
+    /// Not while panicking: the panic hook has restored the shell, and re-entering raw
+    /// mode here would leave it unusable.
     fn drop(&mut self) {
-        let _ = self.restore();
+        if !std::thread::panicking() {
+            let _ = self.restore();
+        }
     }
 }

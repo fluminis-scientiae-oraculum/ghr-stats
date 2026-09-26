@@ -5,8 +5,8 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::shared::github::RunnerScope;
-use crate::shared::github::validate::{self, PatCheck};
+use crate::shared::github::validate::{self, FineGrainedPat, PatCheck};
+use crate::shared::github::{RunnerScope, TokenKey};
 
 mod draw;
 
@@ -18,34 +18,41 @@ pub(crate) struct WizardCtx {
 }
 
 pub(crate) enum TokenOp<'a> {
-    Set { org: &'a str, token: &'a str },
-    Remove { org: &'a str },
+    Set {
+        org: &'a TokenKey,
+        token: &'a FineGrainedPat,
+    },
+    Remove {
+        org: &'a TokenKey,
+    },
 }
 
 pub(crate) struct PickAction;
 pub(crate) struct OrgInput {
     org: Input,
+    error: Option<String>,
 }
 pub(crate) struct PatInput {
-    org: String,
+    org: TokenKey,
     pat: Input,
     error: Option<String>,
 }
 pub(crate) struct Confirmed {
-    org: String,
-    pat: String,
+    org: TokenKey,
+    pat: FineGrainedPat,
     matched: usize,
     local: usize,
 }
 pub(crate) struct RemoveOrgInput {
     org: Input,
+    error: Option<String>,
 }
 pub(crate) struct RemoveConfirm {
-    org: String,
+    org: TokenKey,
 }
-pub(crate) struct Done {
-    message: String,
-    ok: bool,
+pub(crate) enum Done {
+    Saved(String),
+    Failed(String),
 }
 
 pub(crate) struct Wizard<S> {
@@ -57,6 +64,7 @@ impl Wizard<PickAction> {
         Wizard {
             state: OrgInput {
                 org: Input::default(),
+                error: None,
             },
         }
     }
@@ -64,6 +72,7 @@ impl Wizard<PickAction> {
         Wizard {
             state: RemoveOrgInput {
                 org: Input::default(),
+                error: None,
             },
         }
     }
@@ -78,14 +87,17 @@ impl Wizard<RemoveOrgInput> {
     fn edit(&mut self, key: KeyEvent) {
         self.state.org.handle_event(&Event::Key(key));
     }
-    fn next(self) -> RemoveNext {
-        let org = self.state.org.value().trim().to_string();
-        if org.is_empty() {
-            return RemoveNext::Stay(self);
+    fn next(mut self) -> RemoveNext {
+        match parse_org(&self.state.org) {
+            Ok(Some(org)) => RemoveNext::Confirm(Wizard {
+                state: RemoveConfirm { org },
+            }),
+            Ok(None) => RemoveNext::Stay(self),
+            Err(e) => {
+                self.state.error = Some(e);
+                RemoveNext::Stay(self)
+            }
         }
-        RemoveNext::Confirm(Wizard {
-            state: RemoveConfirm { org },
-        })
     }
 }
 
@@ -94,14 +106,8 @@ impl Wizard<RemoveConfirm> {
         let done = match apply(TokenOp::Remove {
             org: &self.state.org,
         }) {
-            Ok(()) => Done {
-                message: format!("removed token and forgot org {}", self.state.org),
-                ok: true,
-            },
-            Err(e) => Done {
-                message: format!("remove failed: {e}"),
-                ok: false,
-            },
+            Ok(()) => Done::Saved(format!("removed token and forgot org {}", self.state.org)),
+            Err(e) => Done::Failed(format!("remove failed: {e}")),
         };
         Wizard { state: done }
     }
@@ -122,18 +128,21 @@ impl Wizard<OrgInput> {
     fn edit(&mut self, key: KeyEvent) {
         self.state.org.handle_event(&Event::Key(key));
     }
-    fn next(self) -> OrgNext {
-        let org = self.state.org.value().trim().to_string();
-        if org.is_empty() {
-            return OrgNext::Stay(self);
+    fn next(mut self) -> OrgNext {
+        match parse_org(&self.state.org) {
+            Ok(Some(org)) => OrgNext::Pat(Wizard {
+                state: PatInput {
+                    org,
+                    pat: Input::default(),
+                    error: None,
+                },
+            }),
+            Ok(None) => OrgNext::Stay(self),
+            Err(e) => {
+                self.state.error = Some(e);
+                OrgNext::Stay(self)
+            }
         }
-        OrgNext::Pat(Wizard {
-            state: PatInput {
-                org,
-                pat: Input::default(),
-                error: None,
-            },
-        })
     }
 }
 
@@ -142,24 +151,30 @@ impl Wizard<PatInput> {
         self.state.pat.handle_event(&Event::Key(key));
     }
     fn validate(self, local: &[(RunnerScope, i64)]) -> PatNext {
-        let pat = self.state.pat.value().to_string();
-        match validate::validate(&pat, &self.state.org, local) {
-            PatCheck::Valid { matched, local, .. } => PatNext::Confirm(Wizard {
-                state: Confirmed {
-                    org: self.state.org,
-                    pat,
-                    matched,
-                    local,
-                },
-            }),
-            PatCheck::Rejected(why) => PatNext::Reject(Wizard {
-                state: PatInput {
-                    org: self.state.org,
-                    pat: Input::default(),
-                    error: Some(why),
-                },
-            }),
-        }
+        let checked = FineGrainedPat::parse(self.state.pat.value()).map(|pat| {
+            let check = validate::validate(&pat, &self.state.org, local);
+            (pat, check)
+        });
+        let why = match checked {
+            Ok((pat, PatCheck::Valid { matched, local, .. })) => {
+                return PatNext::Confirm(Wizard {
+                    state: Confirmed {
+                        org: self.state.org,
+                        pat,
+                        matched,
+                        local,
+                    },
+                });
+            }
+            Ok((_, PatCheck::Rejected(why))) | Err(why) => why,
+        };
+        PatNext::Reject(Wizard {
+            state: PatInput {
+                org: self.state.org,
+                pat: Input::default(),
+                error: Some(why),
+            },
+        })
     }
 }
 
@@ -169,20 +184,23 @@ impl Wizard<Confirmed> {
             org: &self.state.org,
             token: &self.state.pat,
         }) {
-            Ok(()) => Done {
-                message: format!(
-                    "saved read-only token for {} ({}/{} local runners matched)",
-                    self.state.org, self.state.matched, self.state.local
-                ),
-                ok: true,
-            },
-            Err(e) => Done {
-                message: format!("write failed: {e}"),
-                ok: false,
-            },
+            Ok(()) => Done::Saved(format!(
+                "saved read-only token for {} ({}/{} local runners matched)",
+                self.state.org, self.state.matched, self.state.local
+            )),
+            Err(e) => Done::Failed(format!("write failed: {e}")),
         };
         Wizard { state: done }
     }
+}
+
+/// `Ok(None)` for blank input.
+fn parse_org(input: &Input) -> Result<Option<TokenKey>, String> {
+    let text = input.value().trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    TokenKey::parse(text).map(Some)
 }
 
 pub(crate) enum WizardMode {
@@ -265,7 +283,7 @@ impl WizardMode {
                 KeyCode::Esc | KeyCode::Char('n') => Step::Close(false),
                 _ => Step::Stay(WizardMode::RemoveConfirm(w)),
             },
-            WizardMode::Done(w) => Step::Close(w.state.ok),
+            WizardMode::Done(w) => Step::Close(matches!(w.state, Done::Saved(_))),
         }
     }
 }

@@ -35,7 +35,11 @@ pub(crate) fn draw_help(f: &mut Frame) {
             "manage org PATs — add / replace / remove (native wizard)",
         ),
         Line::from(Span::styled(
-            "       PAT needs Self-hosted runners: Read  (+ Actions: Read for job results)",
+            "       PAT: Self-hosted runners (org) or Administration (repo): Read",
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "            + Actions: Read for job results",
             Style::new().fg(Color::DarkGray),
         )),
         key("h", "install / repair the runner job hooks (needs root)"),

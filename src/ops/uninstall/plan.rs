@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::hooks::{self as hook_revert};
 use crate::shared::collectors::runners;
 use crate::shared::hooks::install;
-use crate::shared::paths::{self, Scope};
+use crate::shared::paths::Scope;
 
 use super::{ConfigItem, Domains, Plan};
 
@@ -115,7 +115,7 @@ fn discover_runners(config_override: Option<&Path>) -> Vec<crate::shared::models
     runners::discover(&roots)
 }
 
-/// Includes the sudo-invoker's home, where `sudo ghr-stats config` writes.
+/// The explicit config, then this scope's own file; never another scope's.
 fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut push = |p: PathBuf| {
@@ -130,7 +130,6 @@ fn config_candidates(scope: Scope, config_override: Option<&Path>) -> Vec<PathBu
         push(PathBuf::from(p));
     }
     push(scope.config_file());
-    push(paths::config_write_target(config_override));
     out
 }
 

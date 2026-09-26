@@ -21,7 +21,7 @@ use crate::shared::paths::Scope;
 mod auth;
 mod dispatch;
 
-use auth::peer_auth;
+use auth::Peer;
 use dispatch::handle;
 
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
@@ -30,6 +30,9 @@ const CONN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The socket is `0666`, so this also bounds what any local user can pin. Excess
 /// connections are dropped, not queued.
 const MAX_CONNS: usize = 8;
+/// Slots only root or the admin group may take, so unprivileged clients cannot lock
+/// an operator out.
+const ADMIN_RESERVED: usize = 2;
 
 pub fn socket_path() -> PathBuf {
     Scope::detect().socket_path()
@@ -70,14 +73,20 @@ fn run(
         workers.retain(|w| !w.is_finished());
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let peer = Peer::of(&stream);
+                let cap = if peer.admin().is_some() {
+                    MAX_CONNS
+                } else {
+                    MAX_CONNS - ADMIN_RESERVED
+                };
                 // Only this thread increments, so check-then-increment needs no CAS.
-                if live.load(Ordering::SeqCst) >= MAX_CONNS {
-                    tracing::warn!(max = MAX_CONNS, "ipc: at capacity, dropping connection");
+                if live.load(Ordering::SeqCst) >= cap {
+                    tracing::warn!(max = cap, peer_uid = ?peer.uid(), "ipc: at capacity, dropping connection");
                     continue;
                 }
                 live.fetch_add(1, Ordering::SeqCst);
                 let slot = Slot(Arc::clone(&live));
-                match spawn_conn(stream, db, shared, term, config_path, slot) {
+                match spawn_conn(stream, peer, db, shared, term, config_path, slot) {
                     Ok(w) => workers.push(w),
                     // A failed spawn drops `slot` with the closure; no manual decrement.
                     Err(e) => tracing::warn!(error = %e, "ipc: spawn connection thread"),
@@ -111,6 +120,7 @@ impl Drop for Slot {
 /// `rusqlite::Connection` is not `Sync`; one shared behind a mutex would re-serialize clients.
 fn spawn_conn(
     stream: UnixStream,
+    peer: Peer,
     db: &Path,
     shared: &SharedConfig,
     term: &Arc<AtomicBool>,
@@ -126,7 +136,7 @@ fn spawn_conn(
         .spawn(move || {
             let _slot = slot;
             let conn = store::open_reader(&db);
-            if let Err(e) = serve_conn(stream, conn.as_ref(), &config_path, &shared, &term) {
+            if let Err(e) = serve_conn(stream, peer, conn.as_ref(), &config_path, &shared, &term) {
                 tracing::debug!(error = %e, "ipc: connection ended");
             }
         })
@@ -155,6 +165,7 @@ pub fn bind(sock: &Path) -> io::Result<UnixListener> {
 
 fn serve_conn(
     mut stream: UnixStream,
+    peer: Peer,
     conn: Option<&Connection>,
     config_path: &Path,
     shared: &SharedConfig,
@@ -162,7 +173,6 @@ fn serve_conn(
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(CONN_TIMEOUT))?;
     stream.set_write_timeout(Some(CONN_TIMEOUT))?;
-    let auth = peer_auth(&stream);
     loop {
         if term.load(Ordering::SeqCst) {
             return Ok(());
@@ -182,7 +192,7 @@ fn serve_conn(
         };
         // Per request, so a mutation that widens the freshness window applies immediately.
         let max_age = shared.snapshot().intervals.api_max_age();
-        let resp = handle(&req, conn, auth, config_path, max_age);
+        let resp = handle(&req, conn, &peer, config_path, max_age);
         if matches!(resp, Response::Mutated)
             && let Some(cfg) = reload_config(config_path)
         {

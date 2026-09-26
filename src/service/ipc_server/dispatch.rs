@@ -9,12 +9,12 @@ use crate::service::store::reader;
 use crate::shared::config::persist;
 use crate::shared::ipc::{ApiRow, Mutation, Query, Request, Response, VERSION};
 
-use super::auth::{Auth, authorized};
+use super::auth::{Admin, Peer};
 
 pub(super) fn handle(
     req: &Request,
     conn: Option<&Connection>,
-    auth: Auth,
+    peer: &Peer,
     config_path: &Path,
     max_age: u64,
 ) -> Response {
@@ -26,17 +26,17 @@ pub(super) fn handle(
         },
         // Reads are ungated: derived stats and config presence, no secrets.
         Request::Query(q) => serve_query(q, conn, config_path, max_age),
-        Request::Mutate(m) => {
-            if !authorized(auth.uid, auth.in_admin_group) {
+        Request::Mutate(m) => match peer.admin() {
+            Some(admin) => apply_mutation(m, admin, config_path),
+            None => {
                 tracing::warn!(
-                    peer_uid = auth.uid,
+                    peer_uid = ?peer.uid(),
                     action = m.action(),
                     "ipc: config mutation denied (need root or the ghr-stats group)"
                 );
-                return Response::Denied;
+                Response::Denied
             }
-            apply_mutation(m, auth, config_path)
-        }
+        },
     }
 }
 
@@ -133,10 +133,10 @@ fn serve_query(q: &Query, conn: Option<&Connection>, config_path: &Path, max_age
     }
 }
 
-fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
+fn apply_mutation(m: &Mutation, admin: Admin, config_path: &Path) -> Response {
     let result = match m {
-        Mutation::SetMetricsPull { enabled, addr } => {
-            persist::set_metrics_pull(config_path, *enabled, addr)
+        Mutation::SetMetricsPull { enabled } => {
+            persist::set_metrics_pull(config_path, *enabled, None)
         }
         Mutation::AddOrgToken { org, token } => persist::set_org_token(config_path, org, token),
         Mutation::RemoveOrgToken { org } => persist::remove_org_token(config_path, org),
@@ -144,7 +144,7 @@ fn apply_mutation(m: &Mutation, auth: Auth, config_path: &Path) -> Response {
     match result {
         Ok(()) => {
             tracing::info!(
-                peer_uid = auth.uid,
+                peer_uid = admin.uid(),
                 action = m.action(),
                 "ipc: config mutated"
             );
@@ -233,17 +233,17 @@ mod tests {
         conn
     }
 
-    const ROOT: Auth = Auth {
+    const ROOT: &Peer = &Peer::Known {
         uid: 0,
-        in_admin_group: false,
+        admin: true,
     };
-    const MEMBER: Auth = Auth {
+    const MEMBER: &Peer = &Peer::Known {
         uid: 1000,
-        in_admin_group: true,
+        admin: true,
     };
-    const NOBODY: Auth = Auth {
+    const NOBODY: &Peer = &Peer::Known {
         uid: 1000,
-        in_admin_group: false,
+        admin: false,
     };
     use crate::shared::models::GhView;
     const MAX_AGE: u64 = 180;
@@ -395,10 +395,7 @@ mod tests {
     fn mutation_denied_for_unauthorized_peer_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
-        let req = Request::Mutate(Mutation::SetMetricsPull {
-            enabled: true,
-            addr: "127.0.0.1:9999".to_string(),
-        });
+        let req = Request::Mutate(Mutation::SetMetricsPull { enabled: true });
         assert!(matches!(
             handle(&req, None, NOBODY, &cfg, MAX_AGE),
             Response::Denied
@@ -410,18 +407,12 @@ mod tests {
     fn mutation_persists_for_authorized_peer() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
-        let req = Request::Mutate(Mutation::SetMetricsPull {
-            enabled: true,
-            addr: "127.0.0.1:9999".to_string(),
-        });
+        let req = Request::Mutate(Mutation::SetMetricsPull { enabled: true });
         assert!(matches!(
             handle(&req, None, MEMBER, &cfg, MAX_AGE),
             Response::Mutated
         ));
         let text = std::fs::read_to_string(&cfg).unwrap();
-        assert!(
-            text.contains("9999"),
-            "persisted config should hold the new addr"
-        );
+        assert!(text.contains("enabled = true"), "{text}");
     }
 }

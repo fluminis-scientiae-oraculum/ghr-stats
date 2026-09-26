@@ -7,8 +7,8 @@ use crate::cli::DoctorArgs;
 use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
-use crate::shared::github::validate::{self, PatCheck};
-use crate::shared::github::{GitHubHost, RunnerScope};
+use crate::shared::github::validate::{self, FineGrainedPat, PatCheck};
+use crate::shared::github::{RunnerScope, TokenKey};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
@@ -293,16 +293,31 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
     let mut ok = Vec::new();
     let mut missing = Vec::new();
     let mut rejected = Vec::new();
+    let mut unsupported = Vec::new();
     for org in orgs {
-        let host = discovered
+        let scope = discovered
             .iter()
             .find(|r| r.org.eq_ignore_ascii_case(org))
-            .map_or_else(GitHubHost::dotcom, |r| r.scope.host.clone());
-        let Some(token) = cfg.github_token_for(&host, org) else {
+            .map(|r| &r.scope);
+        if let Some(Err(why)) = scope.map(RunnerScope::runners_path) {
+            unsupported.push(format!("{org} ({why})"));
+            continue;
+        }
+        let key = scope
+            .map(TokenKey::for_scope)
+            .or_else(|| TokenKey::parse(org).ok());
+        let Some(key) = key else {
+            rejected.push(format!("{org}: not a GitHub login"));
+            continue;
+        };
+        let Some(token) = cfg.github_token_for(key.host(), key.login()) else {
             missing.push(org.clone());
             continue;
         };
-        match validate::validate(token.expose(), org, &local) {
+        let check = FineGrainedPat::parse(token.expose()).map_or_else(PatCheck::Rejected, |pat| {
+            validate::validate(&pat, &key, &local)
+        });
+        match check {
             PatCheck::Valid {
                 runners, matched, ..
             } => ok.push(format!("{org} ({matched}/{runners} runners confirmed)")),
@@ -319,6 +334,14 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
                   Read for repository runners)"
                 .to_string(),
         }
+    } else if ok.is_empty() && !missing.is_empty() {
+        Outcome::Fail {
+            detail: format!(
+                "no org has a PAT ({}), so nothing is reconciled with GitHub",
+                missing.join(", ")
+            ),
+            fix: "run `sudo ghr-stats config` to add a read-only PAT".to_string(),
+        }
     } else {
         let mut detail = format!("{} PAT(s) validated: {}", ok.len(), ok.join(", "));
         if !missing.is_empty() {
@@ -326,6 +349,9 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
                 "; no PAT: {} (not reconciled with GitHub)",
                 missing.join(", ")
             ));
+        }
+        if !unsupported.is_empty() {
+            detail.push_str(&format!("; not reconcilable: {}", unsupported.join(", ")));
         }
         Outcome::Pass { detail }
     };
@@ -341,6 +367,25 @@ pub(super) fn org_names(cfg: &Config, discovered: &[RunnerInfo]) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_enterprise_fleet_without_a_pat_is_not_told_to_add_one() {
+        let runner = RunnerInfo {
+            agent_id: 1,
+            name: "r1".into(),
+            org: "acme".into(),
+            scope: RunnerScope::parse("https://github.com/enterprises/acme").unwrap(),
+            group: None,
+            dir: PathBuf::from("/srv/r1"),
+            work_folder: "_work".into(),
+            user: "runner".into(),
+        };
+        let c = tokens_check(&Config::default(), &[runner], &["acme".into()], false);
+        match c.outcome {
+            Outcome::Pass { detail } => assert!(detail.contains("not reconcilable"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn an_unreadable_config_skips_rather_than_fails() {

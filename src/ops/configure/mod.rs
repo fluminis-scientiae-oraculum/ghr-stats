@@ -13,7 +13,7 @@ use crate::shared::collectors::runners;
 mod config;
 mod hooks;
 
-use config::{apply_config, existing_token_orgs, manage_tokens, prompt_metrics};
+use config::{MetricsChoice, apply_config, existing_token_keys, manage_tokens, prompt_metrics};
 use hooks::hooks_step;
 
 pub(crate) use hooks::install_hooks_for_tui;
@@ -26,7 +26,7 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     println!("  • read each runner's .runner under the root you choose");
     println!(
         "  • optionally validate a read-only fine-grained PAT per org \
-         (Self-hosted runners: Read; + Actions: Read for job results)"
+         (Self-hosted runners or Administration: Read; + Actions: Read for job results)"
     );
     println!("  • optionally enable Prometheus metrics");
     println!(
@@ -36,6 +36,14 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     if !confirm(&theme, "Proceed?", true)? {
         println!("aborted.");
         return Ok(());
+    }
+    let target = config_target(config_override);
+    if !writable(&target) {
+        anyhow::bail!(
+            "{} is not writable by this user — re-run `{}`",
+            target.display(),
+            crate::shared::privileged::sudo_hint("config")
+        );
     }
 
     println!("── Step 1 of 4 · Discover runners ──");
@@ -60,15 +68,14 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
         );
     }
 
-    let target = config_target(config_override);
-
     println!("\n── Step 2 of 4 · Read-only GitHub PATs (optional) ──");
     println!(
-        "  Fine-grained PAT per org. Required: Organization → Self-hosted runners → Read-only.\n  \
-         Optional: Repository → Actions → Read-only (fills each job's success/failure — needs\n  \
-         repo access set to All/selected repos, NOT \"Public repositories\")."
+        "  Fine-grained PAT per org or account. Organization runners need Organization →\n  \
+         Self-hosted runners → Read; repository runners need Repository → Administration →\n  \
+         Read. Optional: Repository → Actions → Read fills each job's success/failure (repo\n  \
+         access must include those repositories)."
     );
-    let existing = existing_token_orgs(&target);
+    let existing = existing_token_keys(&target);
     let plan = manage_tokens(&theme, &discovered, &existing)?;
 
     println!("\n── Step 3 of 4 · Prometheus metrics (optional) ──");
@@ -91,17 +98,16 @@ pub fn run(config_override: Option<&Path>) -> Result<()> {
     if plan.is_empty() {
         println!("  github tokens: unchanged (existing PATs kept)");
     } else {
-        for org in plan.set.keys() {
-            println!("  github.tokens.{org} = *** (set/replaced)");
+        for key in plan.set.keys() {
+            println!("  github.tokens.\"{key}\" = *** (set/replaced)");
         }
-        for org in &plan.remove {
-            println!("  github.tokens.{org} = REMOVED (org forgotten)");
+        for key in &plan.remove {
+            println!("  github.tokens.\"{key}\" = REMOVED (org forgotten)");
         }
     }
-    if metrics.pull {
-        println!("  metrics.pull = enabled @ {}", metrics.addr);
-    } else {
-        println!("  metrics: unchanged");
+    match metrics {
+        MetricsChoice::Pull(addr) => println!("  metrics.pull = enabled @ {addr}"),
+        MetricsChoice::Unchanged => println!("  metrics: unchanged"),
     }
     if confirm(&theme, "Apply these changes?", true)? {
         apply_config(&target, &roots, &plan, &metrics)?;
@@ -151,14 +157,37 @@ fn choose_roots(theme: &ColorfulTheme) -> Result<Vec<PathBuf>> {
     Ok(vec![PathBuf::from(expand_tilde(root.trim()))])
 }
 
+/// `~` is the invoking user's home, also under `sudo`.
 fn expand_tilde(s: &str) -> String {
-    match s.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => format!("{}/{}", home.to_string_lossy(), rest),
-            None => s.to_string(),
-        },
+    use uzers::os::unix::UserExt;
+    let Some(rest) = s.strip_prefix("~/") else {
+        return s.to_string();
+    };
+    let home = std::env::var_os("SUDO_USER")
+        .filter(|_| crate::shared::privileged::is_root())
+        .and_then(|u| uzers::get_user_by_name(&u))
+        .map(|u| u.home_dir().to_path_buf())
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    match home {
+        Some(home) => format!("{}/{rest}", home.display()),
         None => s.to_string(),
     }
+}
+
+/// Whether this process can create or replace the config at `target`.
+fn writable(target: &Path) -> bool {
+    use nix::unistd::{AccessFlags, access};
+    let probe = if target.exists() {
+        target.to_path_buf()
+    } else {
+        target
+            .ancestors()
+            .skip(1)
+            .find(|p| p.exists())
+            .unwrap_or(Path::new("/"))
+            .to_path_buf()
+    };
+    access(&probe, AccessFlags::W_OK).is_ok()
 }
 
 fn config_target(config_override: Option<&Path>) -> PathBuf {

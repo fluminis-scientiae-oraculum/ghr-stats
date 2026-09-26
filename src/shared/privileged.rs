@@ -149,10 +149,13 @@ impl Outcome {
     }
 }
 
-/// Root process, or the absolute-path `sudo` re-run hint for `resume`.
-pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
+/// Proof this process runs as root; built only by [`require_root`].
+pub(crate) struct Root(());
+
+/// Root, or the absolute-path `sudo` re-run hint for `resume`.
+pub(crate) fn require_root(resume: &str) -> Result<Root, String> {
     if is_root() {
-        Ok(())
+        Ok(Root(()))
     } else {
         Err(sudo_hint(resume))
     }

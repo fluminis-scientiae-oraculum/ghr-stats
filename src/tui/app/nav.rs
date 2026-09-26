@@ -142,10 +142,8 @@ impl App {
 
     fn enter_detail(&mut self) {
         let sel = self.table.borrow().selected(); // release the borrow before load_detail
-        if let Some(i) = sel
-            && i < self.runners.len()
-        {
-            self.drill = Some(i);
+        if let Some(r) = sel.and_then(|i| self.runners.get(i)) {
+            self.drill = Some(r.dir.clone());
             self.load_detail();
         }
     }

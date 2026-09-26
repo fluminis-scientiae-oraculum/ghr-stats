@@ -50,7 +50,7 @@ impl Scope {
         self.data_dir().join("ghr-stats.db")
     }
 
-    /// Append-only job-event log.
+    /// The shared job-event log older releases wrote; `uninstall` removes a leftover one.
     pub fn event_log(self) -> PathBuf {
         self.data_dir().join("events.ndjson")
     }

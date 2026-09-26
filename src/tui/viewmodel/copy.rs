@@ -72,22 +72,24 @@ pub(crate) fn version_warning(
     ephemeral: Option<&crate::shared::ipc::client::EphemeralReason>,
 ) -> Option<String> {
     use super::status::VersionState;
-    use crate::shared::ipc::client::EphemeralReason;
+    use crate::shared::ipc::client::{Behind, EphemeralReason, REINSTALL_FROM_NEWER};
 
     // Wire drift first: it also explains why there is no collector data.
     if let Some(EphemeralReason::VersionDrift { server }) = ephemeral {
         return Some(format!(
-            "A collector IS running but speaks IPC v{server} (this build speaks v{}). \
-             Restart the service after upgrading:  sudo systemctl restart ghr-stats",
-            crate::shared::ipc::VERSION
+            "A collector IS running but speaks IPC v{server} (this build speaks v{}): {}",
+            crate::shared::ipc::VERSION,
+            Behind::of_wire(*server).remedy()
         ));
     }
-    match state {
-        VersionState::Drift | VersionState::CollectorUnknown => Some(
-            "The running service is a different build than this binary — \
-             restart it to pick up the upgrade:  sudo systemctl restart ghr-stats"
-                .to_string(),
-        ),
-        VersionState::Match | VersionState::NoCollector => None,
-    }
+    let remedy = match state {
+        VersionState::Drift(behind) => {
+            behind.map_or_else(|| REINSTALL_FROM_NEWER.to_string(), Behind::remedy)
+        }
+        VersionState::CollectorUnknown => Behind::Service.remedy(),
+        VersionState::Match | VersionState::NoCollector => return None,
+    };
+    Some(format!(
+        "The running service is a different build than this binary: {remedy}"
+    ))
 }

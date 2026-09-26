@@ -3,17 +3,21 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::shared::github::TokenKey;
+use crate::shared::github::validate::FineGrainedPat;
 use crate::shared::ipc::client::{self as ipc_client, Client, EphemeralReason};
 use crate::shared::ipc::{Mutation, Query, Request, Response};
 use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Mode, RunnerState};
 use crate::shared::paths::Scope;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MutateOutcome {
     Mutated,
     /// The peer is neither root nor in the `ghr-stats` group.
     Denied,
-    /// Ephemeral, or the request failed; the caller writes the file directly.
+    /// The collector refused or could not apply the change.
+    Failed(String),
+    /// No collector answered; the caller writes the file directly.
     Unreachable,
 }
 
@@ -150,31 +154,32 @@ impl DataSource {
         }
     }
 
-    pub(crate) fn set_metrics_pull(&mut self, enabled: bool, addr: &str) -> MutateOutcome {
-        self.mutate(Request::Mutate(Mutation::SetMetricsPull {
-            enabled,
-            addr: addr.to_string(),
-        }))
+    pub(crate) fn set_metrics_pull(&mut self, enabled: bool) -> MutateOutcome {
+        self.mutate(Mutation::SetMetricsPull { enabled })
     }
 
-    pub(crate) fn add_org_token(&mut self, org: &str, token: &str) -> MutateOutcome {
-        self.mutate(Request::Mutate(Mutation::AddOrgToken {
-            org: org.to_string(),
-            token: token.to_string(),
-        }))
+    pub(crate) fn add_org_token(
+        &mut self,
+        org: &TokenKey,
+        token: &FineGrainedPat,
+    ) -> MutateOutcome {
+        self.mutate(Mutation::AddOrgToken {
+            org: org.clone(),
+            token: token.clone(),
+        })
     }
 
-    pub(crate) fn remove_org_token(&mut self, org: &str) -> MutateOutcome {
-        self.mutate(Request::Mutate(Mutation::RemoveOrgToken {
-            org: org.to_string(),
-        }))
+    pub(crate) fn remove_org_token(&mut self, org: &TokenKey) -> MutateOutcome {
+        self.mutate(Mutation::RemoveOrgToken { org: org.clone() })
     }
 
-    fn mutate(&mut self, req: Request) -> MutateOutcome {
-        match self.query(&req) {
+    fn mutate(&mut self, m: Mutation) -> MutateOutcome {
+        match self.query(&Request::Mutate(m)) {
             Some(Response::Mutated) => MutateOutcome::Mutated,
             Some(Response::Denied) => MutateOutcome::Denied,
-            _ => MutateOutcome::Unreachable,
+            Some(Response::Error(e)) => MutateOutcome::Failed(e),
+            Some(other) => MutateOutcome::Failed(format!("unexpected reply {other:?}")),
+            None => MutateOutcome::Unreachable,
         }
     }
 }

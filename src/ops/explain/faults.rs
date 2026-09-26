@@ -17,7 +17,7 @@ pub(super) fn divergence(s: &FleetStatus) -> Option<Finding> {
     }
 
     let affected = orgs_of(divergent.iter().copied());
-    let present = orgs_of(s.runners.iter());
+    let present = orgs_of(s.runners.iter().filter(|r| r.github_online.is_some()));
     let boundary = divergence_boundary(affected.len(), present.len());
     let orgs = affected.join(", ");
     let claim = match boundary {
@@ -97,7 +97,7 @@ fn checks_for(boundary: Boundary) -> Vec<String> {
             "the provider status page, Actions component",
             "compare the `serverUrl` shard in each runner's .runner across orgs",
             "confirm the org's Actions permissions and runner-group membership are unchanged",
-            "confirm this org's PAT is unexpired and still has Self-hosted runners: Read",
+            "confirm this org's PAT is unexpired and still reads its runners (Self-hosted runners or Administration: Read)",
         ],
     };
     checks.iter().map(|c| (*c).to_string()).collect()
@@ -186,6 +186,19 @@ mod tests {
         assert_eq!(f.severity, Severity::High);
         assert!(f.claim.contains("2 runners in org-b"));
         assert!(f.claim.contains("the differing factor is the org"));
+    }
+
+    #[test]
+    fn an_org_without_a_github_view_is_not_a_peer() {
+        let s = status(
+            Mode::Persistent,
+            vec![
+                runner("a0", "org-a", Liveness::Idle, Some(true)),
+                runner("b0", "org-b", Liveness::Idle, Some(true)),
+                runner("p0", "personal", Liveness::Idle, None),
+            ],
+        );
+        assert_eq!(findings(&s)[0].boundary, Boundary::Network);
     }
 
     #[test]
