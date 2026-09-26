@@ -95,7 +95,10 @@ fn post(endpoint: &str, auth: Option<&str>, body: &str) {
     }
     match req.send(body) {
         Ok(_) => tracing::debug!("metrics pushed"),
-        Err(e) => tracing::warn!(error = %e, "metrics push: POST failed"),
+        Err(e) => tracing::warn!(
+            error = %e.to_string().replace(endpoint, &redacted(endpoint)),
+            "metrics push: POST failed"
+        ),
     }
 }
 
