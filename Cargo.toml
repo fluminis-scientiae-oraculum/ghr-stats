@@ -10,6 +10,7 @@ description = "Live TUI + collector service (history, jobs, Prometheus) for self
 authors = ["Aditya Kresna <https://github.com/Ujang360>"]
 license = "MIT"
 repository = "https://github.com/fluminis-scientiae-oraculum/ghr-stats"
+documentation = "https://github.com/fluminis-scientiae-oraculum/ghr-stats/tree/main/docs"
 readme = "README.md"
 keywords = ["github-actions", "self-hosted", "runner", "tui", "prometheus"]
 categories = ["command-line-utilities", "development-tools"]

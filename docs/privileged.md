@@ -1,85 +1,79 @@
 # Privileged operations
 
-[← README](../README.md)
+[← Docs](README.md)
 
-ghr-stats collects everything it can without elevation: sampling runners, reading
-cgroups, the database and the metrics endpoints all run unprivileged. A handful of
-*actions* do need elevation, and this page is the complete account of them.
+Sampling, the database, metrics and the dashboard need no privilege. What does is
+listed here in full.
 
-## What runs as root
+| Tier | What it is | Used for |
+| --- | --- | --- |
+| **Per-command** | one command from a closed list, run directly as root or through `sudo` | restarting and recycling a runner, rewriting a runner's `.env` |
+| **Root process** | the whole process must be root, proven by a `Root` value | the entry points [below](#root-process) |
+| **Admin peer** | a local user who is root or in the `ghr-stats` group, checked by the collector | PAT and metrics edits over the socket ([Configuration](configuration.md#editing)) |
 
-Every elevated command is a variant of one closed enum, `PrivilegedCall`
-(`src/shared/privileged.rs`). `run()` accepts nothing else, so this table is the
-whole privilege surface — not a sample of it:
+## Per-command
 
-| Variant | Exact command | Runs as | Used by |
+Every command elevated per call is a variant of one enum, `PrivilegedCall`
+([`src/shared/privileged.rs`](../src/shared/privileged.rs)), and the executor
+accepts nothing else:
+
+| Variant | Command | Runs as | Used by |
 | --- | --- | --- | --- |
-| `Systemctl` | `systemctl {start,stop,restart} <unit>` | root | Restart / Recycle, hook install and uninstall |
-| `PurgeDir` | `rm -rf -- <dir>` | the runner user | Recycle: `<install>/<work>/_temp` |
-| `TrimFilesIn` | `find <dir> -type f -delete` | the runner user | Recycle: `<install>/_diag` |
-| `InstallEnvFile` | `install -o <uid> -g <gid> -m <mode> <src> <dst>` | root | Writing and reverting a runner's `.env` |
+| `Systemctl` | `systemctl {start,stop,restart} <unit>` | root | Restart, Recycle, hook install and uninstall |
+| `PurgeDir` | `rm -rf -- <dir>` | the runner's user | Recycle: `<install>/<workFolder>/_temp` |
+| `TrimFilesIn` | `find <dir> -type f -delete` | the runner's user | Recycle: `<install>/_diag` |
+| `InstallEnvFile` | `install -o <uid> -g <gid> -m <mode> <src> <dst>` | root | writing and reverting a runner's `.env` |
 
-`<unit>` is only ever a unit named `actions.runner.*.service` whose
-`WorkingDirectory` is that runner's install dir. `InstallEnvFile` keeps the
-uid, gid and mode the `.env` already had.
+- `<unit>` is only ever an `actions.runner.*.service` whose `WorkingDirectory`
+  is that runner's install dir.
+- `InstallEnvFile` keeps the owner and mode the `.env` already had.
+- Deletions drop to the runner's uid, so a planted symlink reaches nothing the
+  runner could not already delete.
+- Arguments go to `execve` as a vector, never through a shell.
+- The Restart prompt renders the same value the executor runs, so the command
+  shown is the command run.
 
-Three properties follow from that being an enum rather than a free
-`(program, args)` pair:
+Run directly when the process is root, otherwise prefixed with `sudo`, which
+prompts on the terminal; the dashboard suspends itself for that.
 
-- **Auditing is reading, not grepping.** Widening what this tool can do as root
-  means adding a variant, which is a visible diff in review.
-- **The prompt cannot lie.** `Display` on `PrivilegedCall` renders the exact
-  argv, and the confirm popup formats the same value the executor runs. There is
-  no second copy of the command string to drift.
-- **Ownership travels with the file.** The wizard writes `.env` files and
-  `uninstall` reverts them; both carry the ownership read from the file itself.
+## Root process
 
-Arguments are handed to `execve` as a vector and never to a shell, so no quoting
-or escaping is involved.
+Some work is only correct if this process is root: it writes across scopes, or
+derives its install scope from the effective uid, which a per-command `sudo`
+cannot change. Those code paths take a `Root` value that only `require_root()`
+creates, so they cannot be reached without the check.
+
+| Entry point | Why |
+| --- | --- |
+| `systemd install --system` | writes `/usr/local/bin` and the system unit; runs `groupadd`, `usermod` and `systemctl` directly |
+| hook install (`config`, TUI `[h]`) | shared scripts in `/var/lib/ghr-stats/hooks` that every runner user can read; each runner's `.env` |
+| `uninstall hooks`, in either scope | each runner's `.env`, the shared scripts |
+| `uninstall` at system scope | removes `/etc`, `/var/lib`, `/usr/local/bin` and the unit |
+
+Without root, each prints the exact command to re-run instead of acting.
 
 ## Runner-owned files
 
-A runner's install dir belongs to the runner user, and its CI jobs run as that
-user, so anything in it may have been planted. Reads of `.runner`, `.service`,
-`.env` and the job-event log refuse symlinks, FIFOs and other non-regular files,
-hard links, files owned by anyone but the runner or root, and anything past a
-size cap. Deleting a runner's files drops to that runner's uid, so a planted
-symlink reaches only what the runner could delete anyway. Runner restarts after
-a `.env` change happen only when the runner is idle.
+A runner's install dir belongs to the runner's user, and its CI jobs run as that
+user, so anything in it may be hostile. Opening `.runner`, `.service`, `.env` or
+the job-event log refuses symlinks, FIFOs and other non-regular files, hard
+links, and files owned by anyone but the runner or root. The first three are read
+up to a size cap; the log is read at most 1 MiB per tick. After a `.env` change a
+runner is restarted only if it is idle when checked just before the restart.
 
-## Two ways to be privileged
+## `sudo` and `PATH`
 
-They are not interchangeable, and picking the wrong one is how a gate gets
-forgotten.
+`sudo ghr-stats …` often reports "command not found" after `cargo install`:
+`sudo` resets `PATH` to a `secure_path` without `~/.cargo/bin`. Every `sudo`
+command ghr-stats prints names the binary by absolute path. A system install
+copies the binary to `/usr/local/bin`, which is on `secure_path`:
 
-**Per-command escalation** — `run()` executes directly when the process is
-already root, otherwise it prepends `sudo`. This suffices when each command can
-escalate on its own, which is true of everything in the table above. `sudo`
-prompts on `/dev/tty`, so the TUI suspends itself first; an action's `execute`
-is guaranteed by the typestate to run inside that suspend window.
-
-**A root process** — `require_root()` / `is_root()`, for work whose correctness
-depends on *this process* being root, because it writes across scopes or has to
-resolve our own install scope (which is derived from the effective uid and so
-cannot be relocated by a per-command `sudo`). Three entry points need it:
-
-| Entry point | Why a root process |
-| --- | --- |
-| `systemd install --system` | writes `/etc`, `/usr/local/bin`, the system unit |
-| hook install (`config`, TUI `[h]`) | shared scripts must be readable by every runner user; each runner's `.env` belongs to its runner user |
-| `uninstall` at system scope | removes `/etc`, `/var/lib`, `/usr/local/bin` and the unit — refused up front rather than half-done |
-
-Each refuses with a re-run hint instead of failing partway.
-
-## The `sudo` PATH gotcha
-
-`sudo ghr-stats …` often reports "command not found" after a user-wide install.
-That is `sudo` resetting `PATH` to a `secure_path` that excludes `~/.cargo/bin`
-and `~/.local/bin` — not a broken install.
-
-Every hint this tool prints therefore names the binary by **absolute path**, so
-it works as printed. To put ghr-stats on `sudo`'s path permanently:
-
-```sh
-ghr-stats systemd install --system   # copies the binary to /usr/local/bin
+```bash
+sudo ~/.cargo/bin/ghr-stats systemd install --system
 ```
+
+## See also
+
+- [Runner hooks](hooks.md): what the `.env` edits are for
+- [CLI & operations](cli.md#per-runner-actions): Restart and Recycle
+- [Design](design.md#ipc): how the collector identifies an admin peer

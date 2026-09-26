@@ -242,7 +242,7 @@ pub(crate) struct ChartSpec<'a> {
     /// `(ts_secs, value)`, oldest → newest.
     pub points: &'a [(f64, f64)],
     pub y_bounds: [f64; 2],
-    /// At most three: ratatui mis-positions a fourth (ratatui issue 334).
+    /// At most three: ratatui misplaces a fourth (ratatui issue 334).
     pub y_labels: Vec<String>,
     pub color: Color,
     /// Ticks missing here plot as a gap, not zero.

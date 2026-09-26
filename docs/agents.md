@@ -1,75 +1,65 @@
 # ghr-stats for agents
 
-[← README](../README.md)
+[← Docs](README.md)
 
-Six verbs are **machine-facing**: they write a stable payload to stdout, encode
-their answer in the exit code, and never colour or decorate it. Everything else
-(`tui`, `config`, `systemd`, `db`, `uninstall`, `serve`) is for humans and
-operators.
+Six verbs are **machine-facing**: a stable payload on stdout, the answer in the
+exit code, nothing decorated. The rest (`tui`, `config`, `systemd`, `db`,
+`uninstall`, `serve`) are for operators.
 
-| Verb | Answers | Blocks? |
-| --- | --- | --- |
-| [`status`](#status) | Is the fleet healthy **now**? | no |
-| [`explain`](#explain) | **Why** isn't it? | no |
-| [`timeline`](#timeline) | **What changed**, and in what order? | no |
-| [`doctor`](#doctor) | Is the **tool itself** wired up correctly? | no |
-| [`wait`](#wait) | Block until the fleet reaches a state. | yes |
-| [`tail`](#tail) | Follow transitions as they happen. | yes |
+| Verb | Answers | Blocks | `0` means |
+| --- | --- | --- | --- |
+| [`status`](#status) | Is the fleet healthy now? | no | healthy |
+| [`explain`](#explain) | Why not? | no | healthy |
+| [`doctor`](#doctor) | Is ghr-stats itself set up correctly? | no | healthy |
+| [`timeline`](#timeline) | What changed, in what order? | no | answered |
+| [`wait`](#wait) | Block until the fleet reaches a state | yes | the state was reached |
+| [`tail`](#tail) | Follow transitions live | yes | the reader closed the pipe |
 
-Start with `doctor`. Every other verb assumes the install is sound, and `doctor`
-is the one that checks it.
+Start with `doctor`: every other verb assumes the install is sound.
 
 ## Exit codes
 
-One table across every verb, so a caller can branch on the code without knowing
-which verb produced it.
-
 | Code | Meaning |
 | --- | --- |
-| `0` | The question was answered affirmatively. |
-| `1` | Answered, and the answer is bad — degraded, or the wait timed out. |
-| `2` | **Cannot determine.** Not "no": we could not see. |
-| `3` | Usage or configuration error — the invocation itself was wrong. |
+| `0` | Answered, and the answer is good. |
+| `1` | Answered, and the answer is bad. |
+| `2` | **Cannot determine**: not "no", but "could not see". |
+| `3` | Usage or configuration error. |
 
-`2` is the one that matters. It is never a fact about the fleet; it is a fact
-about our ability to observe it. Treating it as a `1` is the single most likely
-way to build something that reports a false outage.
+| Verb | `0` | `1` | `2` |
+| --- | --- | --- | --- |
+| `status`, `explain` | runners found, none offline or divergent | a runner is offline, or divergent where GitHub's view is fresh | no runner in scope |
+| `doctor` | every check passed | a check failed | a check was skipped and none failed |
+| `timeline` | answered | — | no collector |
+| `wait` | every runner online to GitHub | timed out while GitHub's view was readable | see [wait](#wait) |
+| `tail` | the reader closed the pipe | — | no collector on the first poll |
 
-**Verbs that judge return a verdict; verbs that retrieve return availability.**
-`status`, `explain` and `doctor` assess health, so `0` from them means *healthy*.
-`timeline`, `wait` and `tail` make no health claim — `0` means only that the
-question was answerable. So `ghr-stats timeline && echo healthy` is a bug: an
-empty window is a perfectly good answer about a fleet that may be on fire.
+An error the verb cannot work around is `2`. Usage errors are `3`, not clap's
+usual `2`, so a typo never reads as an unknown fleet.
 
-`3` is deliberately not `2`: clap's default for a usage error is `2`, which would
-collide with "cannot determine". A caller must never confuse a mistyped flag with
-an unknowable fleet.
+Treat `2` as "unknown", never as an outage. `status`, `explain` and `doctor` judge
+health, so their `0` means healthy; `timeline` and `tail` only retrieve, so
+`ghr-stats timeline && echo healthy` is a bug. Without a collector, `status` and
+`explain` answer from a scan of this host and `doctor` fails its `collector`
+check; see [Design](design.md#clients-and-modes).
 
 ## Output contract
 
-- **`--json` writes only the payload to stdout.** Diagnostics, progress and
-  warnings go to stderr. Log output is disabled entirely for these verbs, so a
-  stray `RUST_LOG` cannot corrupt what you parse.
-- **`schema_version`** is on every JSON payload and starts at `1`. Fields may be
-  added within a version; existing fields will not change meaning. Parse
-  defensively — ignore unknown fields.
-- **Times appear twice**: ISO-8601 UTC (`generated_at`) and epoch seconds
-  (`generated_at_epoch`). No local time, no localised formats.
-- **Unknown is `null`, never invented.** A runner with no readable GitHub view
-  reports `github_online: null` — not `false`. The distinction is load-bearing
-  everywhere in this tool.
-- **No ANSI, ever.** These verbs emit no escape sequences at all — not
-  conditionally on a TTY, not suppressed by `NO_COLOR`, simply never written. So
-  there is no terminal-detection behaviour to depend on, and piping changes
-  nothing about the bytes. (Colour belongs to the dashboard, which owns its own
-  screen.) No thousands separators, no localised numbers.
+- `--json` writes only the payload to stdout. Progress and diagnostics go to
+  stderr, and these verbs emit no logs, so `RUST_LOG` cannot corrupt the stream.
+- Every `--json` payload has `schema_version` (currently `1`); `tail` lines do
+  not. Fields may be added within a version; existing fields keep their meaning.
+  Ignore unknown fields.
+- Times are UTC: ISO-8601 (`generated_at`), epoch seconds (`generated_at_epoch`,
+  `since_epoch`), or both.
+- An unknown GitHub view is `null`, never `false`. `state_seconds` is `0` when no
+  liveness edge is recorded, which is always the case without a collector.
+- No ANSI escapes, colours or localised numbers, whether or not stdout is a
+  terminal.
+- A closed pipe (`| head`) ends the verb cleanly.
 
-### The SQLite schema is not an interface
-
-The database under `db_path` is an implementation detail. Its tables have been
-re-keyed twice already (`runner_state` moved from `agent_id` to the install
-`dir`, because GitHub's `agent_id` is unique only *within an org* and this fleet
-has a real collision). Query the verbs. They are versioned; the schema is not.
+Query these verbs, not the database: the SQLite schema is not an interface and
+changes between releases.
 
 ## status
 
@@ -77,21 +67,18 @@ has a real collision). Query the verbs. They are versioned; the schema is not.
 ghr-stats status --json [--org ORG] [--runner NAME]
 ```
 
-The fleet as one payload: per-runner liveness, GitHub's view of each runner,
-per-org reconcile health, and a `verdict`. Filtering recomputes the verdict over
-the surviving rows, so `--org healthy-org` does not inherit another org's
-"degraded".
+The fleet as one payload: each runner's local liveness and GitHub's view of it,
+per-org reconcile health, and a `verdict`. A filter recomputes counts and verdict
+over the rows that remain, so a healthy org never inherits another org's
+`degraded`.
 
-Each entry in `orgs` carries its own `verdict`, judged only from readings we
-actually have. An org with no fresh GitHub reading for any of its runners — no
-PAT, a broken token, a reconcile gap — is `unknown`, never `degraded`: the same
-rule as exit `2` above, applied per org. `reconcile_age_s` is `null` for an org
-that has never reconciled, and is the field to branch on if you need to tell
-"never asked" from "asked recently".
+An org with no fresh GitHub reading for any of its runners (no PAT, a broken
+token, a reconcile gap) is `unknown`, not `degraded`. `reconcile_age_s` is
+`null` for an org that has never reconciled; branch on it to tell "never asked"
+from "asked recently".
 
-With no collector it falls back to a live local scan, reports
-`mode: "ephemeral"`, and sets every `github_*` field to `null` — a local scan can
-see processes, never GitHub.
+Without a collector, `status` scans the host itself, reports `mode: "ephemeral"`
+and sets every `github_*` field to `null`.
 
 ## explain
 
@@ -99,55 +86,27 @@ see processes, never GitHub.
 ghr-stats explain --json
 ```
 
-Findings, worst first. Each carries a `claim`, the `evidence` it rests on,
-`suggested_checks`, and — the load-bearing field — a **`boundary`**:
+Findings, worst first, each with a `claim`, the `evidence` behind it,
+`suggested_checks`, and a `boundary` saying where to look.
 
 | `boundary` | Investigate |
 | --- | --- |
-| `local` | This host: the runner process, its unit, its disk. |
-| `github` | GitHub's side: the org's Actions service, permissions, a shard. |
-| `network` | Between the two: egress, DNS, a proxy. |
-| `config` | Our own configuration: a missing PAT, an unknown org. |
+| `local` | this host: the runner process, its unit, its disk |
+| `github` | GitHub's side: the org's Actions service, permissions |
+| `network` | between the two: egress, DNS, proxy |
+| `config` | ghr-stats' own setup: a missing PAT, no collector |
 
-Establishing which side of the fence a fault sits on was the most expensive part
-of the incident that motivated this tool, and it is the part a fleet monitor can
-shortcut — it holds the local process truth and GitHub's opinion at the same
-instant.
+| Finding | Severity | Boundary | Raised when |
+| --- | --- | --- | --- |
+| `github-divergence` | high | `network` when more than one org has a GitHub reading and all of them are affected, else `github` | runners are up locally but offline to GitHub |
+| `runners-offline-locally` | medium | `local` | a runner's listener is not running |
+| `github-view-stale` | medium | `github` | an org reconciled before, but its runners have no fresh reading |
+| `org-never-reconciled` | info | `config` | an org has runners here and has never reconciled |
+| `github-view-unavailable` | info | `config` or `local` | there is no usable collector; the claim names why |
 
-`severity` ranks how *invisible* a problem is, not how loud. `github-divergence`
-outranks a plainly offline runner because every other surface already shows the
-offline one in red, while divergence reads as green everywhere.
-
-## timeline
-
-```bash
-ghr-stats timeline --since 6h [--org ORG] [--runner NAME] [--limit N] [--samples] [--json]
-```
-
-The window as the things that **changed** in it, not as the samples underneath.
-Four streams, kept separate because their disagreement is the diagnosis:
-
-- local liveness edges (a process fact),
-- GitHub-online edges (a remote opinion),
-- per-org reconcile outcomes (whether we could hold that opinion at all),
-- job starts and completions.
-
-"Eight runners went GitHub-offline" means something entirely different depending
-on whether the reconcile was still succeeding at the time. That is why they are
-never collapsed.
-
-Bounded by construction: `--since` is capped at 7 d, `--limit` (default 500)
-applies per section, and every section reports `limited` when it was cut. A
-window reaching past what `db prune` has left reports `truncated_at` — where the
-record *starts*, deliberately not why, because a pruned history and a young one
-are indistinguishable from here.
-
-> **Known limit.** `transitions` merges the liveness, GitHub and reconcile
-> streams under one `--limit`, keeping the newest across all three. A stream that
-> flaps hard can therefore crowd out a quieter one within the same window — and
-> the flapping case is exactly an incident. When `limited` is true, narrow with
-> `--org` / `--runner` or shorten `--since` rather than trusting the mix. Job
-> edges are bounded separately and are not affected.
+`severity` ranks how easily a problem hides, not how loud it is: divergence
+outranks an offline runner because every other surface already shows the offline
+one in red, while a divergent runner looks green.
 
 ## doctor
 
@@ -155,18 +114,46 @@ are indistinguishable from here.
 ghr-stats doctor [--json] [--offline]
 ```
 
-Preflights the install: config parses, each org's PAT can still list its runners,
-hooks are installed, the collector is reachable **and is the same build as this
-binary**, the database exists, and where the retained record starts.
+| Check | Passes when | Skipped when |
+| --- | --- | --- |
+| `config` | the config file exists and parses (fails when missing or invalid) | it exists but is unreadable (re-run with `sudo`) |
+| `collector` | a collector answers and is the same build as this binary | never: an absent or mismatched collector fails, with the fix |
+| `reconcile` | every org that has reconciled did so within `api_max_age_secs` | no collector answered |
+| `history` | the collector reports where its record starts | no collector answered |
+| `runner-roots` | runners are found under the roots | the config was not loaded |
+| `database` | the database file exists | the config was not loaded |
+| `hooks` | every runner's hooks run ghr-stats, directly or through a chain wrapper | the config was not loaded, no runners were found, or a runner's `.env` is unreadable |
+| `tokens` | each org's PAT lists its runners; at least one reconcilable org has a PAT (fails when there are no orgs at all) | `--offline`, or the config was not loaded |
 
-Three outcomes per check — `pass`, `fail`, `skipped` — and the third is the point.
-**A check that could not run is never reported as passing**, and any skip holds
-the verdict at `2`. The common case is real: the system config is `0600 root`, so
-a non-root `doctor` genuinely cannot inspect PATs and says so. Re-run with `sudo`
-for the full picture.
+Every `fail` carries a `fix`: a command to run next. A skipped check never counts
+as passing: with no failure, a skip makes the verdict `2`.
 
-Every `fail` carries a `fix` — a concrete next command. `--offline` skips the one
-check that calls GitHub, and skipping keeps the verdict at `2` rather than green.
+## timeline
+
+```bash
+ghr-stats timeline --since 6h [--org ORG] [--runner NAME] [--limit N] [--samples] [--json]
+```
+
+The window as what **changed** in it, in four streams kept apart because their
+disagreement is the diagnosis:
+
+| Stream | Fact |
+| --- | --- |
+| local liveness edges | the runner's processes |
+| GitHub-online edges | GitHub's opinion |
+| per-org reconcile outcomes | whether that opinion could be fetched at all |
+| job starts and completions | the hooks |
+
+`--since` (default `6h`) needs a unit (`90s`, `30m`, `6h`, `2d`) and is capped at
+7 days; the header shows the window actually used. `--limit` (default 500, at most
+2000) applies per section and each section reports `limited` when cut. A window that reaches past
+the oldest retained sample reports `truncated_at`, where the record starts.
+
+`transitions` merges the first three streams under one `--limit` that keeps the
+newest rows (printed oldest first), so a stream that flaps hard can crowd out a
+quiet one. When `limited` is true,
+narrow with `--org` / `--runner` or shorten `--since`. Jobs are bounded
+separately.
 
 ## wait
 
@@ -174,21 +161,18 @@ check that calls GitHub, and skipping keeps the verdict at `2` rather than green
 ghr-stats wait --github-online [--org ORG] [--timeout 600] [--json]
 ```
 
-Blocks until every runner in scope is online to GitHub. This replaces the
-`while ! ghr-stats status; do sleep 30; done` loop — which gets three things
-wrong that this does not:
-
-- **A timeout while the GitHub view was unreadable exits `2`, not `1`.** Our
-  blindness must never be reported as the fleet's answer.
-- **A filter matching no runners exits `2`, not `0`.** "Every runner in the empty
-  set is online" is vacuously true, so `--org typo` would otherwise report
-  success.
-- **With no collector it exits immediately**, not after the full timeout. The
-  GitHub view lives only there.
-
-Polls at the local sampling interval. Progress goes to stderr and only when it
-changes; the final snapshot goes to stdout on every outcome. `--timeout 0`
+Blocks until every runner in scope is online to GitHub, polling at the local
+sampling interval. Progress goes to stderr when it changes; the final snapshot,
+narrowed to `--org` when given, goes to stdout on every outcome. `--timeout 0`
 evaluates once.
+
+| Outcome | Exit |
+| --- | --- |
+| every runner online to GitHub | `0` |
+| timed out while GitHub's view was readable | `1` |
+| timed out while the view was unreadable | `2` |
+| the filter matched no runners | `2` |
+| no collector | `2`, immediately |
 
 ## tail
 
@@ -196,54 +180,40 @@ evaluates once.
 ghr-stats tail [--org ORG] [--runner NAME] [--backfill SECONDS]
 ```
 
-Every transition as one JSON object per line, flushed per line — NDJSON, safe to
-pipe into `jq` or an agent loop. Starts from now; `--backfill` replays a window
-first.
+Each transition as one JSON line, flushed per line. The first poll looks back
+`max(4 × local_secs, 60 s)`; `--backfill` (up to 7 days) replays a longer window.
 
 ```json
-{"type":"transition","ts":1785044382,"at":"2026-07-26T05:39:42Z","org":"acme","edge":{"liveness":{"runner":"r1","from":"busy","to":"offline"}}}
-{"type":"job","ts":1785044387,"at":"2026-07-26T05:39:47Z","org":"acme","runner":"r1","repo":"acme/web","job":"build","edge":{"completed":{"conclusion":"success"}}}
-```
-
-Branch on `type`: `transition`, `job`, or **`gap`**.
-
-```json
+{"type":"transition","ts":1785044382,"at":"2026-07-26T05:39:42Z","org":"example-org","edge":{"liveness":{"runner":"runner-01","from":"busy","to":"offline"}}}
+{"type":"job","ts":1785044387,"at":"2026-07-26T05:39:47Z","org":"example-org","runner":"runner-01","repo":"example-org/web","job":"build","edge":{"completed":{"conclusion":null}}}
 {"type":"gap","section":"transitions","since_epoch":1785044340,"until_epoch":1785044400,"limit":500}
 ```
 
-A `gap` means more transitions occurred in that window than one poll could carry,
-so **events were missed** — re-ask `timeline` for the named window. It is emitted
-*before* the events it qualifies, so a consumer never acts on a batch it believes
-is complete and learns otherwise afterwards. Silence about falling behind would
-be indistinguishable from calm, which is the failure this whole tool exists to
-prevent.
+Branch on `type`. A **`gap`** means one poll could not carry every event in that
+window, so events may have been missed: re-ask `timeline` for it. It comes
+*before* the events it qualifies.
 
-`tail` **polls; it does not subscribe**, and that is a decision rather than a
-shortcut. A transition does not exist until a sampler observes it, so a
-subscription would deliver the same events at the same moments — while holding
-one of the collector's few connection slots for its entire life, which is how a
-handful of forgotten streams would lock every other client out. Polling also lets
-it prove it kept up, which is what the `gap` line is.
+`tail` polls the collector each local interval and holds no connection between
+polls. If the collector goes away after the first poll (a restart), `tail` says
+so on stderr, keeps its window, and resumes when the collector returns. A job's
+`conclusion` is `null` unless the reconcile resolved it before `tail` saw the
+completion; `tail` never re-emits a job to add it.
 
-A job's `conclusion` is `null` until the reconcile resolves it from the API: the
-hook knows a job ended, not whether it passed. You see the completion once, with
-an unknown outcome, and no correction follows — ask `status` or the job queries
-for the settled answer.
+| Outcome | Exit |
+| --- | --- |
+| the reader closed the pipe | `0` |
+| no collector on the first poll | `2` |
+| Ctrl-C | killed by SIGINT (a shell reports `130`) |
 
-Ends with `0` when its reader closes (`ghr-stats tail | head -5`), or `2`
-immediately if there is no collector. Ctrl-C ends it at `130`, the shell
-convention.
+## After an upgrade
 
-## Collector versus binary
+Clients and the collector must speak the same IPC version. Until the service is
+re-installed from the new binary ([CLI & operations](cli.md#the-collector-service)),
+`status` and `explain` answer from a scan of this host, `timeline`, `wait` and
+`tail` exit `2`, and `doctor` fails its `collector` check with the fix.
 
-Every verb that needs history or GitHub's view needs the collector, and the two
-must be the **same build**. After upgrading:
+## See also
 
-```bash
-sudo systemctl restart ghr-stats.service
-```
-
-Until you do, the wire versions disagree and the verbs report `version-drift` and
-exit `2` rather than answering from a stale or mismatched source. `doctor` names
-this explicitly, including the quieter case where the wire versions still match
-but the builds differ.
+- [Metrics](metrics.md): the same snapshot for Prometheus
+- [CLI & operations](cli.md): every command
+- [Design](design.md#clients-and-modes): how a verb finds the collector

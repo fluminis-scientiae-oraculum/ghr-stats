@@ -1,104 +1,140 @@
 # Metrics
 
-[← README](../README.md)
+[← Docs](README.md)
 
-The collector can also expose the fleet metrics (both off by default; enable in
-`[metrics]`). These are Persistent-mode features — they need the service:
+The collector exports one snapshot two ways, both off by default and enabled in
+`[metrics]` ([Configuration](configuration.md#settings)):
 
-- **Pull** — a tiny `/metrics` endpoint in Prometheus text format, bound to
-  **`127.0.0.1:9477`** by default. The metrics are unauthenticated, so the bind
-  address must stay on loopback. Always the literal `127.0.0.1`, never
-  `localhost`.
-- **Push** — periodically POSTs the metrics as JSON to an ingest endpoint (e.g.
-  OpenObserve's `_json` API), with an optional `auth` header and an interval.
+- **Pull**: `GET /metrics` in Prometheus text format on `metrics.pull.addr`
+  (default `127.0.0.1:9477`). The endpoint has no authentication, so a
+  non-loopback address exposes runner and org names to that network. A failed
+  read answers HTTP 500, never an empty page.
+- **Push**: every `interval_secs` (default 30), a JSON array POSTed to
+  `metrics.push.endpoint`, with `auth` sent as the `Authorization` header. When
+  push starts, the log shows the endpoint without credentials or query string,
+  and warns once if `auth` would travel over plain HTTP to a non-loopback host.
 
-## Local liveness vs GitHub's view
+`status --json` is built from the same snapshot, so its verdict and the series
+agree.
 
-ghr-stats holds two independent facts about every runner, and keeping them
-separate is deliberate:
+## Two truths per runner
 
-- **Local liveness** (`ghr_runner_up`, `ghr_fleet_by_state`) comes from
-  inspecting the runner user's processes. It answers "is the listener running on
-  this host".
-- **GitHub's view** (`ghr_runner_github_online`) comes from the API reconcile. It
-  answers "will GitHub give this runner work".
+- **Local liveness** (`ghr_runner_up`, `ghr_runner_busy`): the runner's
+  processes on this host. "Is the listener running?"
+- **GitHub's view** (`ghr_runner_github_online`): the API reconcile. "Will GitHub
+  send this runner work?"
 
-These can disagree, and the disagreement is the interesting state: a runner whose
-listener is perfectly healthy but which GitHub will not dispatch to is
-**divergent**. `ghr_runner_divergent` and `ghr_fleet_by_state{state="divergent"}`
-name it.
+A runner that is up locally but offline to GitHub is **divergent**
+(`ghr_runner_divergent`).
 
-> `divergent` **cross-cuts** `busy`/`idle`/`offline` rather than partitioning
-> them — a divergent runner is still counted as idle or busy. Do not sum all
-> four; you would double-count.
+GitHub's view of each runner is its newest reading, served only while fresh:
 
-Alert on **duration**, never on the instantaneous bit. In the incident that
-motivated these metrics the raw value flapped 62 times in three hours before
-settling into a sustained failure; anything keyed to the instantaneous value
-would have fired, been muted, and then missed the real outage.
-`ghr_runner_github_offline_seconds` is the debounced quantity — it comes from a
-persisted edge, so it survives collector restarts and scrape gaps.
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Unknown
+    Unknown --> Fresh: a reconcile lists this runner
+    Fresh --> Fresh: a reconcile lists this runner
+    Fresh --> Stale: no reading within api_max_age_secs
+    Stale --> Fresh: a reconcile lists this runner
+    Stale --> Unknown: its readings are pruned
+```
 
-### Reconcile health
+| View | `github_online` | `divergent` | `github_sample_age_seconds` |
+| --- | --- | --- | --- |
+| Fresh | `0` or `1` | `0` or `1` | present |
+| Stale | absent | absent, or `0` when locally offline | present |
+| Unknown: no reading on record (no PAT, never listed, pruned) | absent | absent, or `0` when locally offline | absent |
 
-`ghr_runner_github_online` being absent is not the same as it being `0`. An org
-whose token broke, or which has no PAT at all, cannot be asked — and a scrape
-must be able to tell that from "GitHub says offline":
+A locally offline runner is never divergent: every other series already shows
+it.
 
-| Metric | Meaning |
-| --- | --- |
-| `ghr_api_reconcile_ok{org}` | 1 if the last attempt for this org succeeded |
-| `ghr_api_reconcile_timestamp_seconds{org}` | last **successful** reconcile |
-| `ghr_api_reconcile_error{org,kind}` | 1 while the last reconcile failed, labelled by the failure (`http_403`, `transport`, …) |
-| `ghr_api_org_configured{org}` | 0 when no PAT is configured for the org |
-| `ghr_runner_github_sample_age_seconds` | age of each runner's GitHub reading |
-| `ghr_api_max_age_seconds` | the configured freshness window itself |
+Absent means "we cannot say", never "offline". Alert on the absence separately,
+through the reconcile-health series below.
 
-Past `ghr_api_max_age_seconds` a reading is treated as stale and its
-`ghr_runner_github_online` series drops out rather than reporting an aged value
-as current. Tune with `intervals.api_max_age_secs`.
+## Families
 
-> **Personal-account runners never reconcile, by design.** The reconcile calls
-> `/orgs/{org}/actions/runners`, which is gated by an *organization*-scoped
-> fine-grained PAT permission. A repository-level runner under a personal
-> account has no equivalent permission to grant, so it reports
-> `ghr_api_org_configured 0` permanently and has **no** `github_*` series at
-> all. That is "we cannot ask", not "it is down" — which is why the
-> `configured == 1` clause in the org alert below is required, and why the
-> per-runner alerts are safe: a runner with no GitHub reading emits no
-> `ghr_runner_github_offline_seconds`, so nothing can fire on it.
+Runner series carry `agent_id`, `name` and `org`; `org` is the organization,
+repository owner or enterprise the runner is registered to, without the host.
+
+| Family | Type | Labels | Meaning | Absent when |
+| --- | --- | --- | --- | --- |
+| `ghr_build_info` | gauge | `version` | always `1` | never |
+| `ghr_fleet_runners` | gauge | | runners discovered | never |
+| `ghr_fleet_by_state` | gauge | `state` = `busy`, `idle`, `offline`, `divergent` | runners per state | never |
+| `ghr_last_sample_timestamp_seconds` | gauge | | last local sample | nothing sampled yet |
+| `ghr_host_load1` | gauge | | 1-minute load average | no host sample yet |
+| `ghr_host_mem_bytes` | gauge | `kind` = `used`, `total` | host memory | no host sample yet |
+| `ghr_jobs_total` | counter | | job rows recorded by the hooks | never |
+| `ghr_jobs_running` | gauge | | jobs started with no completion recorded | never |
+| `ghr_runner_up` | gauge | runner | `1` unless locally offline | never |
+| `ghr_runner_busy` | gauge | runner | `1` while running a job | never |
+| `ghr_runner_cpu_percent` | gauge | runner | cgroup CPU over the last tick | first tick, or no cgroup |
+| `ghr_runner_mem_bytes` | gauge | runner | cgroup working set (anon + shmem; `memory.current` if `memory.stat` is unreadable) | no cgroup |
+| `ghr_runner_mem_current_bytes` | gauge | runner | cgroup `memory.current`, page cache included | no cgroup |
+| `ghr_runner_state_seconds` | gauge | runner, `state` | time in the current local state | never |
+| `ghr_runner_github_online` | gauge | runner | GitHub reports it online | view not fresh |
+| `ghr_runner_github_busy` | gauge | runner | GitHub reports it busy | view not fresh |
+| `ghr_runner_github_sample_age_seconds` | gauge | runner | age of GitHub's reading | never read |
+| `ghr_runner_github_offline_seconds` | gauge | runner | time since GitHub last reported it going offline; `0` while fresh and online | neither a recorded offline edge nor a fresh online reading |
+| `ghr_runner_divergent` | gauge | runner | up locally, offline to GitHub | view not fresh and runner up locally |
+| `ghr_org_runners` | gauge | `org`, `state` = `total`, `github_online` | runners per org | never |
+| `ghr_api_max_age_seconds` | gauge | | the freshness window in force | never |
+| `ghr_api_reconcile_ok` | gauge | `org` | last reconcile attempt succeeded | org never attempted |
+| `ghr_api_org_configured` | gauge | `org` | the org has a PAT and a listable scope | org never attempted |
+| `ghr_api_reconcile_timestamp_seconds` | gauge | `org` | last **successful** reconcile | never succeeded |
+| `ghr_api_reconcile_error` | gauge | `org`, `kind` | `1` while the last reconcile failed; `kind` is e.g. `http_403`, `transport` | last attempt succeeded, or the org is not configured |
+
+In `ghr_fleet_by_state`, divergent runners are also counted as `busy` or `idle`;
+do not sum all four.
 
 ## Alert recipes
 
-Sized against the measured flap. The third rule is what makes the first two
-trustworthy — without it a dead reconcile presents as a calm fleet.
+Alert on durations, not on the instantaneous bit: GitHub's view can flap for
+minutes before a real outage settles. `ghr_runner_github_offline_seconds` comes
+from a persisted edge, so it survives collector restarts and scrape gaps.
 
 ```yaml
-- alert: GhrRunnerDivergent            # local healthy, GitHub says unusable
+- alert: GhrRunnerDivergent
   expr: ghr_runner_github_offline_seconds > 900 and ghr_runner_up == 1
   for: 5m
   annotations:
     summary: "{{ $labels.name }} ({{ $labels.org }}) offline to GitHub for >15m while running locally"
 
-- alert: GhrOrgAllRunnersOffline       # the org-wide pattern
-  # The `configured == 1` clause is required, not optional. An org with no PAT
-  # reports github_online = 0 forever, because we never asked — not because its
-  # runners are down. Personal-account (repository-level) runners are the common
-  # case: they have no org-scoped "Self-hosted runners" permission to grant, so
-  # they can never be reconciled and would otherwise alert permanently.
+- alert: GhrOrgAllRunnersOffline
+  # `on(org)`: the operands differ in their other labels.
+  # `configured` and `reconcile_ok`: an org that was never asked, or whose last
+  # reconcile failed, has no fresh readings and so counts 0 online.
   expr: |
     ghr_org_runners{state="github_online"} == 0
-      and ghr_org_runners{state="total"} > 0
+      and on(org) ghr_org_runners{state="total"} > 0
       and on(org) ghr_api_org_configured == 1
+      and on(org) ghr_api_reconcile_ok == 1
   for: 15m
 
-- alert: GhrApiReconcileStale          # do not trust the two above without this
+- alert: GhrApiReconcileStale
+  # The rules above cannot see new outages while the reconcile is failing.
   expr: time() - ghr_api_reconcile_timestamp_seconds > 600
   for: 10m
 ```
 
-For the push path, the equivalent is a scheduled search over the `runner`
-records on `github_online = false AND up = 1`, grouped by `org`, with a `>15m`
-sustain condition. The pushed records also carry `divergent`,
-`github_offline_seconds` and a per-record `verdict`, so a query does not have to
-re-derive the join.
+## Push payload
+
+A JSON array: one `fleet` record, then one `runner` record per runner.
+`_timestamp` is in microseconds, as OpenObserve's `_json` ingest expects.
+
+| Record | Fields |
+| --- | --- |
+| `kind: "fleet"` | `version`, `runners`, `busy`, `idle`, `offline`, `divergent`, `load1`, `mem_used`, `mem_total`, `jobs_total`, `jobs_running`, `last_sample_ts`, `verdict` (as `status`), `orgs[]` of `{org, runners, github_online}` |
+| `kind: "runner"` | `agent_id`, `name`, `org`, `liveness`, `up`, `busy`, `cpu_percent`, `mem_bytes`, `mem_current_bytes`, `state_seconds`, `github_online`, `github_busy`, `github_sample_age_s`, `github_offline_seconds`, `divergent` |
+
+Unknown values are `null`, like an absent series, with one difference:
+`github_offline_seconds` is `null` while the runner is online, where Prometheus
+shows `0`. The equivalent of `GhrRunnerDivergent` is a search over `runner`
+records for `github_offline_seconds > 900 AND up = 1`, sustained for 5 minutes.
+
+## See also
+
+- [For agents](agents.md#status): the same snapshot as `status --json`
+- [Configuration](configuration.md#settings): `[metrics]` and `api_max_age_secs`
+- [Design](design.md#the-collector): where the snapshot is read

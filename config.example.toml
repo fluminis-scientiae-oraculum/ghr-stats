@@ -7,15 +7,17 @@
 # $GHR_STATS_CONFIG names another. Every field has a default. The file holds
 # GitHub tokens, so keep it mode 0600.
 
-# SQLite database (the collector service writes it; the TUI reads it over the IPC socket).
-# Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).
-# db_path = "/home/you/.local/share/ghr-stats/ghr-stats.db"
+# The collector's SQLite database. Default: /var/lib/ghr-stats/ghr-stats.db for a
+# root collector, $XDG_DATA_HOME/ghr-stats/ghr-stats.db otherwise.
+# db_path = "/var/lib/ghr-stats/ghr-stats.db"
 
-# Directories scanned for runner installs (each holds a `.runner` file).
-# Default: empty — `ghr-stats config` discovers and records them, or list here.
+# Directories holding runner install dirs (each with a `.runner` file).
+# Default: empty, meaning the parents of every actions.runner.* unit's
+# WorkingDirectory. `ghr-stats config` records the root you choose.
 # runner_roots = ["/opt/actions-runner", "/srv/runners"]
 
-# GitHub orgs to reconcile. Empty => derived from the orgs found in `.runner`.
+# github.com organizations to reconcile INSTEAD of the scopes found in `.runner`
+# files. Default: empty, meaning those scopes (organizations, repositories, any host).
 # orgs = ["gh-org-a", "gh-org-b"]
 
 # Days of samples to keep; the collector prunes older ones hourly. Job history is
@@ -47,7 +49,7 @@ api_secs = 60
 # is scoped to one resource owner):
 #   GitHub → Settings → Developer settings → Personal access tokens →
 #   Fine-grained tokens → Generate new token
-#     • Resource owner: the organization (or your account, for repository runners)
+#     • Resource owner: the organization, or the repository's owner for repository runners
 #     • Repository access: the repositories whose runners or job results you want
 #       read, or none for organization runners without job results
 #     • the permission above for your runners                        (required)
@@ -75,9 +77,8 @@ api_secs = 60
 # Prometheus PULL: a tiny /metrics endpoint scrapers hit.
 # [metrics.pull]
 # enabled = true
-# SECURITY: bind loopback only (default 127.0.0.1:9477). Never bind a wider
-# interface — the metrics are unauthenticated. Use `localhost`? No: always the
-# literal 127.0.0.1 (localhost can resolve to ::1 first and hang the listener).
+# An ip:port (default 127.0.0.1:9477). The endpoint is unauthenticated: a
+# non-loopback address exposes runner and org names to that network.
 # addr = "127.0.0.1:9477"
 
 # PUSH: periodically POST the metrics as JSON to an ingest endpoint (e.g.
