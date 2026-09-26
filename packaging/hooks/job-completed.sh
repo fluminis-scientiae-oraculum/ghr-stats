@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# ghr-stats runner hook — JOB_COMPLETED.  See job-started.sh for the contract.
-# MUST NOT fail the job: best-effort, always exits 0.
+# ghr-stats runner hook: JOB_COMPLETED. Same contract as job-started.sh.
 
 log="${GHR_STATS_EVENT_LOG:-}"
 [ -n "$log" ] || exit 0
