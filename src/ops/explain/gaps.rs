@@ -63,15 +63,14 @@ pub(super) fn github_view_stale(snap: &Snapshot) -> Option<Finding> {
         ],
         first_seen: oldest.map(|age| to_rfc3339_utc(s.generated_at_epoch - age)),
         suggested_checks: vec![
-            "ghr_api_reconcile_ok and ghr_api_reconcile_errors_total on the metrics endpoint"
-                .to_string(),
+            "ghr_api_reconcile_ok and ghr_api_reconcile_error on the metrics endpoint".to_string(),
             "whether the org's PAT expired or lost Self-hosted runners: Read".to_string(),
             "whether these runners were removed from the org on GitHub's side".to_string(),
         ],
     })
 }
 
-/// `Info`: an org with no token (e.g. a personal account) is a standing fact.
+/// `Info`: an org with no token, or enterprise-level runners, is a standing fact.
 pub(super) fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
     if !matches!(snap.source, Source::Collector) {
         return None;
@@ -113,7 +112,7 @@ pub(super) fn org_never_reconciled(snap: &Snapshot) -> Option<Finding> {
         suggested_checks: vec![
             "whether a read-only PAT is configured for each of these orgs".to_string(),
             "ghr_api_org_configured on the metrics endpoint".to_string(),
-            "that this is expected — a personal account cannot expose org runners".to_string(),
+            "enterprise-level runners cannot be reconciled with a fine-grained PAT".to_string(),
         ],
     })
 }

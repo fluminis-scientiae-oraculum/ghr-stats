@@ -163,10 +163,7 @@ mod tests {
         set_org_token(&path, "acme", "github_pat_ABC").unwrap();
 
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            cfg.github_token_for("acme").as_deref(),
-            Some("github_pat_ABC")
-        );
+        assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_ABC"));
         assert_eq!(cfg.intervals.local_secs, 9);
         assert!(cfg.metrics.push.enabled);
         assert_eq!(cfg.runner_roots, vec![std::path::PathBuf::from("/srv/r")]);
@@ -193,10 +190,7 @@ mod tests {
             cfg.runner_roots,
             vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")]
         );
-        assert_eq!(
-            cfg.github_token_for("acme").as_deref(),
-            Some("github_pat_KEEP")
-        );
+        assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_KEEP"));
         assert!(cfg.metrics.push.enabled);
     }
 
@@ -289,10 +283,7 @@ mod tests {
         let path = dir.path().join("etc").join("ghr-stats").join("config.toml");
         set_org_token(&path, "acme", "github_pat_ABC").unwrap();
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            cfg.github_token_for("acme").as_deref(),
-            Some("github_pat_ABC")
-        );
+        assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_ABC"));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

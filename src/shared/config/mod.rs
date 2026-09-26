@@ -4,6 +4,7 @@ pub(crate) mod persist;
 mod secret;
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -12,6 +13,7 @@ use serde::Deserialize;
 pub use secret::Secret;
 
 use crate::shared::error::{Error, Result};
+use crate::shared::github::GitHubHost;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,10 @@ pub struct Config {
     #[serde(default)]
     pub orgs: Vec<String>,
 
+    /// Days of samples kept (default 30), or `"forever"`. Job history is always kept.
+    #[serde(default)]
+    pub retention_days: Retention,
+
     #[serde(default)]
     pub intervals: Intervals,
 
@@ -35,6 +41,52 @@ pub struct Config {
 
     #[serde(default)]
     pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RetentionSetting")]
+pub enum Retention {
+    Days(NonZeroU16),
+    Forever,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Retention::Days(NonZeroU16::new(30).expect("30 is non-zero"))
+    }
+}
+
+impl Retention {
+    /// Samples older than this epoch second are pruned; `None` keeps everything.
+    pub fn cutoff(self, now: i64) -> Option<i64> {
+        match self {
+            Retention::Days(d) => Some(now - i64::from(d.get()) * 86_400),
+            Retention::Forever => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RetentionSetting {
+    Days(u16),
+    Word(String),
+}
+
+impl TryFrom<RetentionSetting> for Retention {
+    type Error = String;
+
+    fn try_from(s: RetentionSetting) -> std::result::Result<Self, String> {
+        match s {
+            RetentionSetting::Days(d) => NonZeroU16::new(d)
+                .map(Retention::Days)
+                .ok_or_else(|| "retention_days must be at least 1, or \"forever\"".to_string()),
+            RetentionSetting::Word(w) if w == "forever" => Ok(Retention::Forever),
+            RetentionSetting::Word(w) => Err(format!(
+                "retention_days is a number of days or \"forever\", not {w:?}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,7 +117,7 @@ pub struct GithubConfig {
     /// Fallback for orgs without a per-org token; `GHR_STATS_GITHUB_TOKEN` overrides it.
     #[serde(default)]
     pub token: Option<Secret>,
-    /// Org login → read-only PAT.
+    /// Read-only PAT per `owner` (github.com) or `host/owner`.
     #[serde(default)]
     pub tokens: BTreeMap<String, Secret>,
 }
@@ -148,16 +200,34 @@ impl Config {
         }
     }
 
-    pub fn github_token_for(&self, org: &str) -> Option<String> {
-        if let Some(t) = self.github.tokens.get(org) {
-            return Some(t.expose().to_string());
+    #[cfg(test)]
+    pub(crate) fn dotcom_token(&self, owner: &str) -> Option<String> {
+        self.github_token_for(&GitHubHost::dotcom(), owner)
+            .map(|t| t.expose().to_string())
+    }
+
+    /// The PAT for `owner` on `host`: a `[github.tokens]` entry keyed `owner` (github.com)
+    /// or `host/owner`, else — for github.com only — `GHR_STATS_GITHUB_TOKEN` or
+    /// `github.token`. A github.com token is never sent to another host.
+    pub fn github_token_for(&self, host: &GitHubHost, owner: &str) -> Option<Secret> {
+        let keyed = self.github.tokens.iter().find(|(key, _)| {
+            let (key_host, key_owner) = match key.split_once('/') {
+                Some((h, o)) => (GitHubHost::parse(h).ok(), o),
+                None => (Some(GitHubHost::dotcom()), key.as_str()),
+            };
+            key_host.as_ref() == Some(host) && key_owner.eq_ignore_ascii_case(owner)
+        });
+        if let Some((_, t)) = keyed {
+            return Some(t.clone());
         }
-        if let Ok(t) = std::env::var("GHR_STATS_GITHUB_TOKEN")
-            && !t.is_empty()
-        {
-            return Some(t);
+        if !host.is_dotcom() {
+            return None;
         }
-        self.github.token.as_ref().map(|s| s.expose().to_string())
+        std::env::var("GHR_STATS_GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .map(Secret::from)
+            .or_else(|| self.github.token.clone())
     }
 }
 
@@ -212,6 +282,7 @@ impl Default for Config {
             db_path: defaults::db_path(),
             runner_roots: defaults::runner_roots(),
             orgs: Vec::new(),
+            retention_days: Retention::default(),
             intervals: Intervals::default(),
             github: GithubConfig::default(),
             metrics: MetricsConfig::default(),
@@ -302,12 +373,49 @@ mod tests {
     }
 
     #[test]
+    fn tokens_are_scoped_to_their_host() {
+        let c: Config = toml::from_str(
+            "[github]\ntoken = \"github_pat_fallback\"\n\
+             [github.tokens]\n\"Example-Org\" = \"github_pat_dotcom\"\n\
+             \"ghe.example.com/eng\" = \"github_pat_ghes\"\n",
+        )
+        .unwrap();
+        let ghes = GitHubHost::parse("ghe.example.com").unwrap();
+        let expose = |t: Option<Secret>| t.map(|t| t.expose().to_string());
+        assert_eq!(
+            expose(c.github_token_for(&GitHubHost::dotcom(), "example-org")).as_deref(),
+            Some("github_pat_dotcom")
+        );
+        assert_eq!(
+            expose(c.github_token_for(&ghes, "eng")).as_deref(),
+            Some("github_pat_ghes")
+        );
+        assert_eq!(expose(c.github_token_for(&ghes, "example-org")), None);
+    }
+
+    #[test]
+    fn retention_is_days_or_forever() {
+        let parse = |t: &str| toml::from_str::<Config>(t).map(|c| c.retention_days);
+        assert_eq!(parse("").unwrap(), Retention::default());
+        assert_eq!(
+            parse("retention_days = \"forever\"").unwrap(),
+            Retention::Forever
+        );
+        assert_eq!(
+            parse("retention_days = 7").unwrap().cutoff(1_000_000),
+            Some(395_200)
+        );
+        assert!(parse("retention_days = 0").is_err());
+        assert!(parse("retention_days = \"always\"").is_err());
+    }
+
+    #[test]
     fn per_org_token_takes_precedence() {
         let c: Config =
             toml::from_str("[github.tokens]\n\"example-org\" = \"github_pat_xyz\"\n").unwrap();
         // Per-org wins before the env var is consulted, so the test env can't interfere.
         assert_eq!(
-            c.github_token_for("example-org").as_deref(),
+            c.dotcom_token("example-org").as_deref(),
             Some("github_pat_xyz")
         );
     }

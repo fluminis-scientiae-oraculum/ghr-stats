@@ -11,6 +11,12 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 impl Secret {
     /// Reveal the underlying secret. Call sites must never log the result.
     pub fn expose(&self) -> &str {

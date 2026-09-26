@@ -1,6 +1,6 @@
 //! Checks this machine answers directly; none opens the socket.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::cli::DoctorArgs;
@@ -8,6 +8,7 @@ use crate::ops::explain::Boundary;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
 use crate::shared::github::validate::{self, PatCheck};
+use crate::shared::github::{GitHubHost, RunnerScope};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
@@ -285,16 +286,23 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
         };
     }
 
-    let local_ids: HashSet<i64> = discovered.iter().map(|r| r.agent_id).collect();
+    let local: Vec<(RunnerScope, i64)> = discovered
+        .iter()
+        .map(|r| (r.scope.clone(), r.agent_id))
+        .collect();
     let mut ok = Vec::new();
     let mut missing = Vec::new();
     let mut rejected = Vec::new();
     for org in orgs {
-        let Some(token) = cfg.github_token_for(org) else {
+        let host = discovered
+            .iter()
+            .find(|r| r.org.eq_ignore_ascii_case(org))
+            .map_or_else(GitHubHost::dotcom, |r| r.scope.host.clone());
+        let Some(token) = cfg.github_token_for(&host, org) else {
             missing.push(org.clone());
             continue;
         };
-        match validate::validate(&token, org, &local_ids) {
+        match validate::validate(token.expose(), org, &local) {
             PatCheck::Valid {
                 runners, matched, ..
             } => ok.push(format!("{org} ({matched}/{runners} runners confirmed)")),
@@ -307,14 +315,15 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
         Outcome::Fail {
             detail: rejected.join("; "),
             fix: "run `sudo ghr-stats config` to replace the org's PAT (fine-grained, \
-                  Organization → Self-hosted runners: Read)"
+                  Organization → Self-hosted runners: Read, or Repository → Administration: \
+                  Read for repository runners)"
                 .to_string(),
         }
     } else {
         let mut detail = format!("{} PAT(s) validated: {}", ok.len(), ok.join(", "));
         if !missing.is_empty() {
             detail.push_str(&format!(
-                "; no PAT: {} (never reconciled — expected for an account with no org runner API)",
+                "; no PAT: {} (not reconciled with GitHub)",
                 missing.join(", ")
             ));
         }

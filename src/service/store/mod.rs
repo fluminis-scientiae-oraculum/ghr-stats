@@ -29,11 +29,13 @@ pub fn open_writer(path: &Path) -> Result<Connection> {
 /// A WAL reader still writes the `-shm`/`-wal` sidecars, so it needs write access to the DB
 /// directory; never `OPEN_READ_ONLY`. `None` (logged) lets the caller degrade.
 pub fn open_reader(path: &Path) -> Option<Connection> {
-    match Connection::open(path) {
-        Ok(c) => {
-            let _ = c.busy_timeout(Duration::from_secs(5));
-            Some(c)
-        }
+    let opened = Connection::open(path).and_then(|c| {
+        c.busy_timeout(Duration::from_secs(5))?;
+        c.pragma_update(None, "query_only", true)?;
+        Ok(c)
+    });
+    match opened {
+        Ok(c) => Some(c),
         Err(e) => {
             tracing::error!(error = %e, path = %path.display(), "open reader db");
             None

@@ -16,6 +16,7 @@ use ratatui::widgets::TableState;
 use crate::shared::collectors::cpu::CpuRateTracker;
 use crate::shared::collectors::runners;
 use crate::shared::config::Config;
+use crate::shared::github::RunnerScope;
 use crate::shared::hooks::install::HookStatus;
 use crate::shared::ipc::client::EphemeralReason;
 use crate::shared::models::{BusyPoint, GhView, HistPoint, HostPoint, JobRow, Liveness, Mode};
@@ -61,6 +62,7 @@ pub(crate) struct LiveRunner {
     pub agent_id: i64,
     pub name: String,
     pub org: String,
+    pub scope: RunnerScope,
     pub group: Option<String>,
     pub dir: PathBuf,
     pub user: String,

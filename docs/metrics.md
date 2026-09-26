@@ -49,7 +49,7 @@ must be able to tell that from "GitHub says offline":
 | --- | --- |
 | `ghr_api_reconcile_ok{org}` | 1 if the last attempt for this org succeeded |
 | `ghr_api_reconcile_timestamp_seconds{org}` | last **successful** reconcile |
-| `ghr_api_reconcile_errors_total{org,kind}` | classified failure (`http_403`, `transport`, …) |
+| `ghr_api_reconcile_error{org,kind}` | 1 while the last reconcile failed, labelled by the failure (`http_403`, `transport`, …) |
 | `ghr_api_org_configured{org}` | 0 when no PAT is configured for the org |
 | `ghr_runner_github_sample_age_seconds` | age of each runner's GitHub reading |
 | `ghr_api_max_age_seconds` | the configured freshness window itself |

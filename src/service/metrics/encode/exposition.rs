@@ -67,7 +67,7 @@ impl Snapshot {
         }
         let _ = writeln!(
             s,
-            "# TYPE ghr_jobs_total gauge\nghr_jobs_total {}\n\
+            "# TYPE ghr_jobs_total counter\nghr_jobs_total {}\n\
              # TYPE ghr_jobs_running gauge\nghr_jobs_running {}",
             self.jobs_total, self.jobs_running,
         );
@@ -183,7 +183,7 @@ impl Snapshot {
              # TYPE ghr_api_reconcile_ok gauge\n\
              # TYPE ghr_api_org_configured gauge\n\
              # TYPE ghr_api_reconcile_timestamp_seconds gauge\n\
-             # TYPE ghr_api_reconcile_errors_total counter",
+             # TYPE ghr_api_reconcile_error gauge",
             self.max_age
         );
         for c in &self.reconcile {
@@ -204,7 +204,7 @@ impl Snapshot {
             if let Some(kind) = &c.error_kind {
                 let _ = writeln!(
                     s,
-                    "ghr_api_reconcile_errors_total{{org=\"{org}\",kind=\"{}\"}} 1",
+                    "ghr_api_reconcile_error{{org=\"{org}\",kind=\"{}\"}} 1",
                     esc(kind)
                 );
             }
@@ -233,7 +233,7 @@ impl Snapshot {
             "jobs_running": self.jobs_running,
             "last_sample_ts": self.last_sample_ts,
             "divergent": self.divergent,
-            "verdict": if self.divergent > 0 || self.offline > 0 { "degraded" } else { "ok" },
+            "verdict": self.verdict().as_str(),
             "orgs": self.orgs.iter().map(|o| json!({
                 "org": o.org,
                 "runners": o.total,

@@ -3,11 +3,16 @@ use rusqlite::Connection;
 use crate::shared::error::Result;
 
 /// Append-only: entry N is schema vN, recorded in `PRAGMA user_version`.
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let target = MIGRATIONS.len() as i64;
+    if current < 0 {
+        return Err(crate::shared::error::Error::Config(format!(
+            "database schema version is {current}, which no ghr-stats build writes"
+        )));
+    }
     if current > target {
         return Err(crate::shared::error::Error::Config(format!(
             "database schema is v{current}, but this build knows only v{target} — the database \
@@ -163,6 +168,13 @@ CREATE INDEX idx_api_runner_sample_org_agent_ts
     ON api_runner_sample(org, agent_id, ts);
 "#;
 
+/// No query reads these: runner identity is the install dir, and GitHub rows are read
+/// through `idx_api_runner_sample_org_agent_ts`.
+const V7: &str = r#"
+DROP INDEX IF EXISTS idx_runner_sample_agent;
+DROP INDEX IF EXISTS idx_api_runner_sample_agent;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +214,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 10);
+
+        let dropped: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name IN \
+                 ('idx_runner_sample_agent','idx_api_runner_sample_agent')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dropped, 0);
     }
 }

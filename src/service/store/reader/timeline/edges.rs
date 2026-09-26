@@ -3,7 +3,6 @@
 use rusqlite::{Connection, params};
 
 use crate::shared::error::Result;
-use crate::shared::models::Liveness;
 use crate::shared::models::timeline::{
     Edge, JobEdge, JobTransition, ReconcileEdge, TimelineQuery, Transition,
 };
@@ -72,8 +71,8 @@ pub(super) fn liveness_edges(
             org: r.get(1)?,
             edge: Edge::Liveness {
                 runner: r.get(2)?,
-                from: Liveness::from_db(&r.get::<_, String>(3)?),
-                to: Liveness::from_db(&r.get::<_, String>(4)?),
+                from: r.get(3)?,
+                to: r.get(4)?,
             },
         })
     })?;

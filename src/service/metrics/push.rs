@@ -33,7 +33,10 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                 let on = push.enabled && !push.endpoint.is_empty();
                 if on != active {
                     if on {
-                        tracing::info!(endpoint = %push.endpoint, every_s = push.interval_secs.max(5), "metrics push enabled");
+                        tracing::info!(endpoint = %redacted(&push.endpoint), every_s = push.interval_secs.max(5), "metrics push enabled");
+                        if push.auth.is_some() && sends_auth_in_clear(&push.endpoint) {
+                            tracing::warn!("metrics push sends its Authorization header over plain HTTP");
+                        }
                         next = Instant::now();
                     } else {
                         tracing::info!("metrics push disabled");
@@ -61,6 +64,26 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .expect("spawn metrics-push")
 }
 
+/// `scheme://host/path` without userinfo or query, which may carry credentials.
+fn redacted(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    format!("{scheme}://{host}/{path}")
+}
+
+/// Plain `http://` to anything but loopback.
+fn sends_auth_in_clear(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    !matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
 fn post(endpoint: &str, auth: Option<&str>, body: &str) {
     let mut req = ureq::post(endpoint)
         .config()
@@ -73,5 +96,21 @@ fn post(endpoint: &str, auth: Option<&str>, body: &str) {
     match req.send(body) {
         Ok(_) => tracing::debug!("metrics pushed"),
         Err(e) => tracing::warn!(error = %e, "metrics push: POST failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logged_endpoints_drop_credentials() {
+        assert_eq!(
+            redacted("https://user:pw@ingest.example.com/api/_json?token=abc"),
+            "https://ingest.example.com/api/_json"
+        );
+        assert!(sends_auth_in_clear("http://ingest.example.com:5080/api"));
+        assert!(!sends_auth_in_clear("http://127.0.0.1:5080/api"));
+        assert!(!sends_auth_in_clear("https://ingest.example.com/api"));
     }
 }

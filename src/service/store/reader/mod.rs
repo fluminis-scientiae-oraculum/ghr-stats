@@ -1,12 +1,10 @@
 //! Server-side reads for the IPC server and metrics exporter, each on its own WAL connection.
 use std::collections::HashMap;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::shared::error::Result;
-use crate::shared::models::{
-    BusyPoint, GhCount, HistPoint, HostPoint, Liveness, RunnerSample, RunnerState,
-};
+use crate::shared::models::{BusyPoint, GhCount, HistPoint, HostPoint, RunnerSample, RunnerState};
 
 /// Edge derivations and window assembly for the `timeline` query.
 pub mod timeline;
@@ -19,8 +17,19 @@ mod jobs;
 pub use github::{api_reconcile_states, api_runner_states, latest_api_runners};
 pub use jobs::{ingest_offsets, job_counts, jobs_awaiting_conclusion, latest_job, recent_jobs};
 
-/// Newest `limit` samples, oldest first.
+/// Newest `limit` samples, oldest first. An unknown `dir` answers empty at once rather
+/// than scanning the whole table for it.
 pub fn runner_history(conn: &Connection, dir: &str, limit: usize) -> Result<Vec<HistPoint>> {
+    let known: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM runner_state WHERE dir = ?1",
+            params![dir],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if known.is_none() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare_cached(
         "SELECT ts, cpu_pct, mem_bytes FROM runner_sample \
          WHERE dir = ?1 ORDER BY ts DESC LIMIT ?2",
@@ -110,7 +119,7 @@ pub fn latest_runners(conn: &Connection) -> Result<Vec<RunnerSample>> {
             agent_id: r.get(1)?,
             name: r.get(2)?,
             org: r.get(3)?,
-            liveness: Liveness::from_db(&r.get::<_, String>(4)?),
+            liveness: r.get(4)?,
             cpu_pct: r.get::<_, Option<f64>>(5)?.map(|v| v as f32),
             mem_bytes: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
             uptime_s: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
@@ -130,7 +139,7 @@ pub fn runner_states(conn: &Connection) -> Result<HashMap<String, RunnerState>> 
             dir.clone(),
             RunnerState {
                 dir,
-                liveness: Liveness::from_db(&r.get::<_, String>(1)?),
+                liveness: r.get(1)?,
                 since_ts: r.get(2)?,
                 last_seen_ts: r.get(3)?,
             },
@@ -181,6 +190,7 @@ mod fixtures {
 mod tests {
     use super::fixtures::{api_sample, mem_db};
     use super::*;
+    use crate::shared::models::Liveness;
 
     #[test]
     fn retention_of_an_empty_store_is_none_not_zero() {
@@ -216,6 +226,12 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO runner_state (dir, liveness, since_ts, last_seen_ts) \
+             VALUES ('/srv/r7', 'idle', 100, 400)",
+            [],
+        )
+        .unwrap();
         let h = runner_history(&conn, "/srv/r7", 3).unwrap();
         assert_eq!(
             h.iter().map(|p| p.ts).collect::<Vec<_>>(),

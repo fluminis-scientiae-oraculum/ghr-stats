@@ -89,7 +89,7 @@ fn version_outcome(collector: &str) -> Outcome {
     }
 }
 
-/// An org that never reconciled passes: a personal account has no org runner API.
+/// An org that never reconciled passes: it has no PAT, or its runners are enterprise-level.
 fn reconcile_check(s: &FleetStatus) -> Check {
     let mut stale = Vec::new();
     let mut never = Vec::new();
@@ -108,7 +108,7 @@ fn reconcile_check(s: &FleetStatus) -> Check {
         let mut detail = format!("{ok} org(s) reconciling");
         if !never.is_empty() {
             detail.push_str(&format!(
-                "; never reconciled: {} (expected for an account with no org runner API)",
+                "; never reconciled: {} (no PAT, or enterprise-level runners)",
                 never.join(", ")
             ));
         }

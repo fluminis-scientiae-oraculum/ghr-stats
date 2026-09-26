@@ -10,9 +10,6 @@ pub enum Error {
 
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
-
-    #[error("github: {0}")]
-    Github(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

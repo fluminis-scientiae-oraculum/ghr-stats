@@ -99,8 +99,15 @@ fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
         DbAction::Prune { days } => {
             let mut db = crate::service::store::open_writer(&cfg.db_path)
                 .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;
-            let cutoff = crate::shared::util::now_epoch() - (days as i64) * 86_400;
-            let removed = crate::service::store::writer::prune(&mut db, cutoff)?;
+            let cutoff = crate::shared::util::now_epoch() - i64::from(days) * 86_400;
+            let mut removed = 0;
+            loop {
+                let n = crate::service::store::writer::prune_batch(&mut db, cutoff, 10_000)?;
+                if n == 0 {
+                    break;
+                }
+                removed += n;
+            }
             println!("pruned {removed} sample rows older than {days}d");
             Ok(())
         }

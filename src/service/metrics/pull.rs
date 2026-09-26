@@ -52,12 +52,14 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
                     Some(s) => match s.recv_timeout(TICK) {
                         Ok(Some(req)) => {
                             let resp = if req.url().starts_with("/metrics") {
-                                Response::from_string(body(
-                                    conn.as_ref(),
-                                    version,
-                                    cfg.intervals.api_max_age(),
-                                ))
-                                .with_header(text_header())
+                                match body(conn.as_ref(), version, cfg.intervals.api_max_age())
+                                {
+                                    Ok(text) => {
+                                        Response::from_string(text).with_header(text_header())
+                                    }
+                                    Err(e) => Response::from_string(format!("{e}\n"))
+                                        .with_status_code(500),
+                                }
                             } else {
                                 Response::from_string("see /metrics\n")
                             };
@@ -74,14 +76,12 @@ pub fn spawn(shared: SharedConfig, term: Arc<AtomicBool>) -> JoinHandle<()> {
         .expect("spawn metrics-pull")
 }
 
-fn body(conn: Option<&Connection>, version: &str, max_age: u64) -> String {
-    let Some(conn) = conn else {
-        return "# db unavailable\n".to_string();
-    };
-    match Snapshot::gather(conn, now_epoch(), version, max_age) {
-        Ok(s) => s.to_prometheus(),
-        Err(e) => format!("# gather error: {e}\n"),
-    }
+/// The exposition, or why it could not be built (served as a 500 so the scrape fails).
+fn body(conn: Option<&Connection>, version: &str, max_age: u64) -> Result<String, String> {
+    let conn = conn.ok_or("database unavailable")?;
+    Snapshot::gather(conn, now_epoch(), version, max_age)
+        .map(|s| s.to_prometheus())
+        .map_err(|e| format!("gather error: {e}"))
 }
 
 fn text_header() -> Header {

@@ -1,13 +1,11 @@
-# ghr-stats configuration — copy to ~/.config/ghr-stats/config.toml
+# ghr-stats configuration. `sudo ghr-stats config` writes this for you; to start
+# from this file instead:
 #
-#   install -Dm600 config.example.toml ~/.config/ghr-stats/config.toml
+#   sudo install -Dm600 config.example.toml /etc/ghr-stats/config.toml
 #
-# Every field has a default, so the tool runs with no config at all. It holds
-# GitHub tokens, so it is root-owned mode 0600.
-#
-# Canonical location: /etc/ghr-stats/config.toml (system-scope, root:root 0600) —
-# one source of truth the collector reads and `sudo ghr-stats config` writes.
-# An explicit --config FLAG or $GHR_STATS_CONFIG overrides it.
+# The collector reads /etc/ghr-stats/config.toml unless --config FILE or
+# $GHR_STATS_CONFIG names another. Every field has a default. The file holds
+# GitHub tokens, so keep it mode 0600.
 
 # SQLite database (the collector service writes it; the TUI reads it over the IPC socket).
 # Default: $XDG_DATA_HOME/ghr-stats/ghr-stats.db (~/.local/share/...).
@@ -19,6 +17,10 @@
 
 # GitHub orgs to reconcile. Empty => derived from the orgs found in `.runner`.
 # orgs = ["gh-org-a", "gh-org-b"]
+
+# Days of samples to keep; the collector prunes older ones hourly. Job history is
+# always kept. "forever" disables pruning.
+# retention_days = 30
 
 [intervals]
 # Local sampling cadence (runner processes / cgroup / host), seconds.
@@ -34,32 +36,36 @@ api_secs = 60
 # ── GitHub API (optional, read-only) ───────────────────────────────────────
 # Runner online/busy reconcile; `ghr-stats config` validates each token.
 #
-# ORGANIZATION runners only: the reconcile calls /orgs/{org}/actions/runners,
-# gated by the ORG-scoped "Self-hosted runners" fine-grained-PAT permission —
-# which exists only on an organization resource owner. Personal-account
-# (repository-level) self-hosted runners have no equivalent PAT permission, so
-# they get no GitHub online/busy reconcile; they are still sampled locally
-# (liveness / CPU / memory / uptime — no PAT needed).
+# What gets reconciled depends on where each runner is registered (its `.runner`):
+#   • organization runners  → Organization permissions → "Self-hosted runners" → Read
+#   • repository runners    → Repository permissions → "Administration" → Read, on
+#                             the repositories that have runners
+#   • enterprise runners    → not reconciled (GitHub requires a classic token there)
+# Runners are always sampled locally (liveness / CPU / memory / uptime) without a PAT.
 #
-# Create a FINE-GRAINED personal access token PER ORG (a fine-grained PAT is
-# scoped to one resource owner):
+# Create a FINE-GRAINED personal access token per org or account (a fine-grained PAT
+# is scoped to one resource owner):
 #   GitHub → Settings → Developer settings → Personal access tokens →
 #   Fine-grained tokens → Generate new token
-#     • Resource owner: the organization
-#     • Repository access: none / public read-only (runner data is org-scoped)
-#     • Organization permissions → "Self-hosted runners" → Read-only   (required)
+#     • Resource owner: the organization (or your account, for repository runners)
+#     • Repository access: the repositories whose runners or job results you want
+#       read, or none for organization runners without job results
+#     • the permission above for your runners                        (required)
 #     • Repository permissions → "Actions" → Read-only   (OPTIONAL: lets the
 #       collector fill each job's success/failure conclusion; without it jobs
 #       still show timing, just a neutral "done")
 #     • Expiration: bounded (e.g. 90 days); re-mint on expiry
 # The org may require owner approval for the token.
 #
-# [github.tokens]
-# "gh-org-a"      = "github_pat_..."
-# "gh-org-b"      = "github_pat_..."
+# Keys are the org or account login. For GitHub Enterprise Server or GHE.com,
+# prefix the host: "ghe.example.com/eng".
 #
-# Single fallback for any org without a specific token above (suits a single-org
-# setup). The GHR_STATS_GITHUB_TOKEN env var overrides this fallback.
+# [github.tokens]
+# "gh-org-a"            = "github_pat_..."
+# "ghe.example.com/eng" = "github_pat_..."
+#
+# Fallback for any github.com org without a specific token above (suits a single-org
+# setup); never sent to another host. The GHR_STATS_GITHUB_TOKEN env var overrides it.
 # [github]
 # token = "github_pat_..."
 

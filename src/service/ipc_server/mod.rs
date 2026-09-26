@@ -183,8 +183,10 @@ fn serve_conn(
         // Per request, so a mutation that widens the freshness window applies immediately.
         let max_age = shared.snapshot().intervals.api_max_age();
         let resp = handle(&req, conn, auth, config_path, max_age);
-        if matches!(resp, Response::Mutated) {
-            shared.store(reload_config(config_path));
+        if matches!(resp, Response::Mutated)
+            && let Some(cfg) = reload_config(config_path)
+        {
+            shared.store(cfg);
             tracing::info!("ipc: config reloaded after mutation");
         }
         ipc::write_frame(&mut stream, &resp)?;
@@ -192,10 +194,19 @@ fn serve_conn(
 }
 
 /// Mirrors `serve` startup, which applies systemd root discovery to an empty `runner_roots`.
-fn reload_config(config_path: &Path) -> Config {
-    let mut cfg = Config::load(Some(config_path)).unwrap_or_default();
-    cfg.runner_roots = crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);
-    cfg
+/// A file that no longer loads leaves the running config in place.
+fn reload_config(config_path: &Path) -> Option<Config> {
+    match Config::load(Some(config_path)) {
+        Ok(mut cfg) => {
+            cfg.runner_roots =
+                crate::shared::collectors::runners::effective_roots(&cfg.runner_roots);
+            Some(cfg)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "config reload failed; keeping the running config");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
