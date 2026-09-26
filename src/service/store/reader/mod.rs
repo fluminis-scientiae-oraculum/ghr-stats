@@ -152,8 +152,8 @@ pub fn latest_host(conn: &Connection) -> Result<Option<HostPoint>> {
     Ok(host_series(conn, 1)?.pop())
 }
 
-/// Oldest retained sample. `runner_sample` alone suffices since `db prune` prunes every sample
-/// table together, and `min(ts)` stays a covering-index probe.
+/// Oldest retained sample. `runner_sample` alone suffices since pruning cuts every sample
+/// table at the same cutoff, and `min(ts)` stays a covering-index probe.
 pub fn retention(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row("SELECT min(ts) FROM runner_sample", [], |r| r.get(0))
         .map_err(Into::into)
