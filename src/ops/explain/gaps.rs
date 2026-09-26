@@ -124,7 +124,10 @@ pub(super) fn github_view_unavailable(source: &Source) -> Option<Finding> {
     let checks: Vec<String> = match source {
         Source::Collector => Vec::new(),
         Source::LocalScan(EphemeralReason::NoCollector) => vec![
-            "`ghr-stats systemd install --system` (or `--user`)".to_string(),
+            format!(
+                "`{}` (or `ghr-stats systemd install --user`)",
+                crate::shared::privileged::sudo_hint("systemd install --system")
+            ),
             "`systemctl status ghr-stats` in case it is installed but stopped".to_string(),
         ],
         Source::LocalScan(EphemeralReason::VersionDrift { server }) => vec![

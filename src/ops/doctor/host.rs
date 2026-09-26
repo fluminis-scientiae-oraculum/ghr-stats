@@ -77,6 +77,7 @@ pub(super) fn load_config(explicit: Option<&Path>) -> ConfigSource {
                 why: e.to_string(),
             },
         },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigSource::Missing { path },
         Err(e) => ConfigSource::Unreadable {
             path,
             why: e.to_string(),

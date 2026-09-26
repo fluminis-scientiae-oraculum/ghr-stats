@@ -26,7 +26,10 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         ),
     ));
     let roots = if cfg.runner_roots.is_empty() {
-        "(none — set with `ghr-stats config`)".to_string()
+        format!(
+            "(none — set with `{}`)",
+            crate::shared::privileged::sudo_hint("config")
+        )
     } else {
         cfg.runner_roots
             .iter()
