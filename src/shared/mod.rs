@@ -7,4 +7,5 @@ pub mod ipc;
 pub mod models;
 pub mod paths;
 pub mod privileged;
+pub(crate) mod runner_files;
 pub mod util;

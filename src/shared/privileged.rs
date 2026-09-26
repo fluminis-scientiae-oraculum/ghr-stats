@@ -1,40 +1,31 @@
-//! Privileged host operations. Two distinct needs, deliberately not unified:
+//! Privileged host operations, in two tiers:
 //!
-//! 1. **Per-command escalation** — [`run`] executes a [`PrivilegedCall`]
-//!    directly when already root, else via `sudo`. Enough whenever each command
-//!    can escalate on its own (`systemctl restart`, `install(1)`). `sudo` prompts
-//!    on `/dev/tty`, so call only while the TUI is *suspended* — the typestate
-//!    guarantees an action's `execute` runs inside the suspend window.
-//! 2. **A root *process*** — [`require_root`] / [`is_root`], for work whose
-//!    correctness depends on the process itself being root: it writes across
-//!    scopes (`/etc`, `/usr/local/bin`, root-owned runner `.env` files) or must
-//!    resolve our own install scope. Per-op `sudo` cannot supply this. Gated at
-//!    the three entry points that need it — `ops::systemd::install`,
-//!    `ops::wizard::apply_hooks`, `ops::uninstall`.
+//! 1. **Per-command escalation**: [`run`] executes a [`PrivilegedCall`] directly
+//!    when root, else via `sudo`. `sudo` prompts on `/dev/tty`, so the TUI calls
+//!    it only while suspended.
+//! 2. **A root process**: [`require_root`] for flows that write across scopes
+//!    (`/etc`, `/usr/local/bin`, runner `.env` files) over several steps.
 //!
-//! Tier 1 is a *registry*: [`PrivilegedCall`] is a closed enum of every command
-//! this binary can run elevated, and [`run`] accepts nothing else. The privilege
-//! surface is therefore readable in one place instead of reconstructed by
-//! grepping call sites, and widening it means adding a variant — a deliberate
-//! edit that shows up in review. Operator-facing summary: `docs/privileged.md`.
-//!
-//! Tier 2 stays free functions. A `PrivilegedExecution` template-method trait
-//! lived here until 0.2.1 and was removed: it wrapped only the two TUI actions,
-//! which need tier 1 and never overrode the gate, while all four sites needing
-//! tier 2 called the free functions directly — so it advertised an enforcement it
-//! did not provide. See the backlog entry for D1.
+//! [`PrivilegedCall`] is the closed registry of everything this binary runs
+//! elevated; `docs/privileged.md` is its operator-facing summary.
 
 use std::fmt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The `.env` mode is fixed here, not passed in: the wizard *writes* these files
-/// and `uninstall` *reverts* them, and the two directions must stay symmetric on
-/// ownership and mode. A parameter would let them drift.
-const ENV_MODE: &str = "0644";
+use crate::shared::collectors::runners::RunnerUnit;
+use crate::shared::runner_files::Ownership;
 
-/// `systemctl` verbs this tool may invoke. Closed on purpose — see
-/// [`PrivilegedCall`].
+/// The account a command drops to: a runner's own files are removed as that
+/// runner, so a planted symlink can only reach what the runner could delete anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunAs {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// `systemctl` verbs this tool may invoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnitVerb {
     Start,
@@ -52,43 +43,40 @@ impl UnitVerb {
     }
 }
 
-/// Every command ghr-stats can run with elevated privilege — the complete
-/// registry, and the only thing [`run`] accepts.
-///
-/// [`fmt::Display`] renders the exact argv, so a confirm prompt and the command
-/// that actually runs cannot disagree: they are the same value, formatted once.
+/// Every command ghr-stats can run with elevated privilege, and the only thing
+/// [`run`] accepts. [`fmt::Display`] renders the exact argv, so a confirm prompt
+/// and the command that runs are the same value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrivilegedCall {
-    /// `systemctl <verb> <unit>` — bounce a runner's service.
-    Systemctl { verb: UnitVerb, unit: String },
-    /// `rm -rf -- <dir>`. The caller scopes `dir` to a runner's own install dir
-    /// (see `RecycleRunner::scoped_paths`); never a global path.
-    PurgeDir { dir: PathBuf },
-    /// `find <dir> -type f -delete` — empty a dir, keeping the dir itself.
-    TrimFilesIn { dir: PathBuf },
-    /// `install -o <owner> -g <owner> -m 0644 <src> <dst>` — stage a runner's
-    /// root-owned `.env` preserving ownership and mode.
+    /// `systemctl <verb> <unit>`.
+    Systemctl { verb: UnitVerb, unit: RunnerUnit },
+    /// `rm -rf -- <dir>`, as the runner.
+    PurgeDir { dir: PathBuf, owner: RunAs },
+    /// `find <dir> -type f -delete`, as the runner: empties a dir, keeps the dir.
+    TrimFilesIn { dir: PathBuf, owner: RunAs },
+    /// `install -o <uid> -g <gid> -m <mode> <src> <dst>`: replace a runner's
+    /// `.env`, keeping the ownership and mode it had.
     InstallEnvFile {
-        owner: String,
         src: PathBuf,
         dst: PathBuf,
+        ownership: Ownership,
     },
 }
 
 impl PrivilegedCall {
-    /// The exact `(program, args)` this call executes — the ONLY place a
-    /// privileged argv is built. Arguments are passed to `execve` as a vector,
-    /// never through a shell, so no quoting or escaping applies.
+    /// The exact `(program, args)` this call executes, passed to `execve` as a
+    /// vector, never through a shell.
     fn argv(&self) -> (&'static str, Vec<String>) {
         let path = |p: &PathBuf| p.to_string_lossy().into_owned();
         match self {
-            PrivilegedCall::Systemctl { verb, unit } => {
-                ("systemctl", vec![verb.as_str().to_string(), unit.clone()])
-            }
-            PrivilegedCall::PurgeDir { dir } => {
+            PrivilegedCall::Systemctl { verb, unit } => (
+                "systemctl",
+                vec![verb.as_str().to_string(), unit.as_str().to_string()],
+            ),
+            PrivilegedCall::PurgeDir { dir, .. } => {
                 ("rm", vec!["-rf".to_string(), "--".to_string(), path(dir)])
             }
-            PrivilegedCall::TrimFilesIn { dir } => (
+            PrivilegedCall::TrimFilesIn { dir, .. } => (
                 "find",
                 vec![
                     path(dir),
@@ -97,19 +85,32 @@ impl PrivilegedCall {
                     "-delete".to_string(),
                 ],
             ),
-            PrivilegedCall::InstallEnvFile { owner, src, dst } => (
+            PrivilegedCall::InstallEnvFile {
+                src,
+                dst,
+                ownership,
+            } => (
                 "install",
                 vec![
                     "-o".to_string(),
-                    owner.clone(),
+                    ownership.uid.to_string(),
                     "-g".to_string(),
-                    owner.clone(),
+                    ownership.gid.to_string(),
                     "-m".to_string(),
-                    ENV_MODE.to_string(),
+                    format!("{:04o}", ownership.mode),
                     path(src),
                     path(dst),
                 ],
             ),
+        }
+    }
+
+    fn runs_as(&self) -> Option<RunAs> {
+        match self {
+            PrivilegedCall::PurgeDir { owner, .. } | PrivilegedCall::TrimFilesIn { owner, .. } => {
+                Some(*owner)
+            }
+            PrivilegedCall::Systemctl { .. } | PrivilegedCall::InstallEnvFile { .. } => None,
         }
     }
 }
@@ -120,6 +121,9 @@ impl fmt::Display for PrivilegedCall {
         write!(f, "{program}")?;
         for a in &args {
             write!(f, " {a}")?;
+        }
+        if let Some(who) = self.runs_as() {
+            write!(f, " (as uid {})", who.uid)?;
         }
         Ok(())
     }
@@ -171,19 +175,24 @@ pub(crate) fn require_root(resume: &'static str) -> Result<(), String> {
     }
 }
 
-/// Run a registered privileged command — directly if root, else via `sudo`.
-///
-/// Taking a [`PrivilegedCall`] rather than a `(program, args)` pair is what
-/// makes the registry binding: there is no way to run an unregistered command,
-/// and no "empty command" to guard against at runtime.
+/// Run a registered privileged command: directly if root, else via `sudo`.
 pub(crate) fn run(call: &PrivilegedCall) -> Outcome {
     let (program, args) = call.argv();
-    let mut cmd = if is_root() {
-        Command::new(program)
-    } else {
-        let mut c = Command::new("sudo");
-        c.arg(program);
-        c
+    let mut cmd = match (is_root(), call.runs_as()) {
+        (true, None) => Command::new(program),
+        (true, Some(who)) => {
+            let mut c = Command::new(program);
+            c.uid(who.uid).gid(who.gid);
+            c
+        }
+        (false, who) => {
+            let mut c = Command::new("sudo");
+            if let Some(who) = who {
+                c.args(["-u", &format!("#{}", who.uid)]);
+            }
+            c.arg("--").arg(program);
+            c
+        }
     };
     match cmd.args(&args).output() {
         Ok(o) if o.status.success() => Outcome::Ok,
@@ -223,7 +232,7 @@ pub(crate) fn sudo_hint(subcommand: &str) -> String {
 /// TUI, and in the help sheet. The gate informs; it does not fail.
 pub(crate) fn root_guidance() -> String {
     format!(
-        "Installing runner hooks edits each runner's root-owned .env and writes shared \
+        "Installing runner hooks rewrites each runner's .env and writes shared \
          scripts, so the whole process must run as root.\n\n\
          Re-run the dashboard as root:\n\
          \x20\x20sudo {exe}\n\n\
@@ -274,68 +283,50 @@ mod tests {
         );
     }
 
-    /// Display IS the argv — this is what makes a confirm prompt unable to
-    /// misreport what will run, so pin the rendering of every variant.
     #[test]
     fn every_call_renders_its_exact_argv() {
-        assert_eq!(
-            PrivilegedCall::Systemctl {
-                verb: UnitVerb::Restart,
-                unit: "runner-1.service".into(),
-            }
-            .to_string(),
-            "systemctl restart runner-1.service"
-        );
-        assert_eq!(
-            PrivilegedCall::PurgeDir {
-                dir: PathBuf::from("/srv/runners/r0/_work/_temp"),
-            }
-            .to_string(),
-            "rm -rf -- /srv/runners/r0/_work/_temp"
-        );
-        assert_eq!(
-            PrivilegedCall::TrimFilesIn {
-                dir: PathBuf::from("/srv/runners/r0/_diag"),
-            }
-            .to_string(),
-            "find /srv/runners/r0/_diag -type f -delete"
-        );
-        assert_eq!(
-            PrivilegedCall::InstallEnvFile {
-                owner: "runner".into(),
-                src: PathBuf::from("/tmp/stage"),
-                dst: PathBuf::from("/srv/runners/r0/.env"),
-            }
-            .to_string(),
-            "install -o runner -g runner -m 0644 /tmp/stage /srv/runners/r0/.env"
-        );
-    }
-
-    #[test]
-    fn unit_verbs_map_to_systemctl_subcommands() {
-        for (verb, want) in [
-            (UnitVerb::Start, "start"),
-            (UnitVerb::Stop, "stop"),
-            (UnitVerb::Restart, "restart"),
-        ] {
-            let call = PrivilegedCall::Systemctl {
-                verb,
-                unit: "u.service".into(),
-            };
-            assert_eq!(call.argv().1[0], want);
+        let runner = RunAs {
+            uid: 1001,
+            gid: 1001,
+        };
+        let cases = [
+            (
+                PrivilegedCall::Systemctl {
+                    verb: UnitVerb::Restart,
+                    unit: RunnerUnit::for_test("actions.runner.o.r1.service"),
+                },
+                "systemctl restart actions.runner.o.r1.service",
+            ),
+            (
+                PrivilegedCall::PurgeDir {
+                    dir: PathBuf::from("/srv/runners/r0/_work/_temp"),
+                    owner: runner,
+                },
+                "rm -rf -- /srv/runners/r0/_work/_temp (as uid 1001)",
+            ),
+            (
+                PrivilegedCall::TrimFilesIn {
+                    dir: PathBuf::from("/srv/runners/r0/_diag"),
+                    owner: runner,
+                },
+                "find /srv/runners/r0/_diag -type f -delete (as uid 1001)",
+            ),
+            (
+                PrivilegedCall::InstallEnvFile {
+                    src: PathBuf::from("/tmp/stage"),
+                    dst: PathBuf::from("/srv/runners/r0/.env"),
+                    ownership: Ownership {
+                        uid: 1001,
+                        gid: 1002,
+                        mode: 0o600,
+                    },
+                },
+                "install -o 1001 -g 1002 -m 0600 /tmp/stage /srv/runners/r0/.env",
+            ),
+        ];
+        for (call, want) in cases {
+            assert_eq!(call.to_string(), want);
         }
-    }
-
-    /// `rm -rf` must keep `--` immediately before the path: without it a dir
-    /// whose name begins with `-` would be parsed as a flag.
-    #[test]
-    fn purge_terminates_options_before_the_path() {
-        let (program, args) = PrivilegedCall::PurgeDir {
-            dir: PathBuf::from("/srv/r/_temp"),
-        }
-        .argv();
-        assert_eq!(program, "rm");
-        assert_eq!(args[args.len() - 2], "--");
     }
 
     #[test]

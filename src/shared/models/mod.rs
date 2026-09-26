@@ -59,8 +59,7 @@ pub use github::{
 pub use jobs::{JobConclusion, JobRow, PendingConclusion};
 pub use status::{FleetCounts, FleetStatus, Mode, OrgStatus, RunnerStatus, Verdict};
 
-/// Static identity of a self-hosted runner, read from its `.runner` file plus
-/// the owning OS user of its install directory.
+/// Static identity of a self-hosted runner, read from its `.runner` file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerInfo {
     /// GitHub runner id (`agentId` in `.runner`) — the join key to the API.
@@ -75,11 +74,7 @@ pub struct RunnerInfo {
     pub dir: PathBuf,
     /// Work folder name (`workFolder`), e.g. "_work".
     pub work_folder: String,
-    /// Owning uid of the install dir — the authoritative handle for matching
-    /// the runner's processes (`/proc/<pid>` owner) and cgroup.
-    pub uid: u32,
-    /// Owning linux user name, resolved from `uid` for display (e.g.
-    /// "runner-01"). Falls back to the uid as a string if unresolvable.
+    /// Owner of the install dir, for display; the uid when it has no name.
     pub user: String,
 }
 

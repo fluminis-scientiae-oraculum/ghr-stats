@@ -284,26 +284,28 @@ impl App {
         self.drill.and_then(|i| self.runners.get(i))
     }
 
-    /// Build a Restart action for the drilled runner (None if none is drilled or
-    /// the runner has no `.service` unit file).
-    pub(crate) fn restart_action(&self) -> Option<ActionKind> {
-        let r = self.detail_runner()?;
-        let unit = runners::unit_name(&r.dir)?;
-        Some(ActionKind::Restart(RestartRunner {
+    /// Arm a Restart of the drilled runner, or say why it cannot be.
+    pub(crate) fn restart_action(&self) -> Result<ActionKind, String> {
+        let r = self.detail_runner().ok_or("no runner selected")?;
+        let unit = runners::unit_for(&r.dir)?;
+        Ok(ActionKind::Restart(RestartRunner {
             unit,
             agent_id: r.agent_id,
+            busy: r.liveness == Liveness::Busy,
         }))
     }
 
-    /// Build a Recycle action for the drilled runner — idle-only (None if it is
-    /// busy/offline, none is drilled, or there is no unit file).
-    pub(crate) fn recycle_action(&self) -> Option<ActionKind> {
-        let r = self.detail_runner()?;
+    /// Arm a Recycle of the drilled runner (idle only), or say why it cannot be.
+    pub(crate) fn recycle_action(&self) -> Result<ActionKind, String> {
+        let r = self.detail_runner().ok_or("no runner selected")?;
         if r.liveness != Liveness::Idle {
-            return None;
+            return Err(format!(
+                "{} is not idle; recycle waits for an idle runner",
+                r.name
+            ));
         }
-        let unit = runners::unit_name(&r.dir)?;
-        Some(ActionKind::Recycle(RecycleRunner {
+        let unit = runners::unit_for(&r.dir)?;
+        Ok(ActionKind::Recycle(RecycleRunner {
             unit,
             agent_id: r.agent_id,
             install_dir: r.dir.clone(),

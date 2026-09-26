@@ -208,8 +208,11 @@ mod tests {
     #[test]
     fn cancel_returns_to_browsing_without_executing() {
         let confirm = Screen::<Browsing>::new().confirm(ActionKind::Restart(RestartRunner {
-            unit: "x.service".to_string(),
+            unit: crate::shared::collectors::runners::RunnerUnit::for_test(
+                "actions.runner.o.x.service",
+            ),
             agent_id: 1,
+            busy: false,
         }));
         let _back: Screen<Browsing> = confirm.cancel();
     }

@@ -1,20 +1,17 @@
-//! Minimal, dependency-light process enumeration via `/proc`.
-//!
-//! We read `/proc` directly rather than via a process-listing crate because the
-//! canonical short name lives in `/proc/<pid>/comm` (always the 15-char kernel
-//! `comm`, never an exe path), the owner uid is just the `/proc/<pid>` dir
-//! owner, and these are world-readable even for other users' processes. That
-//! makes liveness detection work unprivileged and keeps the parse under test.
+//! Process enumeration via `/proc`, whose `comm`, `cmdline` and `stat` are
+//! world-readable unless `/proc` is mounted with `hidepid`.
 
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 /// One observed process. `comm` is the kernel short name (`/proc/<pid>/comm`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcInfo {
     pub pid: u32,
-    pub uid: u32,
     pub comm: String,
+    /// `argv[0]`, read only for runner processes (`comm` starting `Runner.`).
+    pub argv0: Option<PathBuf>,
     /// Field 22 of `/proc/<pid>/stat`: start time in clock ticks since boot.
     pub starttime_ticks: u64,
 }
@@ -42,21 +39,32 @@ pub fn scan() -> Vec<ProcInfo> {
 }
 
 fn read_proc(dir: &Path, pid: u32) -> Option<ProcInfo> {
-    let uid = std::fs::metadata(dir).ok()?.uid();
     let comm = std::fs::read_to_string(dir.join("comm"))
         .ok()?
         .trim_end()
         .to_string();
+    let argv0 = if comm.starts_with("Runner.") {
+        std::fs::read(dir.join("cmdline"))
+            .ok()
+            .and_then(|b| parse_argv0(&b))
+    } else {
+        None
+    };
     let starttime_ticks = std::fs::read_to_string(dir.join("stat"))
         .ok()
         .and_then(|s| parse_starttime(&s))
         .unwrap_or(0);
     Some(ProcInfo {
         pid,
-        uid,
         comm,
+        argv0,
         starttime_ticks,
     })
+}
+
+fn parse_argv0(cmdline: &[u8]) -> Option<PathBuf> {
+    let first = cmdline.split(|b| *b == 0).next()?;
+    (!first.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(first)))
 }
 
 /// Parse field 22 (start time, in clock ticks) from a `/proc/<pid>/stat` line.
@@ -123,6 +131,15 @@ mod tests {
         // negative age guarded
         assert_eq!(uptime_secs(1000, 1000, 100, 500_000), None);
         assert_eq!(uptime_secs(1200, 1000, 0, 5000), None);
+    }
+
+    #[test]
+    fn argv0_is_the_first_nul_separated_field() {
+        assert_eq!(
+            parse_argv0(b"/srv/r0/bin/Runner.Listener\0run\0--startuptype\0service\0"),
+            Some(PathBuf::from("/srv/r0/bin/Runner.Listener"))
+        );
+        assert_eq!(parse_argv0(b""), None);
     }
 
     #[test]

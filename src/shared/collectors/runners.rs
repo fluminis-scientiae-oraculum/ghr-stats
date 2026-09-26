@@ -1,12 +1,8 @@
-//! Runner discovery and live probing.
-//!
-//! Identity is read from each runner's own `.runner` file (authoritative);
-//! liveness/resource use are derived from the runner's owning-uid processes and
-//! its cgroup. Nothing here derives identity from systemd unit names — root
-//! auto-discovery only uses the `actions.runner.*` glob to LOCATE units, then
-//! reads their `WorkingDirectory` property (still authoritative) for install
-//! dirs.
+//! Runner discovery and live probing. Identity comes from each runner's own
+//! `.runner` file; liveness and resource use from the processes whose `argv[0]`
+//! lies under its install dir, and their cgroup.
 
+use std::fmt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,13 +10,17 @@ use std::process::Command;
 use serde::Deserialize;
 
 use super::cgroup;
-use super::procscan::ProcInfo;
+use super::procscan::{self, ProcInfo};
 use crate::shared::models::{Liveness, RunnerInfo};
+use crate::shared::runner_files;
 
 /// Listener process kernel `comm` — present ⇒ runner online.
 const LISTENER_COMM: &str = "Runner.Listener";
 /// Worker process kernel `comm` — present ⇒ runner busy with a job.
 const WORKER_COMM: &str = "Runner.Worker";
+
+const DOT_RUNNER_CAP: u64 = 64 * 1024;
+const DOT_SERVICE_CAP: u64 = 1024;
 
 /// Raw shape of the `.runner` JSON we depend on.
 #[derive(Debug, Deserialize)]
@@ -64,11 +64,10 @@ pub fn discover(roots: &[PathBuf]) -> Vec<RunnerInfo> {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            let dot = dir.join(".runner");
-            if !dot.is_file() {
+            if !dir.join(".runner").exists() {
                 continue;
             }
-            match read_runner(&dir, &dot) {
+            match read_runner(&dir) {
                 Ok(info) => found.push(info),
                 Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "skipping runner"),
             }
@@ -173,8 +172,8 @@ fn roots_from_workdirs(show_output: &str) -> Vec<PathBuf> {
     roots
 }
 
-fn read_runner(dir: &Path, dot: &Path) -> anyhow::Result<RunnerInfo> {
-    let raw = std::fs::read_to_string(dot)?;
+fn read_runner(dir: &Path) -> anyhow::Result<RunnerInfo> {
+    let (raw, _) = runner_files::read_text(dir, ".runner", DOT_RUNNER_CAP)?;
     let parsed: DotRunner = serde_json::from_str(strip_bom(&raw))?;
     let org = org_from_github_url(&parsed.github_url)
         .ok_or_else(|| anyhow::anyhow!("no org in gitHubUrl {:?}", parsed.github_url))?;
@@ -189,19 +188,72 @@ fn read_runner(dir: &Path, dot: &Path) -> anyhow::Result<RunnerInfo> {
         group: parsed.pool_name,
         dir: dir.to_path_buf(),
         work_folder: parsed.work_folder.unwrap_or_else(|| "_work".to_string()),
-        uid,
         user,
     })
 }
 
-/// The runner's systemd unit name, read from its own `.service` file in the
-/// install dir (authoritative — never parsed from a display string). `None` if
-/// the file is absent or empty.
-pub fn unit_name(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(dir.join(".service"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+/// A runner's systemd unit: named like a runner unit and serving that runner's
+/// install dir. Built only by [`unit_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunnerUnit(String);
+
+impl RunnerUnit {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self(name.to_string())
+    }
+}
+
+impl fmt::Display for RunnerUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The unit named by `dir/.service`, if systemd confirms it runs from `dir`.
+pub(crate) fn unit_for(dir: &Path) -> Result<RunnerUnit, String> {
+    let (text, _) = runner_files::read_text(dir, ".service", DOT_SERVICE_CAP)
+        .map_err(|e| format!("no usable .service file ({e})"))?;
+    let name = text.trim();
+    if !is_runner_unit_name(name) {
+        return Err(format!("{name:?} is not an actions.runner.*.service unit"));
+    }
+    let out = Command::new("systemctl")
+        .args(["show", "-P", "WorkingDirectory", "--", name])
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    let workdir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    if !same_dir(&workdir, dir) {
+        return Err(format!(
+            "{name} runs from {}, not {}",
+            workdir.display(),
+            dir.display()
+        ));
+    }
+    Ok(RunnerUnit(name.to_string()))
+}
+
+fn is_runner_unit_name(name: &str) -> bool {
+    name.strip_prefix("actions.runner.")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .is_some_and(|mid| {
+            !mid.is_empty()
+                && mid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-@:\\".contains(&b))
+        })
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// Probe every discovered runner against the current process snapshot.
@@ -221,7 +273,7 @@ fn probe_one(
     boot: i64,
     clk_tck: u64,
 ) -> RunnerProbe {
-    let mine: Vec<&ProcInfo> = procs.iter().filter(|p| p.uid == info.uid).collect();
+    let mine = processes_of(&info.dir, procs);
     let liveness = liveness_of(&mine);
     let listener = mine.iter().find(|p| p.comm == LISTENER_COMM);
 
@@ -247,13 +299,30 @@ fn probe_one(
     }
 }
 
-/// Liveness of the runner owning `uid`, from a process snapshot — the cheap
-/// idle-gate for host-mutating ops (a one-shot `procscan::scan()` feeds every
-/// runner). Same rule as [`probe_one`], so the gate can't disagree with the
-/// dashboard's own liveness.
-pub(crate) fn liveness_for(uid: u32, procs: &[ProcInfo]) -> Liveness {
-    let mine: Vec<&ProcInfo> = procs.iter().filter(|p| p.uid == uid).collect();
-    liveness_of(&mine)
+/// Liveness of the runner installed at `dir`, from a process snapshot. Same rule
+/// as [`probe_all`], so an idle gate cannot disagree with the dashboard.
+pub(crate) fn liveness_in(dir: &Path, procs: &[ProcInfo]) -> Liveness {
+    liveness_of(&processes_of(dir, procs))
+}
+
+/// Whether the runner at `dir` is idle right now, from a fresh process scan.
+pub(crate) fn is_idle_now(dir: &Path) -> bool {
+    liveness_in(dir, &procscan::scan()) == Liveness::Idle
+}
+
+/// Runner processes whose `argv[0]` lies under `dir`. The runner launches its
+/// binaries by path, sometimes through `dir/bin` and sometimes through the
+/// versioned dir that symlink resolves to, so both spellings of `dir` count.
+fn processes_of<'a>(dir: &Path, procs: &'a [ProcInfo]) -> Vec<&'a ProcInfo> {
+    let real = std::fs::canonicalize(dir).ok();
+    procs
+        .iter()
+        .filter(|p| {
+            p.argv0.as_deref().is_some_and(|a| {
+                a.starts_with(dir) || real.as_deref().is_some_and(|r| a.starts_with(r))
+            })
+        })
+        .collect()
 }
 
 /// Classify liveness from a runner's own processes.
@@ -299,11 +368,11 @@ fn clock_ticks() -> u64 {
 mod tests {
     use super::*;
 
-    fn proc(uid: u32, comm: &str) -> ProcInfo {
+    fn proc(comm: &str, argv0: &str) -> ProcInfo {
         ProcInfo {
             pid: 1,
-            uid,
             comm: comm.to_string(),
+            argv0: Some(PathBuf::from(argv0)),
             starttime_ticks: 0,
         }
     }
@@ -366,13 +435,41 @@ mod tests {
     }
 
     #[test]
-    fn liveness_precedence() {
-        assert_eq!(
-            liveness_of(&[&proc(5, LISTENER_COMM), &proc(5, WORKER_COMM)]),
-            Liveness::Busy
-        );
-        assert_eq!(liveness_of(&[&proc(5, LISTENER_COMM)]), Liveness::Idle);
-        assert_eq!(liveness_of(&[&proc(5, "node")]), Liveness::Offline);
-        assert_eq!(liveness_of(&[]), Liveness::Offline);
+    fn processes_are_attributed_by_install_dir_through_the_bin_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let r0 = root.path().join("r0");
+        let r00 = root.path().join("r00");
+        std::fs::create_dir_all(r0.join("bin.2.0.0")).unwrap();
+        std::fs::create_dir_all(&r00).unwrap();
+        std::os::unix::fs::symlink(r0.join("bin.2.0.0"), r0.join("bin")).unwrap();
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+
+        let listener = proc(LISTENER_COMM, &s(&r0.join("bin/Runner.Listener")));
+        let worker = proc(WORKER_COMM, &s(&r0.join("bin.2.0.0/Runner.Worker")));
+        let sibling = proc(WORKER_COMM, &s(&r00.join("bin/Runner.Worker")));
+        let procs = [listener, worker, sibling];
+
+        assert_eq!(liveness_in(&r0, &procs), Liveness::Busy);
+        assert_eq!(liveness_in(&r00, &procs[..2]), Liveness::Offline);
+        assert_eq!(liveness_in(&r0, &procs[..1]), Liveness::Idle);
+    }
+
+    #[test]
+    fn only_runner_unit_names_pass() {
+        assert!(is_runner_unit_name(
+            "actions.runner.example-org.runner-01.service"
+        ));
+        assert!(is_runner_unit_name(
+            "actions.runner.example-org.my\\x2drunner.service"
+        ));
+        for bad in [
+            "poweroff.target",
+            "actions.runner..service",
+            "actions.runner.x.service extra",
+            "actions.runner.a/b.service",
+            "ssh.service",
+        ] {
+            assert!(!is_runner_unit_name(bad), "{bad}");
+        }
     }
 }

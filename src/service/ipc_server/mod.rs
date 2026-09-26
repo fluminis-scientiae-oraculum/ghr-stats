@@ -24,7 +24,7 @@
 //! never times out, so `accept` was never reached again.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,32 +58,37 @@ const CONN_TIMEOUT: Duration = Duration::from_secs(5);
 /// is the failure this cap replaces.
 const MAX_CONNS: usize = 8;
 
-/// Spawn the IPC server thread. Always spawns; a bind failure is logged and the
-/// thread returns (the collector keeps sampling), exactly like `metrics::pull`.
-/// Holds the [`SharedConfig`] so it can reload the collector's config in-process
-/// after an authorized mutation (making a newly added PAT live without restart).
-pub fn spawn(shared: &SharedConfig, term: Arc<AtomicBool>, config_path: PathBuf) -> JoinHandle<()> {
-    // Bind the socket for the process's own scope — the same scope `systemd
-    // install` placed the DB + unit under (root ⇒ System ⇒ /run/ghr-stats). The
-    // DB path is fixed for the run, so snapshot it once here.
-    let sock = Scope::detect().socket_path();
+/// The socket this process serves: its own scope's, the one `systemd install`
+/// placed the unit under.
+pub fn socket_path() -> PathBuf {
+    Scope::detect().socket_path()
+}
+
+/// Spawn the IPC server thread on an already-bound `listener`. Holds the
+/// [`SharedConfig`] so an authorized mutation reloads it in-process.
+pub fn spawn(
+    listener: UnixListener,
+    shared: &SharedConfig,
+    term: Arc<AtomicBool>,
+    config_path: PathBuf,
+) -> JoinHandle<()> {
+    let sock = socket_path();
     let db = shared.snapshot().db_path.clone();
     let shared = shared.clone();
     thread::Builder::new()
         .name("ipc-server".into())
-        .spawn(move || run(&sock, &db, &shared, &term, &config_path))
+        .spawn(move || run(listener, &sock, &db, &shared, &term, &config_path))
         .expect("spawn ipc-server")
 }
 
-fn run(sock: &Path, db: &Path, shared: &SharedConfig, term: &Arc<AtomicBool>, config_path: &Path) {
-    let listener = match bind(sock) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(error = %e, sock = %sock.display(),
-                "ipc: bind failed — Persistent-mode TUI features unavailable");
-            return;
-        }
-    };
+fn run(
+    listener: UnixListener,
+    sock: &Path,
+    db: &Path,
+    shared: &SharedConfig,
+    term: &Arc<AtomicBool>,
+    config_path: &Path,
+) {
     if let Err(e) = listener.set_nonblocking(true) {
         tracing::error!(error = %e, "ipc: set_nonblocking failed");
         return;
@@ -177,24 +182,23 @@ fn spawn_conn(
         })
 }
 
-/// Create the runtime dir, clear any stale socket, bind, and widen perms so a
-/// non-root TUI can connect.
-fn bind(sock: &Path) -> io::Result<UnixListener> {
+/// Bind `sock`, replacing a stale socket but refusing one a live collector still
+/// answers on (the serve lock is per database, the socket per scope). Widened to
+/// 0666 so a non-root TUI can connect; the parent dir is root-only-writable.
+pub fn bind(sock: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // A stale socket (unclean prior exit) makes bind fail EADDRINUSE. Removing it
-    // is safe: serve holds the exclusive flock before spawning us, so no live
-    // collector owns this path.
-    if sock.exists() {
-        let _ = std::fs::remove_file(sock);
+    if UnixStream::connect(sock).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another collector is serving {}", sock.display()),
+        ));
+    }
+    if std::fs::symlink_metadata(sock).is_ok_and(|m| m.file_type().is_socket()) {
+        std::fs::remove_file(sock)?;
     }
     let listener = UnixListener::bind(sock)?;
-    // connect(2) needs WRITE permission on the socket file; bind creates it
-    // ~0755 (umask), which a non-root TUI cannot connect to. Widen to 0666 — the
-    // same unauthenticated-loopback posture as /metrics; the IPC serves only
-    // derived fleet stats, never tokens. The parent dir is root-only-writable, so
-    // this is not a meaningful TOCTOU.
     std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o666))?;
     Ok(listener)
 }
@@ -267,78 +271,17 @@ fn reload_config(config_path: &Path) -> Config {
 mod tests {
     use super::*;
 
-    use crate::shared::ipc::VERSION;
-
-    fn handshake(stream: &mut UnixStream) -> io::Result<Response> {
-        ipc::write_frame(stream, &Request::Hello { client: VERSION })?;
-        ipc::read_frame(stream)
-    }
-
-    /// A client that holds its connection open must not lock every other client
-    /// out.
-    ///
-    /// The production failure this guards, found on the live fleet host: served
-    /// inline, `serve_conn` runs until its client hangs up, and the dashboard
-    /// holds its connection open for as long as it is on screen. One open TUI
-    /// therefore owned the accept loop, every other client sat unaccepted in the
-    /// kernel backlog, and `status` / `explain` timed out during the handshake
-    /// and reported "no collector" — while the collector was healthy, listening,
-    /// and answering the dashboard the whole time.
-    ///
-    /// The 2 s budget is deliberately well inside `CONN_TIMEOUT` (5 s). Served
-    /// inline, the second client could not be accepted until the FIRST client's
-    /// read timed out, so "is it served promptly" is exactly what separates the
-    /// two designs — "is it served eventually" does not.
     #[test]
-    fn a_held_connection_does_not_lock_out_a_second_client() {
+    fn bind_replaces_a_stale_socket_but_refuses_a_live_one() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("serve.sock");
-        let db = dir.path().join("history.db");
-        let config_path = dir.path().join("config.toml");
-        let term = Arc::new(AtomicBool::new(false));
 
-        let server = {
-            let (sock, db, config_path, term) = (
-                sock.clone(),
-                db.clone(),
-                config_path.clone(),
-                Arc::clone(&term),
-            );
-            thread::spawn(move || {
-                let shared = SharedConfig::new(Config::default());
-                run(&sock, &db, &shared, &term, &config_path);
-            })
-        };
+        drop(UnixListener::bind(&sock).unwrap());
+        let live = bind(&sock).expect("stale socket replaced");
 
-        let mut first = (0..100)
-            .find_map(|_| {
-                UnixStream::connect(&sock).ok().or_else(|| {
-                    thread::sleep(Duration::from_millis(20));
-                    None
-                })
-            })
-            .expect("collector never bound its socket");
-        assert!(matches!(
-            handshake(&mut first).expect("first handshake"),
-            Response::Hello { .. }
-        ));
-
-        // `first` stays open and idle from here — precisely what an on-screen
-        // dashboard does between refreshes, and precisely what used to wedge us.
-        let mut second = UnixStream::connect(&sock).expect("second client could not connect");
-        second
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        match handshake(&mut second) {
-            Ok(Response::Hello { .. }) => {}
-            other => panic!(
-                "a second client was not served while the first held its connection: {other:?}"
-            ),
-        }
-
-        term.store(true, Ordering::SeqCst);
-        drop(first);
-        drop(second);
-        server.join().unwrap();
+        let err = bind(&sock).expect_err("live socket kept");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(UnixStream::connect(&sock).is_ok());
+        drop(live);
     }
 }

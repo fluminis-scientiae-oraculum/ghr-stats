@@ -173,7 +173,7 @@ impl Plan {
                 println!("{}", plan_line(rp));
             }
             if !self.runners.is_empty() && !privileged::is_root() {
-                println!("  ⚠ reverting hooks edits root-owned .env files — re-run with sudo");
+                println!("  ⚠ reverting hooks rewrites runner .env files — re-run with sudo");
             }
         }
 

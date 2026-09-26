@@ -22,6 +22,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -43,25 +44,32 @@ struct Collector {
 
 impl Collector {
     fn start(name: &str) -> Self {
+        // As root the collector's socket is the system one, not the private dir's.
+        assert_ne!(
+            uzers::get_effective_uid(),
+            0,
+            "run this suite as a non-root user"
+        );
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ghr-stats-it-{}-{}-{name}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create test dir");
+        let runners = dir.join("runners");
+        std::fs::create_dir_all(&runners).expect("create test dir");
 
         let config = dir.join("config.toml");
         let db = dir.join("t.db");
         std::fs::write(
             &config,
             format!(
-                "db_path = {:?}\n\
-                 runner_roots = []\n\
+                "db_path = {db:?}\n\
+                 runner_roots = [{runners:?}]\n\
                  \n[intervals]\n\
                  local_secs = 1\n\
-                 api_secs = 3600\n",
-                db
+                 api_secs = 3600\n"
             ),
         )
         .expect("write test config");
@@ -147,35 +155,15 @@ fn round_trip(s: &mut UnixStream, msg: &Value) -> Value {
     read_frame(s)
 }
 
-/// Whether this process would pass the collector's mutation gate: uid 0, or a
-/// member of the `ghr-stats` group.
-///
-/// Resolved the same way the server resolves it (the group database), so the
-/// assertions below track the machine they run on. This split is deliberate and
-/// both halves are real: a developer in the admin group exercises the
-/// authorized path including the config reload, and CI — where no such group
-/// exists — exercises the refusal.
+/// Whether this (non-root) process passes the collector's mutation gate: a
+/// member of the `ghr-stats` group. CI, with no such group, exercises refusal.
 fn privileged() -> bool {
-    if unsafe_uid() == 0 {
-        return true;
-    }
     Command::new("id")
         .arg("-nG")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .is_some_and(|groups| groups.split_whitespace().any(|g| g == "ghr-stats"))
-}
-
-/// The caller's uid, via `id -u` — the crate forbids `unsafe`, so no `getuid`.
-fn unsafe_uid() -> u32 {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(u32::MAX)
 }
 
 #[test]

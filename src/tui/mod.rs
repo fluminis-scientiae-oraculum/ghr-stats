@@ -168,12 +168,17 @@ fn route_key(mode: ScreenState, app: &mut App, code: KeyCode) -> Next {
             // Detail drill-down: R = restart, C = recycle (idle-only) the runner.
             if app.drill.is_some() {
                 let armed = match code {
-                    KeyCode::Char('R') => app.restart_action(),
-                    KeyCode::Char('C') => app.recycle_action(),
+                    KeyCode::Char('R') => Some(app.restart_action()),
+                    KeyCode::Char('C') => Some(app.recycle_action()),
                     _ => None,
                 };
-                if let Some(a) = armed {
-                    return Next::Mode(ScreenState::Confirm(scr.confirm(a)));
+                match armed {
+                    Some(Ok(a)) => return Next::Mode(ScreenState::Confirm(scr.confirm(a))),
+                    Some(Err(why)) => {
+                        app.status = Some(format!("✗ {why}"));
+                        return Next::Mode(ScreenState::Browsing(scr));
+                    }
+                    None => {}
                 }
             }
             app.on_key(code);
