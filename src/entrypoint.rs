@@ -12,7 +12,7 @@ mod tui;
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "ghr-stats currently supports Linux only (procfs / cgroup v2 / systemd). \
-     A thinner macOS build is planned — see the README \"Platform\" section."
+     See docs/design.md, \"Platform\"."
 );
 
 use anyhow::{Context, Result};
@@ -96,12 +96,16 @@ fn run() -> Result<std::process::ExitCode> {
 }
 
 fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
+    use crate::shared::config::Retention;
     match action {
         DbAction::Prune { days } => {
             cfg.require_readable()?;
+            let retention = days.map_or(cfg.retention_days, Retention::Days);
+            let Some(cutoff) = retention.cutoff(crate::shared::util::now_epoch()) else {
+                anyhow::bail!("retention_days is \"forever\"; pass --days N to prune anyway");
+            };
             let mut db = crate::service::store::open_writer(&cfg.db_path)
                 .with_context(|| format!("opening db at {}", cfg.db_path.display()))?;
-            let cutoff = crate::shared::util::now_epoch() - i64::from(days) * 86_400;
             let mut removed = 0;
             loop {
                 let n = crate::service::store::writer::prune_batch(&mut db, cutoff, 10_000)?;
@@ -110,7 +114,7 @@ fn run_db(action: DbAction, cfg: &crate::shared::config::Config) -> Result<()> {
                 }
                 removed += n;
             }
-            println!("pruned {removed} sample rows older than {days}d");
+            println!("pruned {removed} sample rows older than {retention}");
             Ok(())
         }
     }

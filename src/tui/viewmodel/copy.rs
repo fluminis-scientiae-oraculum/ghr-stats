@@ -2,8 +2,12 @@ use super::status::{GithubReason, JobsView, RunnerGithub};
 
 pub(crate) const INSTALL_COLLECTOR: &str = "ghr-stats systemd install";
 pub(crate) const ADD_PAT: &str = "add a read-only PAT on the Config tab [a]";
-pub(crate) const INSTALL_HOOKS: &str =
-    "install or chain it on the Config tab with [h] (as root), or run `sudo ghr-stats config`";
+fn install_hooks() -> String {
+    format!(
+        "install or chain it on the Config tab with [h] (as root), or run `{}`",
+        crate::shared::privileged::sudo_hint("config")
+    )
+}
 
 pub(crate) fn runner_github_cell(rg: RunnerGithub) -> String {
     match rg {
@@ -44,7 +48,8 @@ pub(crate) fn jobs_empty(view: JobsView) -> String {
         ),
         JobsView::NoHooks => format!(
             "No jobs recorded yet.\n\nThe ghr-stats job hook isn't feeding any runner yet. \
-             {INSTALL_HOOKS}."
+             {}.",
+            install_hooks()
         ),
     }
 }

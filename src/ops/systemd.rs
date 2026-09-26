@@ -65,7 +65,7 @@ fn install(target: Install) -> Result<()> {
 }
 
 /// Best-effort: a failure prints the manual command and does not fail the install.
-/// The collector resolves membership per request, so no re-login is needed.
+/// The collector reads the group database on each connection, so no re-login is needed.
 fn provision_admin_group() {
     // `-f`: exits 0 when the group already exists.
     if let Err(e) = run_tool("groupadd", &["-f", ADMIN_GROUP]) {
@@ -80,7 +80,7 @@ fn provision_admin_group() {
         Ok(user) if !user.is_empty() && user != "root" => {
             match run_tool("usermod", &["-aG", ADMIN_GROUP, &user]) {
                 Ok(()) => println!(
-                    "  group:  added {user} to `{ADMIN_GROUP}` — {user} can now edit config \
+                    "  group:  added {user} to `{ADMIN_GROUP}` — {user} can now manage PATs \
                      from a non-root TUI (no re-login needed)"
                 ),
                 Err(e) => {

@@ -4,6 +4,7 @@ use crate::ops::explain::Boundary;
 use crate::shared::ipc::client::{Behind, Client, EphemeralReason, REINSTALL_FROM_NEWER};
 use crate::shared::ipc::{self, Query, Request, Response};
 use crate::shared::models::FleetStatus;
+use crate::shared::privileged::sudo_hint;
 use crate::shared::util::{BUILD_VERSION, to_rfc3339_utc};
 
 use super::{Check, Outcome, skipped};
@@ -114,9 +115,10 @@ fn reconcile_check(s: &FleetStatus, max_age: u64) -> Check {
     } else {
         Outcome::Fail {
             detail: format!("stale reconcile: {}", stale.join(", ")),
-            fix: "check the org's PAT with `sudo ghr-stats doctor`, then \
-                  `journalctl -u ghr-stats | grep reconcile`"
-                .to_string(),
+            fix: format!(
+                "check the org's PAT with `{}`, then `journalctl -u ghr-stats | grep reconcile`",
+                sudo_hint("doctor")
+            ),
         }
     };
     Check {

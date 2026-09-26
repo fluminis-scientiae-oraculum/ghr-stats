@@ -12,9 +12,15 @@ use crate::tui::source::MutateOutcome;
 
 use super::{App, Overlay};
 
-/// The collector resolves group membership fresh by uid, so `usermod -aG` needs no re-login.
-const NOT_AUTHORIZED: &str = "not authorized — add yourself to the `ghr-stats` group \
-    (`sudo usermod -aG ghr-stats $USER`) or run `sudo ghr-stats`";
+/// The collector reads the group database on each connection, so `usermod -aG` needs no
+/// re-login.
+fn not_authorized() -> String {
+    format!(
+        "not authorized — add yourself to the `ghr-stats` group \
+         (`sudo usermod -aG ghr-stats $USER`) or run `{}`",
+        crate::shared::privileged::sudo_hint("")
+    )
+}
 
 impl App {
     pub(crate) fn overlay_open(&self) -> bool {
@@ -108,9 +114,7 @@ impl App {
                 // Mirrored, not reloaded: a non-root TUI cannot re-read root-owned /etc.
                 self.cfg.metrics.pull.enabled = enabled;
                 let state = if enabled { "enabled" } else { "disabled" };
-                self.status = Some(format!(
-                    "metrics pull {state} — restart the service to apply"
-                ));
+                self.status = Some(format!("metrics pull {state}"));
             }
             Err(e) => self.status = Some(format!("✗ metrics toggle failed: {e}")),
         }
@@ -132,7 +136,7 @@ fn resolve(
 ) -> Result<(), String> {
     match outcome {
         MutateOutcome::Mutated => Ok(()),
-        MutateOutcome::Denied => Err(NOT_AUTHORIZED.to_string()),
+        MutateOutcome::Denied => Err(not_authorized()),
         MutateOutcome::Failed(e) => Err(e),
         MutateOutcome::Unreachable => direct().map_err(|e| e.to_string()),
     }

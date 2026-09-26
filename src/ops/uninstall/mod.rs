@@ -166,7 +166,7 @@ impl Plan {
             match &self.binary {
                 Some(BinaryAction::Remove(p)) => println!("  remove {}", p.display()),
                 Some(BinaryAction::InstructCargo(p)) => println!(
-                    "  {} is a `cargo install` build — run `cargo uninstall ghr-stats`",
+                    "  {} is a `cargo install` build — run `cargo uninstall fso-ghr-stats`",
                     p.display()
                 ),
                 Some(BinaryAction::NotInstalled(p)) => {

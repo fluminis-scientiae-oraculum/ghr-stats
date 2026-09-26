@@ -217,7 +217,7 @@ pub enum Command {
         install/repair each runner's job hooks, never clobbering a foreign hook (it chains \
         after it or prints a snippet instead).\n\n\
         The same settings can be changed live from the TUI's Config tab ([a]/[h]/[m]/[o]) under \
-        `sudo ghr-stats`, or, for [a]/[m], as a member of the `ghr-stats` group (see `systemd \
+        `sudo ghr-stats`, or, for [a], as a member of the `ghr-stats` group (see `systemd \
         install`)."
     )]
     Config,
@@ -313,12 +313,12 @@ pub enum SystemdAction {
 
 #[derive(Subcommand, Debug)]
 pub enum DbAction {
-    /// Delete samples older than N days now, in small batches (the collector also
-    /// prunes on its own per `retention_days`). Job history is kept.
+    /// Delete old samples now, in small batches (the collector also prunes on its own
+    /// per `retention_days`). Job history is kept.
     Prune {
-        /// Keep samples newer than this many days.
-        #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u16).range(1..))]
-        days: u16,
+        /// Keep samples newer than this many days. Default: `retention_days`.
+        #[arg(long)]
+        days: Option<std::num::NonZeroU16>,
     },
 }
 
