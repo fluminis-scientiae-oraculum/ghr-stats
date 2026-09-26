@@ -134,7 +134,7 @@ pub struct GithubConfig {
     pub token: Option<Secret>,
     /// Read-only PAT per `owner` (github.com) or `host/owner`.
     #[serde(default)]
-    pub tokens: BTreeMap<String, Secret>,
+    pub tokens: BTreeMap<TokenKey, Secret>,
 }
 
 /// Prometheus metrics export (opt-in).
@@ -242,7 +242,7 @@ impl Config {
             .github
             .tokens
             .iter()
-            .find(|(key, _)| TokenKey::parse(key).is_ok_and(|k| k.matches(host, owner)));
+            .find(|(key, _)| key.matches(host, owner));
         if let Some((_, t)) = keyed {
             return Some(t.clone());
         }
@@ -445,5 +445,13 @@ mod tests {
             c.dotcom_token("example-org").as_deref(),
             Some("github_pat_xyz")
         );
+    }
+
+    #[test]
+    fn a_malformed_token_key_rejects_the_config() {
+        let err = toml::from_str::<Config>("[github.tokens]\n\"not an org\" = \"github_pat_x\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an org"), "{err}");
     }
 }

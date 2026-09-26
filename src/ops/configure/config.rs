@@ -202,9 +202,15 @@ mod tests {
         // Per-org tokens take precedence over env/fallback, so these are deterministic.
         assert_eq!(cfg.dotcom_token("acme").as_deref(), Some("github_pat_NEW"));
         assert_eq!(cfg.dotcom_token("beta").as_deref(), Some("github_pat_B"));
-        assert!(!cfg.github.tokens.contains_key("widgets"));
         assert!(
-            !cfg.github.tokens.contains_key("acme"),
+            !cfg.github
+                .tokens
+                .contains_key(&TokenKey::parse("widgets").unwrap())
+        );
+        assert!(
+            !cfg.github
+                .tokens
+                .contains_key(&TokenKey::parse("acme").unwrap()),
             "replaced under the new spelling"
         );
         assert!(!text.contains("github_pat_W"));

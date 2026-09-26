@@ -259,8 +259,16 @@ mod tests {
             "widgets PAT was dropped:\n{text}"
         );
         let cfg: Config = toml::from_str(&text).unwrap();
-        assert!(!cfg.github.tokens.contains_key("acme"));
-        assert!(cfg.github.tokens.contains_key("widgets"));
+        assert!(
+            !cfg.github
+                .tokens
+                .contains_key(&TokenKey::parse("acme").unwrap())
+        );
+        assert!(
+            cfg.github
+                .tokens
+                .contains_key(&TokenKey::parse("widgets").unwrap())
+        );
         assert_eq!(cfg.orgs, vec!["widgets"]);
         assert!(cfg.metrics.push.enabled);
         assert_eq!(cfg.runner_roots, vec![PathBuf::from("/srv/r")]);
@@ -314,7 +322,9 @@ mod tests {
         let cfg: Config = toml::from_str(&std::fs::read_to_string(&*path).unwrap()).unwrap();
         for i in 0..8 {
             assert!(
-                cfg.github.tokens.contains_key(&format!("org{i}")),
+                cfg.github
+                    .tokens
+                    .contains_key(&TokenKey::parse(&format!("org{i}")).unwrap()),
                 "org{i}'s PAT was lost to a concurrent writer"
             );
         }

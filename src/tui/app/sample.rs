@@ -36,8 +36,14 @@ impl App {
         let api = self.source.latest_api_runners();
         let persisted = self.source.runner_states();
         let orgs = self.source.configured_token_orgs();
-        self.configured_orgs =
-            orgs.unwrap_or_else(|| self.cfg.github.tokens.keys().cloned().collect());
+        self.configured_orgs = orgs.unwrap_or_else(|| {
+            self.cfg
+                .github
+                .tokens
+                .keys()
+                .map(ToString::to_string)
+                .collect()
+        });
         // Hooks install System-scope but the dashboard usually runs non-root, so
         // any scope's hooks dir counts as ours.
         let our_dirs = [
