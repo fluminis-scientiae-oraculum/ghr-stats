@@ -12,6 +12,7 @@ use crate::shared::github::{RunnerScope, TokenKey};
 use crate::shared::hooks::install::{self, HookStatus};
 use crate::shared::models::RunnerInfo;
 use crate::shared::paths::{self, Scope};
+use crate::shared::privileged::sudo_hint;
 
 use super::{Check, Outcome, skipped};
 
@@ -76,6 +77,7 @@ pub(super) fn load_config(explicit: Option<&Path>) -> ConfigSource {
                 why: e.to_string(),
             },
         },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigSource::Missing { path },
         Err(e) => ConfigSource::Unreadable {
             path,
             why: e.to_string(),
@@ -107,7 +109,7 @@ pub(super) fn config_check(source: &ConfigSource, orgs: &[String]) -> Check {
         },
         ConfigSource::Missing { path } => Outcome::Fail {
             detail: format!("no config file at {}", path.display()),
-            fix: "run `sudo ghr-stats config` to create one".to_string(),
+            fix: format!("run `{}` to create one", sudo_hint("config")),
         },
     };
     Check {
@@ -152,7 +154,7 @@ fn runner_roots_check(cfg: &Config, found: usize) -> Check {
     let outcome = if roots.is_empty() {
         Outcome::Fail {
             detail: "no runner roots configured and none discoverable".to_string(),
-            fix: "run `sudo ghr-stats config` to set `runner_roots`".to_string(),
+            fix: format!("run `{}` to set `runner_roots`", sudo_hint("config")),
         }
     } else if found == 0 {
         Outcome::Fail {
@@ -235,9 +237,10 @@ fn hooks_check(discovered: &[RunnerInfo]) -> Check {
         }
         Outcome::Fail {
             detail,
-            fix: "run `sudo ghr-stats config` and install hooks; without them there is no \
-                  per-job data"
-                .to_string(),
+            fix: format!(
+                "run `{}` and install hooks; without them there is no per-job data",
+                sudo_hint("config")
+            ),
         }
     } else if !unreadable.is_empty() {
         Outcome::Skipped {
@@ -272,7 +275,7 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
         return Check {
             outcome: Outcome::Fail {
                 detail: "no orgs configured and none discovered from `.runner` files".to_string(),
-                fix: "run `sudo ghr-stats config` to add an org and its PAT".to_string(),
+                fix: format!("run `{}` to add an org and its PAT", sudo_hint("config")),
             },
             ..check
         };
@@ -329,10 +332,11 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
     let outcome = if !rejected.is_empty() {
         Outcome::Fail {
             detail: rejected.join("; "),
-            fix: "run `sudo ghr-stats config` to replace the org's PAT (fine-grained, \
-                  Organization → Self-hosted runners: Read, or Repository → Administration: \
-                  Read for repository runners)"
-                .to_string(),
+            fix: format!(
+                "run `{}` to replace the org's PAT (fine-grained, Organization → Self-hosted \
+                 runners: Read, or Repository → Administration: Read for repository runners)",
+                sudo_hint("config")
+            ),
         }
     } else if ok.is_empty() && !missing.is_empty() {
         Outcome::Fail {
@@ -340,7 +344,7 @@ fn tokens_check(cfg: &Config, discovered: &[RunnerInfo], orgs: &[String], offlin
                 "no org has a PAT ({}), so nothing is reconciled with GitHub",
                 missing.join(", ")
             ),
-            fix: "run `sudo ghr-stats config` to add a read-only PAT".to_string(),
+            fix: format!("run `{}` to add a read-only PAT", sudo_hint("config")),
         }
     } else {
         let mut detail = format!("{} PAT(s) validated: {}", ok.len(), ok.join(", "));
@@ -427,7 +431,7 @@ mod tests {
             &[],
         );
         match c.outcome {
-            Outcome::Fail { fix, .. } => assert!(fix.contains("ghr-stats config"), "{fix}"),
+            Outcome::Fail { fix, .. } => assert!(fix.contains(&sudo_hint("config")), "{fix}"),
             other => panic!("expected a failure, got {other:?}"),
         }
     }

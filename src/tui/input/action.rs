@@ -103,13 +103,16 @@ impl RestartRunner {
     fn prompt(&self) -> ConfirmPrompt {
         ConfirmPrompt {
             title: format!("Restart {} (#{})", self.unit, self.agent_id),
-            body: if self.busy {
-                format!(
-                    "sudo {}\nThe runner is busy: restarting cancels its job.",
-                    self.call()
-                )
-            } else {
-                format!("sudo {}\nReclaims the runner agent's GC RAM.", self.call())
+            body: {
+                let sudo = if privileged::is_root() { "" } else { "sudo " };
+                if self.busy {
+                    format!(
+                        "{sudo}{}\nThe runner is busy: restarting cancels its job.",
+                        self.call()
+                    )
+                } else {
+                    format!("{sudo}{}\nReclaims the runner agent's GC RAM.", self.call())
+                }
             },
             danger: self.busy,
         }

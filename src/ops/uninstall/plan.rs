@@ -164,8 +164,8 @@ fn cross_scope_probe(scope: Scope) -> Vec<String> {
         return Vec::new();
     }
     let re_run = match other {
-        Scope::System => "sudo ghr-stats uninstall --system",
-        Scope::User => "ghr-stats uninstall --user",
+        Scope::System => crate::shared::privileged::sudo_hint("uninstall --system"),
+        Scope::User => format!("{} uninstall --user", crate::shared::privileged::exe_path()),
     };
     let mut lines: Vec<String> = hits;
     lines.push(format!("↳ to remove these, re-run: {re_run}"));

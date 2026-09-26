@@ -26,7 +26,10 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         ),
     ));
     let roots = if cfg.runner_roots.is_empty() {
-        "(none — set with `ghr-stats config`)".to_string()
+        format!(
+            "(none — set with `{}`)",
+            crate::shared::privileged::sudo_hint("config")
+        )
     } else {
         cfg.runner_roots
             .iter()
@@ -88,9 +91,12 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(Span::styled(
             if unreadable {
-                "  (configured, but the root-owned config isn't readable here — run `sudo ghr-stats`)"
+                format!(
+                    "  (configured, but the root-owned config isn't readable here — run `{}`)",
+                    crate::shared::privileged::sudo_hint("")
+                )
             } else {
-                "  (none configured)"
+                "  (none configured)".to_string()
             },
             Style::new().fg(Color::DarkGray),
         )));

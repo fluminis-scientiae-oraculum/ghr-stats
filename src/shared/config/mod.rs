@@ -4,6 +4,7 @@ pub(crate) mod persist;
 mod secret;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,15 @@ pub enum Retention {
 impl Default for Retention {
     fn default() -> Self {
         Retention::Days(NonZeroU16::new(30).expect("30 is non-zero"))
+    }
+}
+
+impl fmt::Display for Retention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Retention::Days(d) => write!(f, "{d} days"),
+            Retention::Forever => f.write_str("forever"),
+        }
     }
 }
 
