@@ -192,6 +192,57 @@ impl fmt::Display for RunnerUnit {
     }
 }
 
+/// A runner's `_temp` and `_diag`, and the user who owns its install dir; built only by
+/// [`scratch_for`], so a purge can name no other path or user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunnerScratch {
+    temp: PathBuf,
+    diag: PathBuf,
+    uid: u32,
+    gid: u32,
+}
+
+impl RunnerScratch {
+    pub(crate) fn temp(&self) -> &Path {
+        &self.temp
+    }
+
+    pub(crate) fn diag(&self) -> &Path {
+        &self.diag
+    }
+
+    pub(crate) fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub(crate) fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &Path, uid: u32) -> Self {
+        Self {
+            temp: dir.join("_work/_temp"),
+            diag: dir.join("_diag"),
+            uid,
+            gid: uid,
+        }
+    }
+}
+
+/// The scratch of the runner installed at `dir`, from its own `.runner`. The runner
+/// writes `_diag` at the install root, beside the work folder, not inside it.
+pub(crate) fn scratch_for(dir: &Path) -> Result<RunnerScratch, String> {
+    let info = read_runner(dir).map_err(|e| format!("no usable .runner ({e})"))?;
+    let owner = std::fs::metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(RunnerScratch {
+        temp: dir.join(&info.work_folder).join("_temp"),
+        diag: dir.join("_diag"),
+        uid: owner.uid(),
+        gid: owner.gid(),
+    })
+}
+
 /// The unit named by `dir/.service`, if systemd confirms it runs from `dir`.
 pub(crate) fn unit_for(dir: &Path) -> Result<RunnerUnit, String> {
     let (text, _) = runner_files::read_text(dir, ".service", DOT_SERVICE_CAP)
@@ -388,6 +439,21 @@ mod tests {
         assert_eq!(liveness_in(&r0, &procs), Liveness::Busy);
         assert_eq!(liveness_in(&r00, &procs[..2]), Liveness::Offline);
         assert_eq!(liveness_in(&r0, &procs[..1]), Liveness::Idle);
+    }
+
+    #[test]
+    fn scratch_is_temp_under_the_work_folder_and_diag_at_the_install_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".runner"),
+            "{\"agentId\":1,\"agentName\":\"r0\",\
+             \"gitHubUrl\":\"https://github.com/example-org\",\"workFolder\":\"work\"}",
+        )
+        .unwrap();
+        let s = scratch_for(dir.path()).unwrap();
+        assert_eq!(s.temp(), dir.path().join("work/_temp"));
+        assert_eq!(s.diag(), dir.path().join("_diag"));
+        assert_eq!(s.uid(), nix::unistd::geteuid().as_raw());
     }
 
     #[test]

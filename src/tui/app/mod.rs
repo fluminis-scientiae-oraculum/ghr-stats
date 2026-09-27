@@ -71,7 +71,6 @@ pub(crate) struct LiveRunner {
     pub mem_bytes: Option<u64>,
     pub uptime_s: Option<u64>,
     pub gh: GhView,
-    pub work_folder: String,
     /// Seconds in the current liveness state.
     pub state_seconds: Option<i64>,
     pub hook: HookStatus,
@@ -231,11 +230,12 @@ impl App {
             ));
         }
         let unit = runners::unit_for(&r.dir)?;
+        let scratch = runners::scratch_for(&r.dir)?;
         Ok(ActionKind::Recycle(RecycleRunner {
             unit,
             agent_id: r.agent_id,
             install_dir: r.dir.clone(),
-            work_folder: r.work_folder.clone(),
+            scratch,
         }))
     }
 }

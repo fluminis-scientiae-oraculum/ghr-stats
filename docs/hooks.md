@@ -54,7 +54,9 @@ GHR_STATS_EVENT_LOG=/srv/actions-runner/runner-01/.ghr-stats-events.ndjson
 
 Chain wrappers live beside our scripts, named after the install dir
 (`chain-srv-actions-runner-runner-01-started.sh`). Editing `.env` needs root; the
-file keeps its owner and mode. A runner picks up a changed `.env` on restart, and
+file keeps its owner and mode. A `.env` that changed after ghr-stats read it, or
+gained a hook while you were asked about a runner without one, is left as is and
+reported. A runner picks up a changed `.env` on restart, and
 ghr-stats restarts it only if it is idle when checked just before the restart. A
 busy runner is left running and reported.
 

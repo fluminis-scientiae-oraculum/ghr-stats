@@ -3,19 +3,11 @@
 
 use std::fmt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::shared::collectors::runners::RunnerUnit;
+use crate::shared::collectors::runners::{RunnerScratch, RunnerUnit};
 use crate::shared::runner_files::Ownership;
-
-/// Runner-owned files are removed as the runner, so a planted symlink reaches only what it
-/// could delete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RunAs {
-    pub uid: u32,
-    pub gid: u32,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnitVerb {
@@ -41,14 +33,8 @@ pub(crate) enum PrivilegedCall {
         verb: UnitVerb,
         unit: RunnerUnit,
     },
-    PurgeDir {
-        dir: PathBuf,
-        owner: RunAs,
-    },
-    TrimFilesIn {
-        dir: PathBuf,
-        owner: RunAs,
-    },
+    PurgeTemp(RunnerScratch),
+    TrimDiag(RunnerScratch),
     InstallEnvFile {
         src: PathBuf,
         dst: PathBuf,
@@ -59,19 +45,20 @@ pub(crate) enum PrivilegedCall {
 impl PrivilegedCall {
     /// Passed to `execve` as a vector, never through a shell.
     fn argv(&self) -> (&'static str, Vec<String>) {
-        let path = |p: &PathBuf| p.to_string_lossy().into_owned();
+        let path = |p: &Path| p.to_string_lossy().into_owned();
         match self {
             PrivilegedCall::Systemctl { verb, unit } => (
                 "systemctl",
                 vec![verb.as_str().to_string(), unit.as_str().to_string()],
             ),
-            PrivilegedCall::PurgeDir { dir, .. } => {
-                ("rm", vec!["-rf".to_string(), "--".to_string(), path(dir)])
-            }
-            PrivilegedCall::TrimFilesIn { dir, .. } => (
+            PrivilegedCall::PurgeTemp(s) => (
+                "rm",
+                vec!["-rf".to_string(), "--".to_string(), path(s.temp())],
+            ),
+            PrivilegedCall::TrimDiag(s) => (
                 "find",
                 vec![
-                    path(dir),
+                    path(s.diag()),
                     "-type".to_string(),
                     "f".to_string(),
                     "-delete".to_string(),
@@ -97,11 +84,11 @@ impl PrivilegedCall {
         }
     }
 
-    fn runs_as(&self) -> Option<RunAs> {
+    /// Runner-owned files are removed as that runner's user, so a planted symlink reaches
+    /// only what it could delete. `None` runs as root.
+    fn runs_as(&self) -> Option<&RunnerScratch> {
         match self {
-            PrivilegedCall::PurgeDir { owner, .. } | PrivilegedCall::TrimFilesIn { owner, .. } => {
-                Some(*owner)
-            }
+            PrivilegedCall::PurgeTemp(s) | PrivilegedCall::TrimDiag(s) => Some(s),
             PrivilegedCall::Systemctl { .. } | PrivilegedCall::InstallEnvFile { .. } => None,
         }
     }
@@ -115,7 +102,7 @@ impl fmt::Display for PrivilegedCall {
             write!(f, " {a}")?;
         }
         if let Some(who) = self.runs_as() {
-            write!(f, " (as uid {})", who.uid)?;
+            write!(f, " (as uid {})", who.uid())?;
         }
         Ok(())
     }
@@ -167,13 +154,13 @@ pub(crate) fn run(call: &PrivilegedCall) -> Outcome {
         (true, None) => Command::new(program),
         (true, Some(who)) => {
             let mut c = Command::new(program);
-            c.uid(who.uid).gid(who.gid);
+            c.uid(who.uid()).gid(who.gid());
             c
         }
         (false, who) => {
             let mut c = Command::new("sudo");
             if let Some(who) = who {
-                c.args(["-u", &format!("#{}", who.uid)]);
+                c.args(["-u", &format!("#{}", who.uid())]);
             }
             c.arg("--").arg(program);
             c
@@ -246,10 +233,7 @@ mod tests {
 
     #[test]
     fn every_call_renders_its_exact_argv() {
-        let runner = RunAs {
-            uid: 1001,
-            gid: 1001,
-        };
+        let scratch = RunnerScratch::for_test(Path::new("/srv/runners/r0"), 1001);
         let cases = [
             (
                 PrivilegedCall::Systemctl {
@@ -259,17 +243,11 @@ mod tests {
                 "systemctl restart actions.runner.o.r1.service",
             ),
             (
-                PrivilegedCall::PurgeDir {
-                    dir: PathBuf::from("/srv/runners/r0/_work/_temp"),
-                    owner: runner,
-                },
+                PrivilegedCall::PurgeTemp(scratch.clone()),
                 "rm -rf -- /srv/runners/r0/_work/_temp (as uid 1001)",
             ),
             (
-                PrivilegedCall::TrimFilesIn {
-                    dir: PathBuf::from("/srv/runners/r0/_diag"),
-                    owner: runner,
-                },
+                PrivilegedCall::TrimDiag(scratch),
                 "find /srv/runners/r0/_diag -type f -delete (as uid 1001)",
             ),
             (
