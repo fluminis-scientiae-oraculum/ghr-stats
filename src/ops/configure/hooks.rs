@@ -133,8 +133,16 @@ fn repair_event_log(r: &RunnerInfo) {
     }
 }
 
+/// The prompt was answered for a runner with no hook, so one set meanwhile is kept.
 fn install_for(r: &RunnerInfo, started: &Path, completed: &Path) {
     let Some(env) = read_env(r) else { return };
+    if install::current_hook_paths(&env.text) != (None, None) {
+        println!(
+            "    ✗ {} — a job hook was set since the check; .env left as is",
+            r.name
+        );
+        return;
+    }
     let event_log = crate::shared::hooks::runner_event_log(&r.dir);
     let new = install::rewrite_env(&env.text, started, completed, Some(&event_log));
     write_and_restart(r, &env, &new, "hooks installed");

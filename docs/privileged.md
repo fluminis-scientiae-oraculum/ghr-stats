@@ -20,13 +20,17 @@ accepts nothing else:
 | Variant | Command | Runs as | Used by |
 | --- | --- | --- | --- |
 | `Systemctl` | `systemctl {start,stop,restart} <unit>` | root | Restart, Recycle, hook install and uninstall |
-| `PurgeDir` | `rm -rf -- <dir>` | the runner's user | Recycle: `<install>/<workFolder>/_temp` |
-| `TrimFilesIn` | `find <dir> -type f -delete` | the runner's user | Recycle: `<install>/_diag` |
+| `PurgeTemp` | `rm -rf -- <install>/<workFolder>/_temp` | the runner's user | Recycle |
+| `TrimDiag` | `find <install>/_diag -type f -delete` | the runner's user | Recycle |
 | `InstallEnvFile` | `install -o <uid> -g <gid> -m <mode> <src> <dst>` | root | writing and reverting a runner's `.env` |
 
 - `<unit>` is only ever an `actions.runner.*.service` whose `WorkingDirectory`
   is that runner's install dir.
-- `InstallEnvFile` keeps the owner and mode the `.env` already had.
+- `PurgeTemp` and `TrimDiag` take a runner's scratch, built only from that
+  runner's own `.runner` and the owner of its install dir, so they name no other
+  path or user.
+- `InstallEnvFile` keeps the owner and mode the `.env` already had, and runs only
+  if the file still matches what was read.
 - Deletions drop to the runner's uid, so a planted symlink reaches nothing the
   runner could not already delete.
 - Arguments go to `execve` as a vector, never through a shell.

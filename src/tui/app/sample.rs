@@ -91,7 +91,6 @@ impl App {
                     .unwrap_or(GhView::Unknown),
                 state_seconds: Some((now - since).max(0)),
                 hook: install::detect(&p.info.dir, &our_dirs),
-                work_folder: p.info.work_folder,
                 agent_id: id,
                 name: p.info.name,
                 org: p.info.org,
