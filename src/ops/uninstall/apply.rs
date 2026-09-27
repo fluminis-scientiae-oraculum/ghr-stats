@@ -66,11 +66,16 @@ impl Plan {
 }
 
 fn gc_shared_scripts(our_dir: &Path, plans: &[RunnerHookPlan], _root: &Root) {
-    let still_referenced = plans.iter().any(|rp| env_may_point_into(&rp.dir, our_dir));
-    if still_referenced {
+    let users: Vec<&str> = plans
+        .iter()
+        .filter(|rp| env_may_point_into(&rp.dir, our_dir))
+        .map(|rp| rp.name.as_str())
+        .collect();
+    if !users.is_empty() {
         println!(
-            "  · kept {} — still referenced by a runner not managed by ghr-stats",
-            our_dir.display()
+            "  · kept {} — {} may still use it",
+            our_dir.display(),
+            users.join(", ")
         );
         return;
     }
